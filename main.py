@@ -10,3 +10,6 @@ model = load_model()
 
 #testing with video
 process_video("video.mp4", model)
+
+# prints the list of built-in classes in the yolo model
+#print(model.names)
