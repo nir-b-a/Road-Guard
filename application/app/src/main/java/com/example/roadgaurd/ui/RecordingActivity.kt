@@ -33,6 +33,7 @@ class RecordingActivity : AppCompatActivity() {
     private var savedRecordingName: String? = null
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private var lastLocation: Location? = null
+    private var recordingStartTime: Long = 0
 
     private val permissions = arrayOf(
         Manifest.permission.CAMERA,
@@ -76,10 +77,16 @@ class RecordingActivity : AppCompatActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
             != PackageManager.PERMISSION_GRANTED) return
 
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2000).build()
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000).build()
         fusedLocationClient.requestLocationUpdates(request, object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
-                lastLocation = result.lastLocation
+                val location = result.lastLocation ?: return
+                lastLocation = location
+                if (recordingStartTime > 0) {
+                    val speedKmh = location.speed * 3.6f
+                    val elapsedMs = System.currentTimeMillis() - recordingStartTime
+                    session.addSpeedSample(elapsedMs, speedKmh, location.latitude, location.longitude)
+                }
             }
         }, Looper.getMainLooper())
     }
@@ -120,6 +127,7 @@ class RecordingActivity : AppCompatActivity() {
             .start(ContextCompat.getMainExecutor(this)) { event ->
                 when (event) {
                     is VideoRecordEvent.Start -> runOnUiThread {
+                        recordingStartTime = System.currentTimeMillis()
                         findViewById<TextView>(R.id.tvRecIndicator).visibility = View.VISIBLE
                     }
                     is VideoRecordEvent.Finalize -> {
@@ -136,6 +144,7 @@ class RecordingActivity : AppCompatActivity() {
             putExtra("recording_name", savedRecordingName)
             putExtra("session_id", session.getSessionId())
             putExtra("tags_json", session.getTagsAsJson())
+            putExtra("speed_json", session.getSpeedSamplesAsJson())
         })
         finish()
     }
