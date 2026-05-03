@@ -51,7 +51,11 @@ class World:
             return []
         return [self.vehicles[vid] for vid in frame.vehicle_ids if vid in self.vehicles]
     
-    #def getTrafficLightsInFrame(self, frame_id: int) -> list[TrafficLights]:
+    def getTrafficLightsInFrame(self, frame_id: int) -> list[TrafficLight]:
+        frame = self.objects_in_frame.get(frame_id)
+        if not frame:
+            return []
+        return [self.traffic_lights[vid] for vid in frame.traffic_light_ids if vid in self.traffic_lights]
 
     def getVehicle(self, vehicle_id: int) -> Vehicle | None:
         return self.vehicles.get(vehicle_id)

@@ -24,6 +24,11 @@ class Vehicle:
         self.end_frame = frame_id               # IMPORTANT! If frame_id is relative (for example we process the 300th frame but it's the first time this object appears,
                                                 #   so the frame_id the function gets is 1) then we need to change the logic here and set the right frame_id to end_frame.
 
+        # if a vehicle is missing in some frames and reappears later, we set its bounding box to (0,0,0,0)
+        index = self.start_frame
+        for index in range(self.end_frame):
+            self.bounding_box.setdefault(index, (0, 0, 0, 0))
+
     # To easily get the bounding box of a vehicle by his relative frame (for example, (1) -> the bounding box from the first frame he appears in)
     def getRelativeFrameBbox(self, relative_frame_id: int):
         return self.bounding_box[relative_frame_id]

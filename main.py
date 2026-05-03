@@ -1,7 +1,6 @@
 import sys
 import cv2
 from video_handler import VideoHandler
-from video_runner import process_video
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from Constants import DetectClass
