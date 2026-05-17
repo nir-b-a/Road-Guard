@@ -7,6 +7,8 @@ from Constants import DetectClass
 from Objects.World import World
 
 from frameLogger import FrameLogger
+from line_crossing.line_detector import detect_solid_lines
+from line_crossing.crossing_detector import check_crossing
 
 
 YOLO_MODEL = None
@@ -75,8 +77,9 @@ def processFrame(yolo_model, world: World, frame, frame_id, frame_logger: FrameL
             trl.updateBoxAndEnsFrame(frame_id, bounding_box)
 
     world.registerFrame(frame_id, vehicle_ids_in_frame, traffic_light_ids_in_frame)
+    world.detected_lines[frame_id] = detect_solid_lines(frame)
 
-    frame_logger.log_frame(frame_id, vehicle_ids_in_frame, traffic_light_ids_in_frame, logger_bounding_boxes)
+    frame_logger.log_frame(frame_id, vehicle_ids_in_frame, traffic_light_ids_in_frame, logger_bounding_boxes, world.detected_lines.get(frame_id, {}))
 
 
     """rendered = results[0].plot()
@@ -129,7 +132,11 @@ def main():
     # release video resources
     vh.release()
 
-    """ the algorithm we'll write will be here"""
+    for vehicle in world.vehicles.values():
+        violation_frame = check_crossing(vehicle, world.detected_lines)
+        if violation_frame is not None:
+            print(f"[VIOLATION] Vehicle {vehicle.id} crossed a solid line at frame {violation_frame}")
+            # TODO: POST /api/internal/violation to report to backend
 
     """ Part of the testing remove later"""
     for frame_counter in range(world.frame_count):
