@@ -1,6 +1,13 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Python processing unit outputs
 output.mp4
 notes.txt
 test_1_world.jsonl
 test_1_yolo.jsonl
+
+# YOLOv8 model weights
 yolov8m.pt
 yolov8x.pt
