@@ -1,0 +1,2 @@
+dataset/raw_videos/**/*.mp4 filter=lfs diff=lfs merge=lfs -text
+dataset/raw_videos/**/*.m4a filter=lfs diff=lfs merge=lfs -text
