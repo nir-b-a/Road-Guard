@@ -6,12 +6,12 @@ ROI_CROP_RATIO = 0.5       # fraction of frame height to use (bottom portion)
 BLUR_KERNEL = (5, 5)
 CANNY_LOW = 50
 CANNY_HIGH = 150
-HOUGH_THRESHOLD = 30
+HOUGH_THRESHOLD = 35
 HOUGH_MIN_LINE_LENGTH = 60
-HOUGH_MAX_LINE_GAP = 15
-ANGLE_MIN_DEG = 20         # steeper than this from horizontal = kept
-ANGLE_MAX_DEG = 80         # shallower than this from horizontal = kept
-SOLID_Y_COVERAGE = 0.65    # y-span coverage ratio above which a group is classified as solid
+HOUGH_MAX_LINE_GAP = 100    # validated by geometric sweep
+ANGLE_MIN_DEG = 10         # steeper than this from horizontal = kept
+ANGLE_MAX_DEG = 85         # shallower than this from horizontal = kept
+SOLID_Y_COVERAGE = 0.5    # y-span coverage ratio above which a group is classified as solid
 
 
 def detect_solid_lines(frame: np.ndarray, roi_crop_ratio: float = ROI_CROP_RATIO) -> dict[str, tuple]:
