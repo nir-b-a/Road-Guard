@@ -6,6 +6,8 @@ from ultralytics.engine.results import Results
 from Constants import DetectClass
 from Objects.World import World
 
+from speed_estimator import estimateDistance
+import distanceLogger
 from frameLogger import FrameLogger
 
 
@@ -18,19 +20,19 @@ CONFIDENCE_LVL = 0.5
 def loadYoloModel():
     #global YOLO_MODEL
     try:
-        return YOLO("yolov8m.pt")
+        return YOLO("yolov8x.pt")
     except Exception as e:
         print(f"Error occurred: {e}")
 
 
 """Is the yolov8 model uses some tracking algorithm?"""
-def processFrame(yolo_model, world: World, frame, frame_id, frame_logger: FrameLogger):
+def processFrame(yolo_model, world: World, frame, frame_id):
     # run object tracking on the frame using YOLO
     results = yolo_model.track(
         frame,
         persist=True,       #tracker="bytetrack.yaml",  # or "botsort.yaml" - claude
         # change to False later
-        verbose=True,
+        verbose=False,
         classes=CLASSES,
         conf=CONFIDENCE_LVL
         #iou=0.5,               # IoU threshold for NMS (non-max suppression)
@@ -76,20 +78,17 @@ def processFrame(yolo_model, world: World, frame, frame_id, frame_logger: FrameL
 
     world.registerFrame(frame_id, vehicle_ids_in_frame, traffic_light_ids_in_frame)
 
-    frame_logger.log_frame(frame_id, vehicle_ids_in_frame, traffic_light_ids_in_frame, logger_bounding_boxes)
 
-
-    """rendered = results[0].plot()
+    rendered = results[0].plot()
 
     # display the processed frame
-    cv2.imshow("frame", rendered)"""
+    cv2.imshow("frame", rendered)
 
 
 
 def main():
 
     """ Just for testing"""
-    yolo_logger = FrameLogger('test_1_yolo')
     world_logger = FrameLogger('test_1_world')
     
     # load yolov8 model
@@ -117,7 +116,7 @@ def main():
             break
 
         """ Remove frame_logger when not testing"""
-        processFrame(yolo_model, world, frame, frame_id, yolo_logger)
+        processFrame(yolo_model, world, frame, frame_id)
 
         # exit loop if 'q' is pressed
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -129,9 +128,10 @@ def main():
     # release video resources
     vh.release()
 
-    """ the algorithm we'll write will be here"""
+    estimateDistance(world)
+    distanceLogger.export_distances(world, world.frame_count, "dashcam_1_60sec_estimated_distances")
+    distanceLogger.export_all_bboxes(world, world.frame_count, "dashcam_1_60sec_bboxes")  # for calibration
 
-    """ Part of the testing remove later"""
     for frame_counter in range(world.frame_count):
         bbox_counter = len(world.objects_in_frame[frame_counter].vehicle_ids) + len(world.objects_in_frame[frame_counter].traffic_light_ids)
         world_logger.log_frame(frame_counter, world.objects_in_frame[frame_counter].vehicle_ids, world.objects_in_frame[frame_counter].traffic_light_ids, bbox_counter)

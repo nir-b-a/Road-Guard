@@ -15,7 +15,8 @@ class Vehicle:
     bounding_box: dict[int, tuple[int, int, int, int]] = field(default_factory=dict, repr=False)        # (frame_id) -> (x1, y1, x2, y2)
 
     # a speed value for each frame. May not be needed so as for now, it's in comment.
-    speed_per_frame: dict[int, int] = field(default_factory=dict, repr=False)               # The constructor won't ask for a speed_per_frame dict.
+    speed_per_frame: dict[int, float] = field(default_factory=dict, repr=False)               # The constructor won't ask for a speed_per_frame dict.
+    dist_per_frame: dict[int, float] = field(default_factory=dict, repr=False)
     #license_plate: int = field(repr=False)
 
 
