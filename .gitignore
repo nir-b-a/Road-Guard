@@ -2,6 +2,14 @@
 .DS_Store
 Thumbs.db
 
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Large local-only data / media
+datasets/
+tests_videos/
+
 # Python processing unit outputs
 output.mp4
 notes.txt
@@ -11,3 +19,16 @@ test_1_yolo.jsonl
 # YOLOv8 model weights
 yolov8m.pt
 yolov8x.pt
+yolov8n.pt
+
+# DL lane-detection env (Phase 0) — never commit envs / build artifacts / cloned framework
+.venv/
+venv/
+env/
+roadguard-dl/
+UnLanedet/
+*.so
+*.pyd
+build/
+*.egg-info/
+.eggs/
