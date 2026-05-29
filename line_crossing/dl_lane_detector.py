@@ -17,12 +17,25 @@ and unit-testable today, before the framework is even installed:
   * `_assign_positions`     - geometric ego-relative indexing                     (pure)
   * `_ensure_model`/`_run`  - SEAM: UnLanedet load + forward                      (needs the lib)
 
-Only the two SEAM methods touch UnLanedet. Fill those in during Phase 2 against
-the actual repo API; the rest needs no changes.
+Phase 2 reality (CLRerNet via UnLanedet)
+----------------------------------------
+The installed UnLanedet API differs from the original seam sketch, so the
+framework-touching methods (`_ensure_model`, `_preprocess`, `_run_model`,
+`_parse_raw`) all delegate to the library:
 
-Coordinate convention (CLR-family default; verify against the chosen config):
-  full frame --(top-crop `crop_top` rows)--> --(resize to model_w x model_h)--> model input.
-The inverse is applied to every output point before a `Lane` is built.
+  * the model is called with a `dict` (`{"img": tensor}`), not a bare tensor;
+  * preprocessing (BGR mean-subtraction, resize) is done by the config's own
+    `dataloader.test.dataset.processes`, so it matches training exactly;
+  * decoded lanes come from `model.get_lanes(out)[0]` and `Lane.to_array(cfg)`
+    already returns points in the model's ORIGINAL image space (CULane:
+    `ori_img_w x ori_img_h`, e.g. 1640x590), NOT the network input space.
+
+Coordinate convention
+  Because `to_array` emits CULane-original coords, `FrameTransform` is repurposed
+  (in `_ensure_model`) as a pure resize map between CULane-original space and the
+  full-resolution source frame: `model_w/h = ori_img_w/h`, `crop_top = 0`. The
+  existing `_postprocess` inversion then maps every point straight back onto the
+  source frame, so `_postprocess`/`_assign_positions` need no changes.
 """
 
 from __future__ import annotations
@@ -84,10 +97,10 @@ class DLLaneDetector:
         *,
         device: str = "cuda",
         conf_threshold: float = 0.4,
-        src_size: tuple[int, int] = (1920, 1080),   # (w, h)
-        model_input: tuple[int, int] = (800, 320),  # (w, h) — CLRerNet default-ish
-        crop_top: int = 270,                          # sky rows cut before resize
-        use_fp16: bool = True,
+        src_size: tuple[int, int] = (1920, 1080),   # (w, h) of the source frames
+        model_input: tuple[int, int] = (800, 320),  # advisory; real geometry comes from cfg
+        crop_top: int = 270,                          # advisory; real geometry comes from cfg
+        use_fp16: bool = False,                       # GTX 1060 (Pascal) prefers fp32; no fp16 speedup
         min_points: int = 2,
     ) -> None:
         self.config_path = config_path
@@ -105,6 +118,8 @@ class DLLaneDetector:
             crop_top=crop_top,
         )
         self._model = None  # lazily loaded on first detect()
+        self._param_config = None  # cfg.param_config, set in _ensure_model
+        self._processes = None     # UnLanedet Preprocess pipeline, set in _ensure_model
 
     # ------------------------------------------------------------------
     # Public API
@@ -121,26 +136,27 @@ class DLLaneDetector:
     # ------------------------------------------------------------------
     # Pure / framework-agnostic (testable now)
     # ------------------------------------------------------------------
-    def _preprocess(self, frame: np.ndarray) -> "np.ndarray":
+    def _preprocess(self, frame: np.ndarray) -> dict:
         """
-        Full-res BGR frame -> normalized model-input tensor on `device`.
+        Full-res BGR frame -> UnLanedet input `dict` ({"img": (1,3,H,W) tensor}).
 
-        Returns a torch tensor at call time; typed loosely to keep this module
-        importable without torch installed (for transform/compat unit tests).
+        Delegates normalization/resize to the config's own test `processes`
+        (BGR mean-subtraction, resize to network input) so the input matches how
+        CLRerNet was trained. The frame is first resized to CULane-original
+        geometry (`ori_img_w x ori_img_h`) so the config's `cut_height` and the
+        `to_array` output dimensions stay consistent regardless of source size.
         """
-        import cv2  # local import: keep module import cheap and torch-free
-        import torch
+        import cv2  # local import: keep module import cheap
 
-        t = self.transform
-        cropped = frame[t.crop_top:, :, :]                       # (cropped_h, src_w, 3)
-        resized = cv2.resize(cropped, (t.model_w, t.model_h))    # cv2 takes (w, h)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        chw = np.transpose(rgb, (2, 0, 1))                       # (3, H, W)
-        tensor = torch.from_numpy(chw).unsqueeze(0)              # (1, 3, H, W)
-        tensor = tensor.to(self.device)
-        if self.use_fp16:
-            tensor = tensor.half()
-        return tensor
+        pc = self._param_config
+        # Map our source frame onto CULane-original geometry, then crop sky rows
+        # exactly as UnLanedet's detect.py does before its processes run.
+        resized = cv2.resize(frame, (int(pc.ori_img_w), int(pc.ori_img_h)))
+        img = resized[int(pc.cut_height):, :, :].astype(np.float32)
+        data = {"img": img, "lanes": []}
+        data = self._processes(data)
+        data["img"] = data["img"].unsqueeze(0)
+        return data
 
     def _postprocess(self, raw_lanes: list[RawLane]) -> list[Lane]:
         """
@@ -186,47 +202,94 @@ class DLLaneDetector:
         return lanes
 
     # ------------------------------------------------------------------
-    # UnLanedet SEAMS — fill these against the actual repo API in Phase 2.
-    # Nothing else in this file should need to change.
+    # UnLanedet-specific methods (Phase 2, implemented against the real API).
+    # The pure helpers above (_postprocess, _assign_positions) are unchanged.
     # ------------------------------------------------------------------
     def _ensure_model(self) -> None:
         if self._model is not None:
             return
-        # SEAM: load UnLanedet config + checkpoint, move to device, eval, half().
-        # Pseudostructure (adapt names to the installed API):
-        #
-        #   from unlanedet.config import Config
-        #   from unlanedet.model import build_model
-        #   cfg = Config.fromfile(self.config_path)
-        #   model = build_model(cfg)
-        #   load_checkpoint(model, self.ckpt_path, map_location=self.device)
-        #   model.to(self.device).eval()
-        #   if self.use_fp16: model.half()
-        #   self._model = model
-        raise NotImplementedError(
-            "Wire UnLanedet model loading here (Phase 2). See pseudostructure "
-            "in _ensure_model(). Until then, DLLaneDetector.detect() will raise."
+        import os
+
+        from ._np_compat import install as _install_np_compat
+        _install_np_compat()  # UnLanedet uses removed np.bool/np.int/... aliases
+
+        from unlanedet.checkpoint import Checkpointer
+        from unlanedet.config import LazyConfig, instantiate
+        from unlanedet.data.transform import Preprocess
+
+        cfg_path = os.path.abspath(self.config_path)
+        # The CLRerNet config calls get_config("config/common/train.py"), a
+        # CWD-relative path, so LazyConfig.load must run from the UnLanedet root.
+        root = self._find_unlanedet_root(cfg_path)
+        cwd = os.getcwd()
+        try:
+            if root:
+                os.chdir(root)
+            cfg = LazyConfig.load(cfg_path)
+            cfg = LazyConfig.apply_overrides(cfg, [])
+            model = instantiate(cfg.model)
+            processes = Preprocess(instantiate(cfg.dataloader.test.dataset.processes))
+        finally:
+            os.chdir(cwd)
+
+        pc = cfg.param_config
+        # Gate inside the library (proper softmax + CUDA NMS) at our threshold,
+        # so parsed lanes carry score=1.0 and pass _postprocess unchanged.
+        pc.test_parameters.conf_threshold = self.conf_threshold
+
+        model.to(self.device)
+        model.eval()
+        Checkpointer(model).load(self.ckpt_path)
+
+        self._model = model
+        self._param_config = pc
+        self._processes = processes
+        # Repurpose FrameTransform as a pure CULane-original <-> source-frame
+        # resize map (to_array already returns CULane-original coords).
+        self.transform = FrameTransform(
+            src_w=self.transform.src_w,
+            src_h=self.transform.src_h,
+            model_w=int(pc.ori_img_w),
+            model_h=int(pc.ori_img_h),
+            crop_top=0,
         )
 
-    def _run_model(self, tensor: "np.ndarray"):
-        """SEAM: forward pass. Return the repo's native lane output object."""
+    @staticmethod
+    def _find_unlanedet_root(cfg_path: str) -> str | None:
+        """Walk up from a config file to the dir holding config/common/train.py."""
+        import os
+        d = os.path.dirname(cfg_path)
+        for _ in range(6):
+            if os.path.exists(os.path.join(d, "config", "common", "train.py")):
+                return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        return None
+
+    def _run_model(self, data: dict):
+        """SEAM: forward pass + native decode. Returns list[unlanedet Lane]."""
         import torch
         with torch.no_grad():
-            return self._model(tensor)  # type: ignore[misc]
+            out = self._model(data)
+        return self._model.get_lanes(out)[0]  # batch size 1
 
     def _parse_raw(self, raw) -> list[RawLane]:
         """
-        SEAM: convert UnLanedet's native output into `RawLane` tuples in
-        MODEL-input coordinates.
+        SEAM: convert UnLanedet's decoded lanes into `RawLane` tuples.
 
-        CLR-family output is typically per-lane: a confidence score plus x
-        values at a fixed set of y-anchors, with invalid samples flagged
-        (negative / out-of-range x). Implement, per lane:
-          * read the score,
-          * keep only valid (x, y) samples (drop flagged points PER POINT),
-          * lane_type = "unknown" until the Phase 3 head exists.
+        `get_lanes` already confidence-gated (at our threshold) and NMS'd, and
+        `Lane.to_array(cfg)` returns valid (x, y) samples in CULane-ORIGINAL
+        image coordinates (the space FrameTransform now inverts from). Score is
+        1.0 because gating happened in the library; type is "unknown" until the
+        Phase 3 type head exists.
         """
-        raise NotImplementedError(
-            "Implement UnLanedet output parsing (Phase 2): per-lane score + "
-            "valid (x, y) samples in model coords. Return list[RawLane]."
-        )
+        raw_lanes: list[RawLane] = []
+        for lane in raw:
+            arr = lane.to_array(self._param_config)
+            if arr is None or len(arr) < self.min_points:
+                continue
+            pts = [(float(x), float(y)) for x, y in arr]
+            raw_lanes.append((pts, 1.0, "unknown"))
+        return raw_lanes

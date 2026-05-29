@@ -43,6 +43,11 @@ opencv-python==4.10.0.84
 # Build helper for torch C++/CUDA extensions — UnLanedet's ops compile via this.
 ninja==1.11.1.1
 
+# setuptools<81: torch 2.1.2's cpp_extension imports `pkg_resources`, which
+# setuptools 81+ removed. Without this pin a fresh env / `pip install -U` breaks
+# inline CUDA op compilation (smoke test stage 6) with ModuleNotFoundError.
+setuptools<81
+
 # Common transitive deps that UnLanedet / lanedet expect; pinned conservatively.
 pyyaml==6.0.2
 scipy==1.13.1
@@ -53,6 +58,10 @@ imgaug==0.4.0
 pandas==2.2.2
 scikit-learn==1.5.1
 albumentations==1.4.10
+# albucore<0.1: albumentations 1.4.10 only requires albucore>=0.0.11, but
+# albucore 0.1+ removed `preserve_channel_dim` from albucore.utils, which breaks
+# `import albumentations` (and thus UnLanedet's al.Resize at inference). Pin it.
+albucore==0.0.13
 pillow==10.4.0
 
 # NOTE: torch / torchvision are intentionally NOT listed here — install them in

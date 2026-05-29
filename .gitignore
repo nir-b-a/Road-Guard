@@ -27,6 +27,7 @@ venv/
 env/
 roadguard-dl/
 UnLanedet/
+weights/
 *.so
 *.pyd
 build/
