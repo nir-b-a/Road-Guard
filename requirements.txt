@@ -26,7 +26,10 @@
 # STEP 4 — Install the rest (this file):
 #   pip install -r requirements.txt
 #
-# STEP 5 — Clone + build UnLanedet, then run tools/smoke_test_env.py
+# STEP 5 — (OPTIONAL) Clone + build UnLanedet. Only needed for the CLRerNet
+#   co-run tool (tools/test_corun_video.py). main.py and the violation pipeline
+#   (crossing_violation_test / wrong_way / shoulder) do NOT need UnLanedet — they
+#   run on ultralytics YOLO + the committed weights/phase3_v3_yellowprotect.pt.
 # -----------------------------------------------------------------------------
 
 # --- Pinned for collision avoidance ------------------------------------------
@@ -66,5 +69,10 @@ pillow==10.4.0
 
 # NOTE: torch / torchvision are intentionally NOT listed here — install them in
 # STEP 3 from the cu118 index, or pip will pull a CPU-only build.
-# NOTE: do not add UnLanedet itself here; install it editable from its clone:
-#   pip install -e ./UnLanedet   (after the smoke test confirms ops compile)
+# NOTE: do not add UnLanedet itself here; it is NOT on PyPI. Clone its repo and
+#   install editable:  pip install -e ./UnLanedet  (UnLanedet/ is gitignored).
+# NOTE: the CLRerNet base weight weights/clrernet_model_best_culane.pth (~264 MB,
+#   from the CLRerNet model zoo) is gitignored and ONLY required by
+#   tools/test_corun_video.py. Download it into weights/ if you run that tool.
+# NOTE: YOLO base weights (yolov8m.pt, yolov8n-seg.pt, ...) are NOT committed —
+#   ultralytics auto-downloads them on first use.
