@@ -50,6 +50,14 @@ from .lane_types import Lane, LaneType, Point
 # (polyline points [(x, y), ...], confidence score, raw type label).
 RawLane = tuple[list[tuple[float, float]], float, LaneType]
 
+# Phase 3 seg-class (canonical name from the 3-class V1 model) -> LaneType.
+# Mapped by NAME (via the model's own `names`), so it's robust to class ordering.
+_SEG_NAME_TO_LANETYPE: dict[str, LaneType] = {
+    "solid_white_lane": "solid_white",
+    "yellow_solid_lane": "solid_yellow",
+    "dashed_lane": "dashed",
+}
+
 
 @dataclass(frozen=True)
 class FrameTransform:
@@ -102,6 +110,11 @@ class DLLaneDetector:
         crop_top: int = 270,                          # advisory; real geometry comes from cfg
         use_fp16: bool = False,                       # GTX 1060 (Pascal) prefers fp32; no fp16 speedup
         min_points: int = 2,
+        type_weights: str = "models/phase3_israeli_head.pth",  # Phase 3 seg head (stub path for now)
+        type_conf: float = 0.20,                      # LOW seg gate: let dipped masks through
+                                                       # so SolidMaskStabilizer hysteresis can act
+        type_samples: int = 20,                       # points sampled per lane for voting
+        type_every_n: int = 5,                        # run the seg head every N frames (1 = every frame)
     ) -> None:
         self.config_path = config_path
         self.ckpt_path = ckpt_path
@@ -109,6 +122,16 @@ class DLLaneDetector:
         self.conf_threshold = conf_threshold
         self.use_fp16 = use_fp16
         self.min_points = min_points
+
+        # --- Phase 3 lane-type head (point-in-mask voting over YOLOv8-seg) ---
+        self.type_weights = type_weights
+        self.type_conf = type_conf
+        self.type_samples = max(2, type_samples)
+        self.type_every_n = max(1, type_every_n)
+        self._type_model = None         # lazily loaded on first classify
+        self._type_unavailable = False  # True once we confirm the weights are absent
+        self._type_masks: list[tuple[LaneType, np.ndarray, float]] | None = None  # (type, poly, conf)
+        self._frame_count = 0           # drives the every-N-frames cadence
 
         src_w, src_h = src_size
         model_w, model_h = model_input
@@ -130,6 +153,7 @@ class DLLaneDetector:
         raw = self._run_model(tensor)
         raw_lanes = self._parse_raw(raw)
         lanes = self._postprocess(raw_lanes)
+        lanes = self._classify_types(frame, lanes)
         lanes = self._assign_positions(lanes, frame_width=frame.shape[1])
         return lanes
 
@@ -200,6 +224,136 @@ class DLLaneDetector:
         for i, ln in enumerate(rights, start=1):
             ln.position = i
         return lanes
+
+    def _classify_types(self, frame: np.ndarray, lanes: list[Lane]) -> list[Lane]:
+        """
+        Assign each geometric lane a semantic `lane_type` via point-in-mask voting
+        against the Phase 3 YOLOv8-seg lane-type head.
+
+        Strategy
+          * Every-N-frames: the seg model is the expensive stage, so we run it
+            only once every `type_every_n` frames and cache its masks; the cheap
+            voting runs EVERY frame against the most recent masks. Lane *geometry*
+            is always fresh from CLRerNet; lane *type* is temporally stable, so
+            voting fresh polylines against slightly-older masks is sound.
+          * Voting: for each lane, sample `type_samples` points down its polyline
+            (via `Lane.x_at_y`) and tally which seg mask each point falls inside
+            (`cv2.pointPolygonTest`). The class with the most votes wins; a lane
+            that overlaps no mask keeps its current type.
+
+        No-op until the model exists: if `type_weights` is absent (e.g. still
+        training) the wiring stays live but lanes keep lane_type="unknown", so the
+        geometric pipeline behaves exactly as in Phase 2.
+        """
+        self._ensure_type_model()
+        if self._type_model is None:
+            return lanes  # weights absent: documented no-op
+
+        # Refresh masks on the every-N-frames cadence (or when the cache is empty).
+        # The seg head runs regardless of how many CLRerNet lanes there are, so
+        # solid_lane_masks() reflects the current frame even when CLRerNet found
+        # nothing - the mask-based crossing test depends on those masks.
+        if self._type_masks is None or self._frame_count % self.type_every_n == 0:
+            self._type_masks = self._run_type_model(frame)
+        self._frame_count += 1
+
+        for lane in lanes:
+            voted = self._vote_lane_type(lane, self._type_masks)
+            if voted is not None:
+                lane.lane_type = voted
+        return lanes
+
+    def solid_lane_masks(self) -> list[tuple[LaneType, np.ndarray, float]]:
+        """
+        SOLID lane masks (solid_white / solid_yellow) from the most recent
+        `detect()`: a list of (lane_type, polygon, conf) where each polygon is an
+        int32 Nx2 array of full-resolution frame coordinates (cv2 contour form) and
+        `conf` is the seg head's confidence for that instance.
+
+        Empty if the Phase 3 type head is unavailable or no solid lane was seen.
+        Feed this straight into SolidMaskStabilizer.update(): the confidence drives
+        the hysteresis (t_high/t_low), and the stabilized binary mask it returns is
+        what the crossing test checks the vehicle's bottom-center anchor against.
+        """
+        if not self._type_masks:
+            return []
+        return [(lt, poly, conf) for lt, poly, conf in self._type_masks
+                if lt in ("solid_white", "solid_yellow")]
+
+    def _ensure_type_model(self) -> None:
+        """Lazily load the YOLOv8-seg lane-type head. If the weights file is
+        absent (model still training), mark it unavailable and stay a no-op."""
+        if self._type_model is not None or self._type_unavailable:
+            return
+        import os
+        if not os.path.isfile(self.type_weights):
+            self._type_unavailable = True
+            print(f"[DLLaneDetector] lane-type weights not found: {self.type_weights} "
+                  f"- lane_type stays 'unknown' until the Phase 3 head is trained.")
+            return
+        from ultralytics import YOLO
+        self._type_model = YOLO(self._as_pt(self.type_weights), task="segment")
+
+    @staticmethod
+    def _as_pt(weights_path: str) -> str:
+        """Ultralytics' loader only accepts a `.pt` suffix; our Phase 3 weights are
+        saved `.pth`, so materialize a `.pt` copy alongside and load that."""
+        if weights_path.lower().endswith(".pt"):
+            return weights_path
+        import os
+        import shutil
+        pt_path = os.path.splitext(weights_path)[0] + ".pt"
+        if not os.path.isfile(pt_path) or os.path.getmtime(pt_path) < os.path.getmtime(weights_path):
+            shutil.copy2(weights_path, pt_path)
+        return pt_path
+
+    def _run_type_model(self, frame: np.ndarray) -> list[tuple[LaneType, np.ndarray, float]]:
+        """Run the seg head on `frame`; return [(LaneType, polygon int32 array, conf)]
+        for every instance whose class maps onto our contract. Polygons come back
+        in full-resolution frame pixel coords - the same space as `Lane.points`.
+        Confidence is surfaced so SolidMaskStabilizer can apply hysteresis."""
+        device = 0 if self.device == "cuda" else "cpu"
+        res = self._type_model.predict(frame, conf=self.type_conf,
+                                       verbose=False, device=device)[0]
+        masks: list[tuple[LaneType, np.ndarray, float]] = []
+        if res.masks is None:
+            return masks
+        names = res.names  # {idx: class_name}
+        for poly, cls_id, conf in zip(res.masks.xy, res.boxes.cls.tolist(), res.boxes.conf.tolist()):
+            if poly is None or len(poly) < 3:
+                continue
+            lane_type = _SEG_NAME_TO_LANETYPE.get(names[int(cls_id)])
+            if lane_type is None:
+                continue  # class outside our contract: ignore
+            masks.append((lane_type, np.asarray(poly, dtype=np.int32), float(conf)))
+        return masks
+
+    def _vote_lane_type(
+        self,
+        lane: Lane,
+        masks: list[tuple[LaneType, np.ndarray]],
+    ) -> LaneType | None:
+        """Sample points down `lane` and return the seg class most of them fall
+        inside, or None if the lane overlaps no mask."""
+        import cv2
+
+        y_top, y_bottom = lane.top[1], lane.bottom[1]
+        if y_bottom <= y_top:
+            return None
+        votes: dict[LaneType, int] = {}
+        n = self.type_samples
+        for i in range(n):
+            y = int(round(y_top + (y_bottom - y_top) * i / (n - 1)))
+            x = lane.x_at_y(y)
+            if x is None:
+                continue
+            pt = (float(x), float(y))
+            for lane_type, poly, _conf in masks:
+                if cv2.pointPolygonTest(poly, pt, False) >= 0:
+                    votes[lane_type] = votes.get(lane_type, 0) + 1
+        if not votes:
+            return None
+        return max(votes, key=votes.get)
 
     # ------------------------------------------------------------------
     # UnLanedet-specific methods (Phase 2, implemented against the real API).

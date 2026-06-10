@@ -1,0 +1,37 @@
+{
+  "_comment": "Ground-truth violation windows for the 'vehicle on solid white line' test harness. Keyed by clip ID prefix (matches files in tests_videos/raw_videos/crossing_solid_line/, ignoring *_annotated.mp4). Each window: start/end FRAME indices + scoring weight. fps is informational (harness reads it from the video; K/M/cooldown are defined in seconds and converted per-clip). JqDMXT4Eue4 intentionally omitted (occlusion, YOLO unreliable). I3AcpHTrEXI has a 2nd violation our logic cannot catch by design -> intentionally NOT labeled.",
+  "clips": {
+    "0SmdindPVEY": { "fps": 58.82, "windows": [
+      { "start": 350, "end": 540, "weight": 0.3, "note": "YOLO struggles here -> low weight" },
+      { "start": 530, "end": 680, "weight": 1.0 }
+    ]},
+    "B7-3EuQFAZM": { "fps": 58.83, "windows": [
+      { "start": 545, "end": 640, "weight": 1.0 }
+    ]},
+    "NFTpZcN4UsU": { "fps": 58.83, "windows": [
+      { "start": 620, "end": 660, "weight": 1.0 }
+    ]},
+    "Rj2yWbv1934": { "fps": 60.00, "windows": [
+      { "start": 657, "end": 810, "weight": 1.0 }
+    ]},
+    "nQp2m8oONBI": { "fps": 25.00, "windows": [
+      { "start": 250, "end": 375, "weight": 1.0 },
+      { "start": 3025, "end": 3075, "weight": 0.3, "note": "hard -> low weight" },
+      { "start": 4300, "end": 4325, "weight": 1.0 },
+      { "start": 4350, "end": 4375, "weight": 1.0 }
+    ]},
+    "I3AcpHTrEXI": { "fps": 25.00, "windows": [
+      { "start": 167, "end": 200, "weight": 1.0 }
+    ]},
+    "S9kQqWl05KU": { "fps": 30.00, "portrait": true, "windows": [
+      { "start": 52, "end": 80, "weight": 1.0 },
+      { "start": 135, "end": 185, "weight": 1.0 }
+    ]},
+    "yI0uJzyS-mQ": { "fps": 29.85, "windows": [
+      { "start": 273, "end": 283, "weight": 1.0 }
+    ]},
+    "DiU52hnxSVY": { "fps": 29.97, "windows": [
+      { "start": 220, "end": 240, "weight": 1.0 }
+    ]}
+  }
+}

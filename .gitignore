@@ -8,7 +8,22 @@ __pycache__/
 
 # Large local-only data / media
 datasets/
+dataset_extraction/
 tests_videos/
+
+# Pipeline outputs (pseudo-labels, hard-example curation, training runs)
+outputs/
+dataset_curation/
+
+# Archived/shelved dev scripts (dataset, upload, training, grids, scratch) — local only
+tools/_archive/
+
+# Shelved lane-classifier experiments — local only
+line_crossing/experiments/
+line_crossing/lab_classifiers_v3.py
+
+# Local Claude allow-rules (machine-specific paths) — not shared
+.claude/settings.json
 
 # Python processing unit outputs
 output.mp4
@@ -20,6 +35,7 @@ test_1_yolo.jsonl
 yolov8m.pt
 yolov8x.pt
 yolov8n.pt
+yolov8n-seg.pt
 
 # DL lane-detection env (Phase 0) — never commit envs / build artifacts / cloned framework
 .venv/
@@ -28,6 +44,7 @@ env/
 roadguard-dl/
 UnLanedet/
 weights/
+models/
 *.so
 *.pyd
 build/

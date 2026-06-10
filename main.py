@@ -1,151 +1,172 @@
-import sys
+"""
+Step 8 (polished): end-to-end violation pipeline with init-zoom + dashboard fixes.
+
+  * LaneDetector  — classical CV pipeline with temporal smoothing + dead reckoning
+  * YOLO (yolov8m) — vehicle tracking with persistent IDs
+  * CrossingMonitor — flags vehicles whose bbox intersects a solid lane line
+  * Spatial gate — drops YOLO boxes whose bottom edge sits below y=1000
+                   (filters out the ego-vehicle dashboard/hood detection)
+  * Writer hard-locked to 1920x1080, frame.copy() used as render canvas
+"""
+
+from pathlib import Path
+
 import cv2
-from video_handler import VideoHandler
 from ultralytics import YOLO
-from ultralytics.engine.results import Results
+
 from Constants import DetectClass
-from Objects.World import World
-
-from frameLogger import FrameLogger
-from line_crossing.line_detector import detect_solid_lines
-from line_crossing.crossing_detector import check_crossing
+from line_crossing.line_detector import LaneDetector
+from line_crossing.crossing_detector import CrossingMonitor
 
 
-YOLO_MODEL = None
-CLASSES = DetectClass.Detection_Classes
-CONFIDENCE_LVL = 0.5
+INPUT_VIDEO = Path(
+    "tests_videos/raw_videos/crossing_solid_line/"
+    "0SmdindPVEY_Crossing_solid_white_line_-_Dashcam.f299.mp4"
+)
+OUTPUT_VIDEO = Path("final_polished_test.avi")
+MAX_FRAMES   = 300
+
+OUTPUT_WIDTH  = 1920
+OUTPUT_HEIGHT = 1080
+
+YOLO_WEIGHTS = "yolov8m.pt"
+YOLO_CONF    = 0.5
+
+# Drop any YOLO bbox whose bottom edge sits below y=1000 — that's where the
+# ego-vehicle dashboard/hood sits in this 1080p mount, and YOLO sometimes
+# hallucinates a "car" on those reflections/edges.
+EGO_VEHICLE_MIN_Y = 1000
+
+LANE_COLOR_BGR      = (0, 0, 255)
+LANE_THICKNESS      = 15
+BBOX_COLOR_BGR      = (0, 255, 0)
+BBOX_THICKNESS      = 4
+VIOLATION_COLOR_BGR = (0, 0, 255)
+VIOLATION_THICKNESS = 10
 
 
-# load yolov8 model and set it to YOLO_MODEL (for now we'll use model x)
-def loadYoloModel():
-    #global YOLO_MODEL
-    try:
-        return YOLO("yolov8m.pt")
-    except Exception as e:
-        print(f"Error occurred: {e}")
-
-
-"""Is the yolov8 model uses some tracking algorithm?"""
-def processFrame(yolo_model, world: World, frame, frame_id, frame_logger: FrameLogger):
-    # run object tracking on the frame using YOLO
-    results = yolo_model.track(
-        frame,
-        persist=True,       #tracker="bytetrack.yaml",  # or "botsort.yaml" - claude
-        # change to False later
-        verbose=True,
-        classes=CLASSES,
-        conf=CONFIDENCE_LVL
-        #iou=0.5,               # IoU threshold for NMS (non-max suppression)
-    )
-
-    detections = results[0]
-    vehicle_ids_in_frame = []
-    traffic_light_ids_in_frame = []
-
-    """ Remove when not testing"""
-    logger_bounding_boxes = 0
-    
-    for box in detections.boxes:
-
-        object_id = int(box.id.item())
-        object_type = int(box.cls.item())
-        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-        bounding_box = (x1, y1, x2, y2)
-
-        logger_bounding_boxes += 1
-
-        # if the object is a vehicle
-        if object_type in DetectClass.Vehicle_Classes:
-            vehicle_ids_in_frame.append(object_id)
-
-            # create a new Vehicle object
-            if world.getVehicle(object_id) is None:
-                world.addVehicle(object_id, object_type, frame_id)
-
-            v = world.getVehicle(object_id)
-            v.updateBoxAndEndFrame(frame_id, bounding_box)
-
-        # if the object is a traffic light
-        if object_type in DetectClass.Traffic_Light_Class:
-            traffic_light_ids_in_frame.append(object_id)
-
-            # create new traffic light object
-            if world.getTrafficLight(object_id) is None:
-                world.addTrafficLight(object_id, frame_id)
-
-            trl = world.getTrafficLight(object_id)
-            trl.updateBoxAndEnsFrame(frame_id, bounding_box)
-
-    world.registerFrame(frame_id, vehicle_ids_in_frame, traffic_light_ids_in_frame)
-    world.detected_lines[frame_id] = detect_solid_lines(frame)
-
-    frame_logger.log_frame(frame_id, vehicle_ids_in_frame, traffic_light_ids_in_frame, logger_bounding_boxes, world.detected_lines.get(frame_id, {}))
-
-
-    """rendered = results[0].plot()
-
-    # display the processed frame
-    cv2.imshow("frame", rendered)"""
-
+def _filter_ego_vehicle(bbox: tuple[int, int, int, int]) -> bool:
+    """Return True if bbox should be kept (i.e. it's NOT the ego dashboard region)."""
+    return bbox[3] <= EGO_VEHICLE_MIN_Y
 
 
 def main():
+    cap = cv2.VideoCapture(str(INPUT_VIDEO))
+    if not cap.isOpened():
+        raise SystemExit(f"failed to open {INPUT_VIDEO}")
 
-    """ Just for testing"""
-    yolo_logger = FrameLogger('test_1_yolo')
-    world_logger = FrameLogger('test_1_world')
-    
-    # load yolov8 model
-    yolo_model = loadYoloModel()
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-    # get the video path from command line argumants
-    video_path = sys.argv[1]
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    writer = cv2.VideoWriter(
+        str(OUTPUT_VIDEO), fourcc, fps, (OUTPUT_WIDTH, OUTPUT_HEIGHT),
+    )
+    if not writer.isOpened():
+        cap.release()
+        raise SystemExit(f"failed to open writer for {OUTPUT_VIDEO}")
 
-    # create video handler object
-    vh = VideoHandler(video_path)
+    print(f"input: {INPUT_VIDEO.name}  @ {fps:.2f} fps")
+    print(f"output: {OUTPUT_VIDEO}  (XVID, {OUTPUT_WIDTH}x{OUTPUT_HEIGHT}, up to {MAX_FRAMES} frames)")
 
-    world = World(vh.get_frame_count())
+    yolo     = YOLO(YOLO_WEIGHTS)
+    detector = LaneDetector()
+    monitor  = CrossingMonitor()
 
-    print(f"number of frames in the video is {vh.get_frame_count()}")
+    written        = 0
+    new_violations = 0
 
-    frame_id = 0
-
-    # iterates on the video's frames and sends them to process
-    while True:
-        # get the current frame
-        frame = vh.get_frame()
-
-        # stop if there are no more frames
-        if frame is None:
+    while written < MAX_FRAMES:
+        ok, frame = cap.read()
+        if not ok:
             break
 
-        """ Remove frame_logger when not testing"""
-        processFrame(yolo_model, world, frame, frame_id, yolo_logger)
+        # Defensive: enforce exact output resolution regardless of source.
+        if frame.shape[0] != OUTPUT_HEIGHT or frame.shape[1] != OUTPUT_WIDTH:
+            frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
-        # exit loop if 'q' is pressed
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # Render canvas is an independent copy so nothing the detectors do can
+        # bleed back into the output (even though they don't mutate today).
+        canvas = frame.copy()
 
-        frame_id += 1
-        vh.read_next()
-    
-    # release video resources
-    vh.release()
+        try:
+            lanes = detector.detect_lanes(frame)
+        except Exception as exc:
+            print(f"frame {written}: detect_lanes failed ({exc})")
+            lanes = {}
 
-    for vehicle in world.vehicles.values():
-        violation_frame = check_crossing(vehicle, world.detected_lines)
-        if violation_frame is not None:
-            print(f"[VIOLATION] Vehicle {vehicle.id} crossed a solid line at frame {violation_frame}")
-            # TODO: POST /api/internal/violation to report to backend
+        results = yolo.track(
+            frame,
+            persist=True,
+            verbose=False,
+            classes=DetectClass.Vehicle_Classes,
+            conf=YOLO_CONF,
+        )
 
-    """ Part of the testing remove later"""
-    for frame_counter in range(world.frame_count):
-        bbox_counter = len(world.objects_in_frame[frame_counter].vehicle_ids) + len(world.objects_in_frame[frame_counter].traffic_light_ids)
-        world_logger.log_frame(frame_counter, world.objects_in_frame[frame_counter].vehicle_ids, world.objects_in_frame[frame_counter].traffic_light_ids, bbox_counter)
+        vehicles: list[tuple[int, tuple[int, int, int, int]]] = []
+        boxes = results[0].boxes if results else None
+        if boxes is not None:
+            for box in boxes:
+                if box.id is None:
+                    continue
+                vid = int(box.id.item())
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                bbox = (x1, y1, x2, y2)
+                if not _filter_ego_vehicle(bbox):
+                    continue
+                vehicles.append((vid, bbox))
+
+        for vid, bbox in vehicles:
+            if monitor.update(vid, bbox, lanes):
+                new_violations += 1
+                print(f"[VIOLATION] vehicle {vid} crossed solid line at frame {written}")
+
+        # ---- render onto canvas (NOT onto frame passed into detectors) ----
+        for x1, y1, x2, y2 in lanes.values():
+            cv2.line(canvas, (x1, y1), (x2, y2), LANE_COLOR_BGR, LANE_THICKNESS)
+
+        any_violator_visible = False
+        for vid, (x1, y1, x2, y2) in vehicles:
+            if monitor.is_violator(vid):
+                any_violator_visible = True
+                cv2.rectangle(
+                    canvas, (x1, y1), (x2, y2),
+                    VIOLATION_COLOR_BGR, VIOLATION_THICKNESS,
+                )
+                cv2.putText(
+                    canvas, f"VIOLATION  ID {vid}",
+                    (x1, max(y1 - 20, 40)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.6, VIOLATION_COLOR_BGR, 5,
+                )
+            else:
+                cv2.rectangle(
+                    canvas, (x1, y1), (x2, y2),
+                    BBOX_COLOR_BGR, BBOX_THICKNESS,
+                )
+                cv2.putText(
+                    canvas, f"ID {vid}",
+                    (x1, max(y1 - 10, 25)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, BBOX_COLOR_BGR, 2,
+                )
+
+        if any_violator_visible:
+            # Massive banner stretched across the top of the frame.
+            cv2.putText(
+                canvas, "!!! SOLID LINE VIOLATION !!!",
+                (80, 130),
+                cv2.FONT_HERSHEY_SIMPLEX, 3.5, VIOLATION_COLOR_BGR, 10,
+            )
+
+        writer.write(canvas)
+        written += 1
+
+    cap.release()
+    writer.release()
+
+    print(
+        f"done: wrote {written} frames, "
+        f"{new_violations} unique vehicles flagged for crossing the solid line"
+    )
 
 
-
-
-# the main function of the program
 if __name__ == "__main__":
     main()

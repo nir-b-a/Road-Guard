@@ -13,8 +13,10 @@ Conventions
   any crop/resize before constructing a `Lane`.
 * Points are ordered BOTTOM -> TOP, i.e. from the largest y (nearest the car)
   to the smallest y (toward the vanishing point). `bottom`/`top` rely on this.
-* `lane_type` is "unknown" until the Phase 3 type head exists; the geometric
-  baseline (Phase 2) emits geometry only.
+* `lane_type` is "unknown" until a type source assigns it. The classical
+  detector emits the color-agnostic "solid"/"dashed"; the Phase 3 DL head emits
+  the color-aware "solid_white"/"solid_yellow"/"dashed". The geometric CLRerNet
+  baseline leaves it "unknown" until `_classify_types` runs.
 * `position` is the ego-relative lane index: -1 = first lane boundary to the
   left of the car, +1 = first to the right, -2/+2 further out, None if unknown.
   It is assigned GEOMETRICALLY in post-processing, not predicted by the model.
@@ -27,9 +29,17 @@ from typing import Literal, Protocol, runtime_checkable
 
 import numpy as np
 
-# Semantic lane-line type. Kept deliberately small; map VIL-100's 10 categories
-# down to this taxonomy in the Phase 3 dataloader.
-LaneType = Literal["solid", "dashed", "unknown"]
+# Semantic lane-line type.
+#   * Color-aware values come from the Phase 3 YOLOv8-seg head:
+#       solid_white  <- solid_white_lane
+#       solid_yellow <- yellow_solid_lane
+#       dashed       <- dashed_lane (white & yellow unified)
+#   * "solid" is the color-AGNOSTIC value the classical detector emits (it can't
+#     tell white from yellow); kept so the classical ablation baseline stays
+#     valid under this shared contract.
+#   * Crossing logic treats EVERY "solid*" value as a non-crossable boundary
+#     (see crossing_detector's startswith("solid") gate and Lane.is_solid).
+LaneType = Literal["solid", "solid_white", "solid_yellow", "dashed", "unknown"]
 
 Point = tuple[int, int]
 
@@ -55,7 +65,9 @@ class Lane:
 
     @property
     def is_solid(self) -> bool:
-        return self.lane_type == "solid"
+        """Any solid variant (color-agnostic "solid" or color-aware
+        "solid_white"/"solid_yellow") is a non-crossable boundary."""
+        return self.lane_type.startswith("solid")
 
     def x_at_y(self, y: int) -> float | None:
         """
