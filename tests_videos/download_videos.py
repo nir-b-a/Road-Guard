@@ -3,6 +3,7 @@ Download categorized dashcam videos from YouTube for YOLOv8 training.
 Saves to raw_videos/<category>/ — this folder is gitignored.
 Requires: pip install yt-dlp  (and ffmpeg on PATH for merged audio+video)
 """
+from __future__ import annotations
 
 import subprocess
 import sys
