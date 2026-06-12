@@ -23,6 +23,7 @@ class World:
         self.traffic_lights: dict[int, TrafficLight] = {}
 
         self.objects_in_frame: dict[int, FrameData] = {}
+        self.detected_lines: dict[int, dict[str, tuple]] = {}  # frame_id -> {"solid_separator_line": (x1,y1,x2,y2), ...}
 
 
     """def addVehicle(self, vehicle: Vehicle):

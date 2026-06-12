@@ -23,13 +23,10 @@ class Vehicle:
 
     def updateBoxAndEndFrame(self, frame_id: int, bbox: tuple[int, int, int, int]):
         self.bounding_box[frame_id] = bbox
-        self.end_frame = frame_id               # IMPORTANT! If frame_id is relative (for example we process the 300th frame but it's the first time this object appears,
-                                                #   so the frame_id the function gets is 1) then we need to change the logic here and set the right frame_id to end_frame.
-
-        # if a vehicle is missing in some frames and reappears later, we set its bounding box to (0,0,0,0)
-        index = self.start_frame
-        for index in range(self.end_frame):
-            self.bounding_box.setdefault(index, (0, 0, 0, 0))
+        # Fill gaps between last seen frame and current frame (vehicle temporarily left detection)
+        for missing_frame in range(self.end_frame + 1, frame_id):
+            self.bounding_box.setdefault(missing_frame, (0, 0, 0, 0))
+        self.end_frame = frame_id
 
     # To easily get the bounding box of a vehicle by his relative frame (for example, (1) -> the bounding box from the first frame he appears in)
     def getRelativeFrameBbox(self, relative_frame_id: int):
@@ -47,10 +44,14 @@ class Vehicle:
         return frame_id - self._lpr_last_read_frame >= read_interval
 
     def centerInFrame(self, frame_id: int) -> tuple[int, int] | None:
-        bbox = self.bounding_box[frame_id]
-
+        bbox = self.bounding_box.get(frame_id)
         if bbox is None:
             return None
-        
-        return((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
+        return ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
+
+    def bottomCenterInFrame(self, frame_id: int) -> tuple[int, int] | None:
+        bbox = self.bounding_box.get(frame_id)
+        if bbox is None:
+            return None
+        return ((bbox[0] + bbox[2]) // 2, bbox[3])
     
