@@ -16,7 +16,9 @@ class Vehicle:
 
     # a speed value for each frame. May not be needed so as for now, it's in comment.
     speed_per_frame: dict[int, int] = field(default_factory=dict, repr=False)               # The constructor won't ask for a speed_per_frame dict.
-    #license_plate: int = field(repr=False)
+    license_plate: str | None = field(default=None, repr=False)
+    _plate_candidates: list = field(default_factory=list, repr=False)
+    _lpr_last_read_frame: int = field(default=-1, repr=False)
 
 
     def updateBoxAndEndFrame(self, frame_id: int, bbox: tuple[int, int, int, int]):
@@ -30,6 +32,17 @@ class Vehicle:
     def getRelativeFrameBbox(self, relative_frame_id: int):
         return self.bounding_box[relative_frame_id]
     
+    def needs_lpr(self, min_area: int, frame_id: int, read_interval: int = 40) -> bool:
+        if not self.bounding_box:
+            return False
+        bbox = self.bounding_box.get(self.end_frame, (0, 0, 0, 0))
+        if bbox == (0, 0, 0, 0):
+            return False
+        x1, y1, x2, y2 = bbox
+        if (x2 - x1) * (y2 - y1) < min_area:
+            return False
+        return frame_id - self._lpr_last_read_frame >= read_interval
+
     def centerInFrame(self, frame_id: int) -> tuple[int, int] | None:
         bbox = self.bounding_box.get(frame_id)
         if bbox is None:

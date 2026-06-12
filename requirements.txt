@@ -67,6 +67,9 @@ albumentations==1.4.10
 albucore==0.0.13
 pillow==10.4.0
 
+# yt-dlp: fetch dataset videos (tests_videos/download_videos.py).
+yt-dlp
+
 # NOTE: torch / torchvision are intentionally NOT listed here — install them in
 # STEP 3 from the cu118 index, or pip will pull a CPU-only build.
 # NOTE: do not add UnLanedet itself here; it is NOT on PyPI. Clone its repo and
