@@ -1,5 +1,11 @@
 
 
+class LPR:
+    # Minimum vehicle bounding-box area (pixels²) before attempting plate recognition.
+    # ~150×100px — below this the plate is too small to read reliably.
+    MIN_VEHICLE_AREA = 15000
+
+
 class DetectClass:
     Car = 2
     Motorcycle = 3

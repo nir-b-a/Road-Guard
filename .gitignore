@@ -14,3 +14,6 @@ yolov8x.pt
 
 # Downloaded dataset videos (use tests_videos/download_videos.py to get them)
 tests_videos/raw_videos/
+test_videos/
+
+.idea/

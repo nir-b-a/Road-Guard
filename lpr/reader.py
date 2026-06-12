@@ -1,0 +1,152 @@
+import re
+import cv2
+import numpy as np
+from abc import ABC, abstractmethod
+from collections import Counter
+from typing import TYPE_CHECKING
+from fast_alpr import ALPR
+
+if TYPE_CHECKING:
+    from Objects.Vehicle import Vehicle
+
+
+def _preprocess_plate(crop: np.ndarray) -> np.ndarray:
+    # upscale so small plates have enough pixels for OCR to work with
+    h, w = crop.shape[:2]
+    crop = cv2.resize(crop, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+    # sharpen
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    crop = cv2.filter2D(crop, -1, kernel)
+    # boost contrast via CLAHE on the L channel
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(l)
+    crop = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    return crop
+
+
+def _validate_israeli_plate(text: str) -> str | None:
+    digits = re.sub(r'\D', '', text)
+    if len(digits) == 7:   # pre-2017: XX-XXX-XX
+        return f"{digits[:2]}-{digits[2:5]}-{digits[5:]}"
+    if len(digits) == 8:
+        if digits[0] == '0':  # likely OCR hallucinated a leading zero on a 7-digit plate
+            return f"{digits[1:3]}-{digits[3:6]}-{digits[6:]}"
+        return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"   # post-2017: XXX-XX-XXX
+    return None
+
+
+class LPRReader(ABC):
+    @abstractmethod
+    def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
+        """Returns a validated Israeli plate string (XX-XXX-XX or XXX-XX-XXX), or None."""
+        pass
+
+
+def _ocr_confidence(conf: float | list[float]) -> float:
+    return float(np.mean(conf)) if isinstance(conf, list) else conf
+
+
+class FastALPRReader(LPRReader):
+    def __init__(self):
+        # detector_model default: yolo-v9-t-384-license-plate-end2end
+        # ocr_model: global-plates-mobile-vit-v2-model gives broader plate coverage
+        self._alpr = ALPR(ocr_model="global-plates-mobile-vit-v2-model")
+
+    def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
+        results = self._alpr.predict(vehicle_crop)
+        if not results:
+            return None
+        best = max(results, key=lambda r: _ocr_confidence(r.ocr.confidence) if r.ocr else 0.0)
+        if best.ocr is None:
+            return None
+        return _validate_israeli_plate(best.ocr.text)
+
+
+class EasyOCRReader(LPRReader):
+    def __init__(self):
+        import easyocr
+        # Use fast-alpr's detector only for plate localisation; replace its OCR with EasyOCR
+        self._alpr = ALPR(ocr_model="global-plates-mobile-vit-v2-model")
+        # digit-only allowlist since Israeli plates are purely numeric
+        self._ocr = easyocr.Reader(['en'], gpu=False)
+
+    def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
+        results = self._alpr.predict(vehicle_crop)
+        if not results:
+            return None
+        best = max(results, key=lambda r: r.detection.confidence)
+        bb = best.detection.bounding_box
+        plate_crop = vehicle_crop[bb.y1:bb.y2, bb.x1:bb.x2]
+        if plate_crop.size == 0:
+            return None
+        ocr_results = self._ocr.readtext(plate_crop, allowlist='0123456789', detail=0)
+        if not ocr_results:
+            return None
+        return _validate_israeli_plate(''.join(ocr_results))
+
+
+class CustomDetectorReader(LPRReader):
+    def __init__(self, detector_path: str = "israeli_plates.pt"):
+        from ultralytics import YOLO
+        import easyocr
+        self._detector = YOLO(detector_path)
+        self._ocr = easyocr.Reader(['en'], gpu=False)
+
+    def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
+        results = self._detector.predict(vehicle_crop, verbose=False, conf=0.3)
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return None
+        best_idx = int(boxes.conf.argmax().item())
+        x1, y1, x2, y2 = map(int, boxes.xyxy[best_idx].tolist())
+        plate_crop = vehicle_crop[y1:y2, x1:x2]
+        if plate_crop.size == 0:
+            return None
+        plate_crop = _preprocess_plate(plate_crop)
+        ocr_results = self._ocr.readtext(plate_crop, allowlist='0123456789', detail=0)
+        if not ocr_results:
+            return None
+        return _validate_israeli_plate(''.join(ocr_results))
+
+
+class PaddleOCRDetectorReader(LPRReader):
+    def __init__(self, detector_path: str = "israeli_plates.pt"):
+        from ultralytics import YOLO
+        from paddleocr import PaddleOCR
+        self._detector = YOLO(detector_path)
+        self._ocr = PaddleOCR(use_angle_cls=False, lang='en', use_gpu=False, show_log=False)
+
+    def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
+        results = self._detector.predict(vehicle_crop, verbose=False, conf=0.3)
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return None
+        best_idx = int(boxes.conf.argmax().item())
+        x1, y1, x2, y2 = map(int, boxes.xyxy[best_idx].tolist())
+        plate_crop = vehicle_crop[y1:y2, x1:x2]
+        if plate_crop.size == 0:
+            return None
+        plate_crop = _preprocess_plate(plate_crop)
+        result = self._ocr.ocr(plate_crop, det=False, cls=False)
+        if not result or not result[0]:
+            return None
+        text = ''.join([item[0] for item in result[0] if item])
+        return _validate_israeli_plate(text)
+
+
+def try_read_plate(vehicle: 'Vehicle', frame: np.ndarray, reader: LPRReader, min_area: int, frame_id: int) -> None:
+    if not vehicle.needs_lpr(min_area, frame_id):
+        return
+    x1, y1, x2, y2 = vehicle.bounding_box[vehicle.end_frame]
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return
+    vehicle._lpr_last_read_frame = frame_id
+    plate = reader.read_plate(crop)
+    if plate:
+        vehicle._plate_candidates.append(plate)
+        counts = Counter(vehicle._plate_candidates)
+        max_count = max(counts.values())
+        vehicle.license_plate = next(p for p in reversed(vehicle._plate_candidates) if counts[p] == max_count)
+        print(f"[LPR] Vehicle {vehicle.id} → {plate} ({len(vehicle._plate_candidates)} reads)")
