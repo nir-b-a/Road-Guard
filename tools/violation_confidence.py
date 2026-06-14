@@ -202,6 +202,55 @@ def confidence_lr(feat: dict, model: dict) -> float:
     return 1.0 / (1.0 + np.exp(-np.clip(z, -50, 50)))
 
 
+def search_user_objective(samples: list, fp_w: float = 0.1, top: int = 8) -> tuple:
+    """Try MANY confidence formulas and keep the one maximising Tal's objective:
+        S = sum_TP (conf * 1)  -  fp_w * sum_FP (conf)
+    (reward confidence on real violations, penalise it on false ones at weight fp_w).
+    Raising fp_w forces the winner to actually push FP confidence DOWN (better separation).
+    Formula = combine( f_distance, f_angle ); we sweep forms + params for both."""
+    d = np.array([f["distance"] for f, _, _ in samples])
+    a = np.array([f["angle_off"] for f, _, _ in samples])
+    sign = np.array([1.0 if t else -fp_w for _, t, _ in samples])
+    nTP, nFP = int((sign > 0).sum()), int((sign < 0).sum())
+
+    def logd(x, x0, k):                    # 1 for small x -> 0 as x grows
+        return 1.0 / (1.0 + np.exp(np.clip(k * (x - x0), -50, 50)))
+
+    def lind(x, x0, s):                     # 1 until x0, linear ramp down
+        return np.clip(1.0 - s * (x - x0), 0.0, 1.0)
+
+    dist_funcs = [("dist=1", np.ones_like(d))]
+    for x0 in (10, 15, 20, 25, 30, 40, 50, 70):
+        for k in (0.05, 0.1, 0.15, 0.2, 0.3, 0.5):
+            dist_funcs.append((f"logistic(d50={x0},k={k})", logd(d, x0, k)))
+        for s in (0.01, 0.02, 0.04):
+            dist_funcs.append((f"linear(d0={x0},slope={s})", lind(d, x0, s)))
+
+    ang_funcs = [("angle=1", np.ones_like(a))]
+    for x0 in (0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.85):
+        for k in (3, 5, 8, 12, 20):
+            ang_funcs.append((f"logistic(a50={x0},k={k})", logd(a, x0, k)))
+
+    combines = [("prod", lambda fd, fa: fd * fa),
+                ("min", lambda fd, fa: np.minimum(fd, fa)),
+                ("mean", lambda fd, fa: 0.5 * (fd + fa))]
+
+    results = []
+    for dn, dv in dist_funcs:
+        for an, av in ang_funcs:
+            for cn, cf in combines:
+                conf = np.clip(cf(dv, av), 0.0, 1.0)
+                results.append((float(conf @ sign), dn, an, cn, conf))
+    results.sort(key=lambda r: r[0], reverse=True)
+
+    print(f"\n=== USER-OBJECTIVE search   S = sum_TP conf  -  {fp_w} * sum_FP conf ===")
+    print(f"  events TP={nTP} FP={nFP}   baseline(conf=1 all): S={sign.sum():.2f}   perfect(TP=1,FP=0): S={nTP:.2f}")
+    print(f"  tried {len(results)} formulas; top {top}:")
+    for S, dn, an, cn, conf in results[:top]:
+        print(f"    S={S:6.2f}  [{cn:4}]  {dn:22} x {an:20}  TPconf={conf[sign>0].mean():.2f} FPconf={conf[sign<0].mean():.2f}")
+    return results[0]
+
+
 def render_confidence(prefix: str, model: dict, k_sec: float = EVENT_K_SEC, panel_w: int = 1280) -> None:
     """Write <prefix>_confidence.mp4: each firing vehicle boxed in red with its confidence float."""
     cache = cvt.load_cache(prefix)
@@ -258,6 +307,8 @@ def main() -> None:
     ap.add_argument("--reuse", action="store_true", help="reuse cached extracted features (skip timeline recompute)")
     ap.add_argument("--render", nargs="*", metavar="CLIP",
                     help="render confidence overlay video(s): give clip prefixes, or 'ALL' for every labeled clip")
+    ap.add_argument("--search", action="store_true",
+                    help="sweep many formulas to maximise S = sum_TP conf - 0.1*sum_FP conf")
     args = ap.parse_args()
 
     if args.reuse and os.path.isfile(SAMPLES_JSON):
@@ -290,6 +341,10 @@ def main() -> None:
                    "note": "logistic regression; confidence = P(real violation). resolution "
                            "excluded (confounded with FP-source clips in the validation set)."}, fh, indent=2)
     print(f"[saved] {MODEL_JSON}   (AUC={auc:.3f})")
+
+    if args.search:
+        for fp_w in (0.1, 0.3, 0.5, 1.0):
+            search_user_objective(samples, fp_w=fp_w)
 
     if args.render is not None:
         with open(args.labels) as fh:
