@@ -98,7 +98,10 @@ def render_snippet(video_path: str, cache: dict, violation: dict, out_dir: str,
     win_s, win_e = max(0, s - pad), e + pad
 
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{prefix}_violation_{tid}.mp4")
+    # include violation_id so multiple violations on one track don't overwrite each other
+    vid = violation.get("violation_id")
+    name = f"{prefix}_violation_{tid}_{vid}.mp4" if vid is not None else f"{prefix}_violation_{tid}.mp4"
+    out_path = os.path.join(out_dir, name)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     font = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -158,6 +161,11 @@ def render_snippet(video_path: str, cache: dict, violation: dict, out_dir: str,
 # CLI
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    # Windows consoles default to cp1252; force UTF-8 so the bilingual (Hebrew) reason prints.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(description="Alert + visual proof for finished violations.")
     ap.add_argument("prefix", help="clip prefix, e.g. DeNnDugXxP0")
     ap.add_argument("--video", default=None, help="video path (default: the cache's recorded path)")
