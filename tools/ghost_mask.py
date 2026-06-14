@@ -396,6 +396,7 @@ class GhostMaskTracker:
         self.side_gate = side_gate          # suppress opposite-side (oncoming) verdicts
         self.ego_x = 0.5 * W                 # ego reference ~ frame centre (dashcam roughly centred)
         self.ghosts: dict[int, dict] = {}
+        self.last_oncoming: dict[int, bool] = {}   # per-track opposite-direction flag from the last step()
 
     def _capture(self, surface, bbox):
         x1, y1, x2, y2 = [int(v) for v in bbox]
@@ -406,7 +407,8 @@ class GhostMaskTracker:
         g[ry1:ry2, rx1:rx2] = surface[ry1:ry2, rx1:rx2]
         return g
 
-    def step(self, vehicles, surface, shift, enrich: bool = False) -> dict:
+    def step(self, vehicles, surface, shift, enrich: bool = False,
+             record_oncoming: bool = False) -> dict:
         dx, dy = shift
         if self.ghosts:
             M = np.float32([[1, 0, dx], [0, 1, dy]])
@@ -414,6 +416,8 @@ class GhostMaskTracker:
                 g["mask"] = cv2.warpAffine(g["mask"], M, (self.W, self.H))
                 g["ttl"] -= 1
         hits = {}
+        if record_oncoming:
+            self.last_oncoming = {}
         for v in vehicles:
             tid, bbox = v["track_id"], v["bbox"]
             tl, tr = trigger_points(bbox)
@@ -428,8 +432,13 @@ class GhostMaskTracker:
             else:
                 jmask = surface
                 hit = line_hits(jmask, verdict)
-            # side-of-line gate: drop verdicts where the line is BETWEEN us and the vehicle (oncoming)
-            if hit and self.side_gate and oncoming_by_side(jmask, bbox, self.ego_x):
+            # opposite-direction test: the line sits BETWEEN ego and the vehicle (oncoming lane).
+            # Computed once, then used to gate (if enabled) and/or recorded for the confidence score.
+            onc = (oncoming_by_side(jmask, bbox, self.ego_x)
+                   if (self.side_gate or record_oncoming) else False)
+            if record_oncoming:
+                self.last_oncoming[tid] = onc
+            if hit and self.side_gate and onc:
                 hit = False
             if enrich:
                 # record hit GEOMETRY (intersection fractions, contact-y, centre-x) for cheap
@@ -446,22 +455,30 @@ class GhostMaskTracker:
 # Clip driver (compute once) + K sweep (cheap)
 # --------------------------------------------------------------------------- #
 def compute_verdict_timeline(frames, shifts, H, W, fps, ttl_sec=1.0,
-                             island_erode_frac=0.05, phantom_min_sec=1.0, side_gate=False):
+                             island_erode_frac=0.05, phantom_min_sec=1.0, side_gate=False,
+                             return_oncoming=False):
     """Run line-tracking -> surface -> ghost/verdict over a clip. Returns
-    {track_id: {frame_index: verdict_hit_bool}} (independent of K)."""
+    {track_id: {frame_index: verdict_hit_bool}} (independent of K). With return_oncoming=True
+    also returns {track_id: {frame_index: oncoming_bool}} (line is between ego and the vehicle),
+    so the confidence score can down-weight opposite-direction traffic in the SAME single pass."""
     ttl = max(1, round(ttl_sec * fps))
     phantom = max(0, round(phantom_min_sec * fps))   # 0 => gate disabled (readable on first sight)
     lt = LaneLineTracker(H, W, phantom)
     gt = GhostMaskTracker(H, W, ttl, island_erode_frac, side_gate=side_gate)
     timeline = defaultdict(dict)
+    oncoming = defaultdict(dict)
     for i, fr in enumerate(frames):
         comps, lab, union = reconcile_components(fr["lanes"], H, W)
         info = lt.update(comps)
         surface = surface_from_components(comps, lab, union, info, H, W, island_erode_frac)
         shift = tuple(shifts[i]) if i < len(shifts) and shifts[i] else (0.0, 0.0)
-        for tid, hit in gt.step(fr["vehicles"], surface, shift).items():
+        hits = gt.step(fr["vehicles"], surface, shift, record_oncoming=return_oncoming)
+        for tid, hit in hits.items():
             timeline[tid][fr["frame"]] = hit
-    return timeline
+        if return_oncoming:
+            for tid, onc in gt.last_oncoming.items():
+                oncoming[tid][fr["frame"]] = onc
+    return (timeline, oncoming) if return_oncoming else timeline
 
 
 def compute_enriched_timeline(frames, shifts, H, W, fps, ttl_sec=1.0,

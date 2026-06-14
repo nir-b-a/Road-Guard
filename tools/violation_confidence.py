@@ -7,6 +7,9 @@ no video). Two reliability features:
 
   distance   from bbox pixel-height (tools/distance.py) -- closer car => more reliable
   angle_off  |bbox-centre-x - frame-centre| / (W/2)     -- car near centre => more reliable
+  oncoming   line sits BETWEEN ego & car (ghost_mask.oncoming_by_side) -- opposite-direction.
+             Multiplies confidence by ONCOMING_FACTOR. This is the REAL direction signal; angle_off
+             is only a centredness proxy and cannot down-weight a centred oncoming car.
 
 The score is a CLASS-BALANCED LOGISTIC REGRESSION over these features (confidence_model.json):
 confidence = sigmoid(w . standardize(features) + b). LR learns each feature's weight AND sign
@@ -37,17 +40,29 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ghost_mask import events_from_timeline                      # noqa: E402
+from ghost_mask import events_from_timeline, compute_verdict_timeline  # noqa: E402
 import crossing_violation_test as cvt                            # noqa: E402
 from distance import distance_from_pixel_height                  # noqa: E402
+import formula_search                                            # noqa: E402  (genetic-search scorer)
+import sigmoid_search                                            # noqa: E402  (two-sigmoid scorer)
 
 # Highway clips have caches but no labels -> every event on them is a FALSE positive.
 FP_ONLY_CLIPS = ["highway_5_trans_samaria", "mitzpe_ramon_to_petah_tikva", "route_241_western_negev"]
 
 EVENT_K_SEC = 0.05    # recall-first: surface many events (incl. FPs) so calibration sees both classes
 PROD_FEATURES = ("distance", "angle_off")   # resolution excluded: confounded with FP-source clips
+ONCOMING_FACTOR = 0.30   # confidence multiplier when the car is opposite-direction (line between ego & car)
 SAMPLES_JSON = os.path.join(cvt.OUT_DIR, "confidence_samples.json")
 MODEL_JSON = os.path.join(cvt.OUT_DIR, "confidence_model.json")
+
+
+def clip_timeline_oncoming(cache: dict):
+    """Single-pass verdict timeline PLUS the per-(track,frame) opposite-direction flag, so the
+    confidence score can down-weight oncoming traffic without a second timeline pass."""
+    shifts = [fr.get("shift", [0.0, 0.0]) for fr in cache["frames"]]
+    return compute_verdict_timeline(cache["frames"], shifts, cache["h"], cache["w"], cache["fps"],
+                                    ttl_sec=cvt.TTL_SEC, island_erode_frac=cvt.ISLAND_ERODE_FRAC,
+                                    phantom_min_sec=cvt.PHANTOM_MIN_SEC, return_oncoming=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -67,7 +82,7 @@ def _track_boxes(cache: dict, tid: int, start: int, end: int) -> list:
     return out
 
 
-def event_features(cache: dict, event: tuple) -> dict | None:
+def event_features(cache: dict, event: tuple, oncoming: dict | None = None) -> dict | None:
     tid, s, e = event
     W, H = cache["w"], cache["h"]
     boxes = _track_boxes(cache, tid, s, e)
@@ -77,12 +92,16 @@ def event_features(cache: dict, event: tuple) -> dict | None:
     cxs = np.array([(b[0] + b[2]) / 2.0 for b in boxes], dtype=float)
     h_med = float(np.median(heights))                       # representative bbox height
     cx_med = float(np.median(cxs))
-    return {
+    feat = {
         "distance": distance_from_pixel_height(h_med),      # meters (calibrated power law)
         "pixel_height": h_med,
         "angle_off": abs(cx_med - W / 2.0) / (W / 2.0),     # 0 centred .. ~1 at frame edge
         "src_res": float(H),                                # source vertical resolution
     }
+    if oncoming is not None:                                # majority vote over the event window
+        flags = [bool(oncoming.get(tid, {}).get(f, False)) for f in range(s, e + 1)]
+        feat["oncoming"] = bool(flags) and (sum(flags) / len(flags) >= 0.5)
+    return feat
 
 
 def label_event(event: tuple, windows: list) -> tuple[bool, float]:
@@ -106,12 +125,12 @@ def build_dataset(labels: dict) -> list:
             print(f"[skip] {prefix}: no cache")
             continue
         cache = cvt.ensure_shifts(cache)
-        timeline = cvt.clip_timeline(cache)
+        timeline, oncoming = clip_timeline_oncoming(cache)
         kf = max(1, round(EVENT_K_SEC * cache["fps"]))
         events = events_from_timeline(timeline, kf)
         n_tp = n_fp = 0
         for ev in events:
-            feat = event_features(cache, ev)
+            feat = event_features(cache, ev, oncoming)
             if feat is None:
                 continue
             is_tp, w = label_event(ev, meta["windows"])
@@ -125,12 +144,12 @@ def build_dataset(labels: dict) -> list:
         if cache is None:
             continue
         cache = cvt.ensure_shifts(cache)
-        timeline = cvt.clip_timeline(cache)
+        timeline, oncoming = clip_timeline_oncoming(cache)
         kf = max(1, round(EVENT_K_SEC * cache["fps"]))
         events = events_from_timeline(timeline, kf)
         n = 0
         for ev in events:
-            feat = event_features(cache, ev)
+            feat = event_features(cache, ev, oncoming)
             if feat is None:
                 continue
             samples.append((feat, False, 1.0))
@@ -202,6 +221,33 @@ def confidence_lr(feat: dict, model: dict) -> float:
     return 1.0 / (1.0 + np.exp(-np.clip(z, -50, 50)))
 
 
+def calibrate_for_fp(model: dict, samples: list, target_fp: float, gain: float) -> dict:
+    """Return a copy of the LR model whose operating point is shifted so the MEAN false-positive
+    confidence equals target_fp, keeping scores graded (smooth). `gain` scales the steepness:
+    higher lets the clearest TPs reach higher while FPs stay centred at target_fp."""
+    feats = model["features"]
+    mu, sd = np.array(model["mu"]), np.array(model["sd"])
+    coef = np.array(model["coef"]) * gain
+    X = np.array([[f[k] for k in feats] for f, _, _ in samples], dtype=float)
+    y = np.array([bool(t) for _, t, _ in samples])
+    z0 = ((X - mu) / sd) @ coef
+    lo, hi = -20.0, 20.0                                      # bisect the intercept for mean FP conf
+    for _ in range(100):
+        b = (lo + hi) / 2.0
+        if (1.0 / (1.0 + np.exp(-(z0[~y] + b)))).mean() > target_fp:
+            hi = b
+        else:
+            lo = b
+    conf = 1.0 / (1.0 + np.exp(-(z0 + b)))
+    print(f"\n[calibrate] FP-centred logistic  target_fp={target_fp}  gain={gain}")
+    print(f"    intercept={b:+.3f}   TPconf={conf[y].mean():.3f}  FPconf={conf[~y].mean():.3f}"
+          f"   max={conf.max():.3f}  frac>=0.99={(conf >= 0.99).mean():.2f}")
+    tuned = dict(model)
+    tuned["coef"] = coef.tolist()
+    tuned["intercept"] = float(b)
+    return tuned
+
+
 def search_user_objective(samples: list, fp_w: float = 0.1, top: int = 8) -> tuple:
     """Try MANY confidence formulas and keep the one maximising Tal's objective:
         S = sum_TP (conf * 1)  -  fp_w * sum_FP (conf)
@@ -251,24 +297,29 @@ def search_user_objective(samples: list, fp_w: float = 0.1, top: int = 8) -> tup
     return results[0]
 
 
-def render_confidence(prefix: str, model: dict, k_sec: float = EVENT_K_SEC, panel_w: int = 1280) -> None:
-    """Write <prefix>_confidence.mp4: each firing vehicle boxed in red with its confidence float."""
+def render_confidence(prefix: str, scorer, k_sec: float = EVENT_K_SEC, panel_w: int = 1280,
+                      hold_sec: float = 0.0) -> None:
+    """Write <prefix>_confidence.mp4: each firing vehicle boxed in red with its confidence float.
+    `scorer` is a callable feat-dict -> confidence in [0,1] (LR model or a genetic-search formula).
+    hold_sec keeps the marker + a big top banner on screen for that many seconds AFTER the event
+    (the box follows the car while it stays tracked), so the score is readable, not a one-frame flash."""
     cache = cvt.load_cache(prefix)
     if cache is None:
         print(f"[render] {prefix}: no cache")
         return
     cache = cvt.ensure_shifts(cache)
-    timeline = cvt.clip_timeline(cache)
+    timeline, oncoming = clip_timeline_oncoming(cache)
     kf = max(1, round(k_sec * cache["fps"]))
+    hold_frames = max(0, round(hold_sec * cache["fps"]))
     active: dict = defaultdict(dict)                 # frame -> {track_id: confidence}
     for ev in events_from_timeline(timeline, kf):
-        feat = event_features(cache, ev)
+        feat = event_features(cache, ev, oncoming)
         if feat is None:
             continue
-        c = confidence_lr(feat, model)
+        c = scorer(feat)
         tid, s, e = ev
-        for f in range(s, e + 1):
-            active[f][tid] = c
+        for f in range(s, e + 1 + hold_frames):      # hold the marker past the event
+            active[f][tid] = max(active[f].get(tid, 0.0), c)
 
     path, fps, W, H = cache["path"], cache["fps"], cache["w"], cache["h"]
     fr_by_idx = {f["frame"]: f for f in cache["frames"]}
@@ -277,6 +328,9 @@ def render_confidence(prefix: str, model: dict, k_sec: float = EVENT_K_SEC, pane
     os.makedirs(cvt.OUT_DIR, exist_ok=True)
     out_path = os.path.join(cvt.OUT_DIR, f"{prefix}_confidence.mp4")
     writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (pw, ph))
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    fscale = max(0.9, H / 600.0)                      # scale markers to source resolution
+    thick = max(2, round(H / 240.0))
     fi = 0
     while True:
         ok, frame = cap.read()
@@ -289,10 +343,23 @@ def render_confidence(prefix: str, model: dict, k_sec: float = EVENT_K_SEC, pane
                 if v["track_id"] in firing:
                     x1, y1, x2, y2 = v["bbox"]
                     c = firing[v["track_id"]]
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                    cv2.putText(frame, f"VIOLATION  conf={c:.2f}", (x1, max(y1 - 10, 28)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"{prefix} f{fi}", (10, H - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), thick)
+                    label = f"conf={c:.2f}"
+                    (tw, th), _ = cv2.getTextSize(label, FONT, fscale, thick)
+                    ly = max(y1 - 8, th + 12)
+                    cv2.rectangle(frame, (x1, ly - th - 10), (x1 + tw + 12, ly + 8), (0, 0, 255), -1)
+                    cv2.putText(frame, label, (x1 + 6, ly), FONT, fscale, (255, 255, 255),
+                                max(2, thick - 1), cv2.LINE_AA)
+        if firing:                                    # big persistent banner so the score is readable
+            cmax = max(firing.values())
+            bh = int(H * 0.12)
+            cv2.rectangle(frame, (0, 0), (W, bh), (0, 0, 255), -1)
+            btext = f"VIOLATION   conf={cmax:.2f}"
+            bscale = fscale * 1.7
+            (tw, th), _ = cv2.getTextSize(btext, FONT, bscale, thick + 1)
+            cv2.putText(frame, btext, (24, int(bh * 0.5 + th * 0.5)), FONT, bscale,
+                        (255, 255, 255), thick + 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{prefix} f{fi}", (10, H - 20), FONT, 0.7,
                     (255, 255, 255), 2, cv2.LINE_AA)
         writer.write(cv2.resize(frame, (pw, ph)))
         fi += 1
@@ -309,6 +376,18 @@ def main() -> None:
                     help="render confidence overlay video(s): give clip prefixes, or 'ALL' for every labeled clip")
     ap.add_argument("--search", action="store_true",
                     help="sweep many formulas to maximise S = sum_TP conf - 0.1*sum_FP conf")
+    ap.add_argument("--hold-sec", type=float, default=0.0,
+                    help="keep each violation marker + banner on screen this many seconds (readability)")
+    ap.add_argument("--formula", metavar="JSON",
+                    help="render with a saved genetic-search formula (best_formula.json) instead of the LR model")
+    ap.add_argument("--sigmoid", metavar="JSON",
+                    help="render with a saved two-sigmoid winner (sigmoid_best.json) instead of the LR model")
+    ap.add_argument("--calibrate-fp", type=float, default=None, metavar="FP",
+                    help="shift the logistic so mean false-positive confidence = this (e.g. 0.25); stays graded")
+    ap.add_argument("--gain", type=float, default=2.0,
+                    help="steepness for --calibrate-fp (higher = clearest TPs reach higher; default 2.0)")
+    ap.add_argument("--oncoming-factor", type=float, default=ONCOMING_FACTOR,
+                    help="multiply confidence by this for opposite-direction cars (1.0 disables; default 0.30)")
     args = ap.parse_args()
 
     if args.reuse and os.path.isfile(SAMPLES_JSON):
@@ -342,6 +421,14 @@ def main() -> None:
                            "excluded (confounded with FP-source clips in the validation set)."}, fh, indent=2)
     print(f"[saved] {MODEL_JSON}   (AUC={auc:.3f})")
 
+    if args.calibrate_fp is not None:
+        model = calibrate_for_fp(model, samples, args.calibrate_fp, args.gain)
+        tuned_path = os.path.join(cvt.OUT_DIR, "confidence_model_tuned.json")
+        with open(tuned_path, "w") as fh:
+            json.dump({"model": model, "target_fp": args.calibrate_fp, "gain": args.gain,
+                       "note": "FP-centred logistic: mean false-positive confidence shifted to target_fp."}, fh, indent=2)
+        print(f"[saved] {tuned_path}")
+
     if args.search:
         for fp_w in (0.1, 0.3, 0.5, 1.0):
             search_user_objective(samples, fp_w=fp_w)
@@ -350,9 +437,34 @@ def main() -> None:
         with open(args.labels) as fh:
             labeled = list(json.load(fh)["clips"])
         targets = labeled if args.render in ([], ["ALL"]) else args.render
-        print(f"\n[render] confidence overlays for {len(targets)} clip(s)...")
+        if args.formula:
+            with open(args.formula) as fh:
+                saved = json.load(fh)
+            def scorer(feat):
+                return float(formula_search.apply_saved(saved, [feat["distance"]], [feat["angle_off"]])[0])
+            print(f"\n[scorer] WINNER formula (search S={saved['S']:.2f}, "
+                  f"TPconf={saved['tp_conf']:.2f} FPconf={saved['fp_conf']:.2f}):\n         {saved['formula_str']}")
+        elif args.sigmoid:
+            with open(args.sigmoid) as fh:
+                sig = json.load(fh)
+            p = sig["params"]
+            def scorer(feat):
+                return float(sigmoid_search.conf_vec(np.array([feat["distance"]]), np.array([feat["angle_off"]]),
+                                                     p["d50"], p["k_d"], p["a50"], p["k_a"])[0])
+            print(f"\n[scorer] two-sigmoid winner  d50={p['d50']} k_d={p['k_d']} a50={p['a50']} k_a={p['k_a']}"
+                  f"  (S={sig['S']:.2f}, TPconf={sig['tp_conf']:.2f} FPconf={sig['fp_conf']:.2f})")
+        else:
+            def scorer(feat):
+                return confidence_lr(feat, model)
+            print(f"\n[scorer] {'FP-centred graded logistic' if args.calibrate_fp is not None else 'logistic-regression production model'}")
+        if args.oncoming_factor != 1.0:                  # geometric opposite-direction down-weight
+            _base = scorer
+            def scorer(feat, _b=_base, _of=args.oncoming_factor):
+                return _b(feat) * (_of if feat.get("oncoming") else 1.0)
+            print(f"[scorer] x{args.oncoming_factor:g} opposite-direction (oncoming) factor applied")
+        print(f"[render] confidence overlays for {len(targets)} clip(s)...")
         for prefix in targets:
-            render_confidence(prefix, model)
+            render_confidence(prefix, scorer, hold_sec=args.hold_sec)
 
 
 if __name__ == "__main__":
