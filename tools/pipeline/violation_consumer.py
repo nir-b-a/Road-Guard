@@ -22,10 +22,32 @@ for _p in (_PIPELINE_DIR, _TOOLS_DIR):
 
 import crossing_violation_test as cvt        # noqa: E402  -- clip_timeline / ensure_shifts / load_cache
 import violation_confidence as vc            # noqa: E402  -- event_features / confidence_lr / paths
+import motion_filter as mf                   # noqa: E402  -- motion-based oncoming direction
 from ghost_mask import events_from_timeline  # noqa: E402  -- K-of-M event grouping
 
 # Same K the confidence model was built/validated at (recall-first 0.05s -> frames per clip).
 DEFAULT_K_SEC = vc.EVENT_K_SEC
+
+# Oncoming-direction gate. "Solid white line crossing" is a SAME-DIRECTION violation; an oncoming
+# car bleeding over the centre line is a different thing (handled by wrong_way.py), so we must not
+# emit it here. The static lane-side flag is unreliable for close/edge/front-facing cars, so we use
+# MOTION (ego-compensated vertical velocity + y-origin anchor) per track. Params validated for
+# oncoming sensitivity in tools/wrong_way.py. Recall-first: only DROP clearly-oncoming tracks
+# (mean P >= threshold); ambiguous tracks are kept for the human reviewer.
+ONCOMING_MF_KWARGS = dict(vy_scale=0.18, w_vy=0.85, w_anchor=0.15, window=10, fusion="sum")
+DEFAULT_ONCOMING_P = 0.25
+
+
+def classify_track_direction(cache: dict, *, mf_kwargs: dict | None = None) -> dict:
+    """Per-track mean oncoming-motion probability in [0,1] (0 = same-direction, 1 = oncoming).
+    Motion-only, so it works where the static lane-side geometry fails."""
+    scores = mf.compute_motion_scores(cache["frames"], cache["h"],
+                                      **(mf_kwargs or ONCOMING_MF_KWARGS))
+    out = {}
+    for tid, by_frame in scores.items():
+        vals = list(by_frame.values())
+        out[int(tid)] = (sum(vals) / len(vals)) if vals else 0.0
+    return out
 
 
 def load_confidence_model(path: str | None = None) -> dict:
@@ -42,26 +64,42 @@ def load_confidence_model(path: str | None = None) -> dict:
 
 
 def find_violations(cache: dict, model: dict, *, k_sec: float = DEFAULT_K_SEC,
-                    prefix: str | None = None) -> list[dict]:
+                    prefix: str | None = None, filter_oncoming: bool = True,
+                    oncoming_p_threshold: float = DEFAULT_ONCOMING_P,
+                    mf_kwargs: dict | None = None) -> list[dict]:
     """Run the ghost-mask verdict timeline + confidence over one cache and emit events shaped
-    for the joiner: {violation_id, track_id, start_frame, end_frame, confidence}."""
+    for the joiner: {violation_id, track_id, start_frame, end_frame, confidence}.
+
+    filter_oncoming (default True): drop events whose track is OPPOSITE-DIRECTION (mean motion
+    oncoming P >= oncoming_p_threshold). Solid-white-line crossing is a same-direction violation;
+    oncoming cars are excluded here (a different violation type)."""
     cache = cvt.ensure_shifts(cache)                       # geometry needs per-frame ego-motion
     timeline = cvt.clip_timeline(cache)
     kf = max(1, round(k_sec * cache["fps"]))
     events = events_from_timeline(timeline, kf)
     prefix = prefix or cache.get("prefix", "clip")
 
+    onc = classify_track_direction(cache, mf_kwargs=mf_kwargs) if filter_oncoming else {}
+
     out: list[dict] = []
+    skipped = []
     for ev in events:                                     # ev = (track_id, start_frame, end_frame)
+        tid, s, e = ev
+        if filter_oncoming and onc.get(int(tid), 0.0) >= oncoming_p_threshold:
+            skipped.append(int(tid))                      # opposite-direction: not this violation type
+            continue
         feat = vc.event_features(cache, ev)
         if feat is None:                                  # track vanished within its window
             continue
-        tid, s, e = ev
         out.append({"violation_id": len(out),
                     "track_id": int(tid),
                     "start_frame": int(s),
                     "end_frame": int(e),
                     "confidence": float(vc.confidence_lr(feat, model))})
+    if skipped:
+        uniq = sorted(set(skipped))
+        print(f"[violation_consumer] {prefix}: dropped {len(skipped)} oncoming-direction event(s) "
+              f"on track(s) {uniq} (motion P>={oncoming_p_threshold})")
     return out
 
 

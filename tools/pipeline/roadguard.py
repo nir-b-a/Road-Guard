@@ -51,7 +51,7 @@ class RoadGuard:
     def __init__(self, reader_kind: str = "fast_alpr",
                  k_sec: float = violation_consumer.DEFAULT_K_SEC,
                  max_frames: int = 8, min_area: float = lpr_consumer.DEFAULT_MIN_AREA,
-                 out_dir: str = DEFAULT_OUT):
+                 out_dir: str = DEFAULT_OUT, hold_sec: float = 0.6):
         self._reader_obj = build_ocr_object(reader_kind)   # LPRReader object (for plate localisation), or None
         self.reader = ((lambda crop: self._reader_obj.read_plate_with_conf(crop))
                        if self._reader_obj is not None else None)   # crop -> (plate, conf), or None
@@ -59,6 +59,7 @@ class RoadGuard:
         self.max_frames = max_frames
         self.min_area = min_area
         self.out_dir = out_dir
+        self.hold_sec = hold_sec        # keep each violation box on screen this long so a human can see it
         self.model = violation_consumer.load_confidence_model()
 
     # --- plate reading: sharpest frames + per-character voting --------------- #
@@ -94,12 +95,15 @@ class RoadGuard:
                 diagnostic=False) -> str | None:
         import cv2
         evidence_crops = evidence_crops or {}
-        # per-frame active violations: frame -> {track_id: (confidence, plate)}
+        # per-frame active violations: frame -> {track_id: (confidence, plate)}. We HOLD each box
+        # for hold_sec past the event so a 1-frame K-of-M hit isn't an invisible ~33ms flash (the
+        # box follows the still-tracked car via bbox_by_frame). Essential for human review.
+        hold_frames = max(0, round(self.hold_sec * float(cache.get("fps", 30.0))))
         active: dict = defaultdict(dict)
         for v in violations:
             tid = v["track_id"]
             plate = plate_map.get(tid, {}).get("plate_candidate")
-            for f in range(v["start_frame"], v["end_frame"] + 1):
+            for f in range(v["start_frame"], v["end_frame"] + 1 + hold_frames):
                 prev = active[f].get(tid)
                 if prev is None or v["confidence"] > prev[0]:
                     active[f][tid] = (v["confidence"], plate)
@@ -203,13 +207,16 @@ def main() -> None:
                     help="label EVERY tracked vehicle with its raw track id on every frame "
                          "(outputs <prefix>_diagnostic_tracking.mp4) to trace tracker ID continuity")
     ap.add_argument("--out", default=DEFAULT_OUT)
+    ap.add_argument("--hold-sec", type=float, default=0.6,
+                    help="hold each violation box on screen this long so a human reviewer can see "
+                         "it (avoids invisible 1-frame flashes); default 0.6s")
     args = ap.parse_args()
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
         pass
 
-    rg = RoadGuard(reader_kind=args.reader, out_dir=args.out)
+    rg = RoadGuard(reader_kind=args.reader, out_dir=args.out, hold_sec=args.hold_sec)
     summary = []
     for prefix in args.prefixes:
         video = args.video if (args.video and len(args.prefixes) == 1) else None
