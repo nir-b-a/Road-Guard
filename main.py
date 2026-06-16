@@ -1,5 +1,6 @@
 import sys
 import cv2
+import requests
 from collections import Counter
 from video_handler import VideoHandler
 from ultralytics import YOLO
@@ -7,6 +8,8 @@ from ultralytics.engine.results import Results
 from Constants import DetectClass, LPR
 from lpr.reader import PaddleOCRDetectorReader, try_read_plate
 from Objects.World import World
+from line_crossing.line_detector import LaneDetector
+from line_crossing.crossing_detector import CrossingMonitor
 
 from frameLogger import FrameLogger
 
@@ -25,7 +28,14 @@ def loadYoloModel():
         print(f"Error occurred: {e}")
 
 
-def processFrame(yolo_model, world: World, frame, frame_id, frame_logger: FrameLogger, lpr_reader: PaddleOCRDetectorReader):
+def processFrame(yolo_model, world: World, frame, frame_id, frame_logger: FrameLogger, lpr_reader: PaddleOCRDetectorReader, lane_detector: LaneDetector, crossing_monitor: CrossingMonitor, violation_frames: dict):
+    lanes_result = lane_detector.detect_lanes(frame)
+    solid_lanes = {}
+    if lanes_result.get("left_type") == "solid" and "left_line" in lanes_result:
+        solid_lanes["solid_left"] = lanes_result["left_line"]
+    if lanes_result.get("right_type") == "solid" and "right_line" in lanes_result:
+        solid_lanes["solid_right"] = lanes_result["right_line"]
+
     # run object tracking on the frame using YOLO
     results = yolo_model.track(
         frame,
@@ -67,6 +77,8 @@ def processFrame(yolo_model, world: World, frame, frame_id, frame_logger: FrameL
             v = world.getVehicle(object_id)
             v.updateBoxAndEndFrame(frame_id, bounding_box)
             try_read_plate(v, frame, lpr_reader, LPR.MIN_VEHICLE_AREA, frame_id)
+            if crossing_monitor.update(object_id, bounding_box, solid_lanes):
+                violation_frames[object_id] = frame_id
 
         # if the object is a traffic light
         if object_type in DetectClass.Traffic_Light_Class:
@@ -105,6 +117,9 @@ def main():
     # load yolov8 model
     yolo_model = loadYoloModel()
     lpr_reader = PaddleOCRDetectorReader("israeli_plates.pt")
+    lane_detector = LaneDetector()
+    crossing_monitor = CrossingMonitor()
+    violation_frames: dict[int, int] = {}  # vehicle_id -> first violation frame
 
     # get the video path from command line argumants
     video_path = sys.argv[1]
@@ -130,7 +145,7 @@ def main():
 
         if frame_id % FRAME_SKIP == 0:
             """ Remove frame_logger when not testing"""
-            processFrame(yolo_model, world, frame, frame_id, yolo_logger, lpr_reader)
+            processFrame(yolo_model, world, frame, frame_id, yolo_logger, lpr_reader, lane_detector, crossing_monitor, violation_frames)
 
         # exit loop if 'q' is pressed
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -157,7 +172,26 @@ def main():
         bbox_counter = len(world.objects_in_frame[frame_counter].vehicle_ids) + len(world.objects_in_frame[frame_counter].traffic_light_ids)
         world_logger.log_frame(frame_counter, world.objects_in_frame[frame_counter].vehicle_ids, world.objects_in_frame[frame_counter].traffic_light_ids, bbox_counter)
 
-
+    drive_id = sys.argv[2] if len(sys.argv) > 2 else None
+    for vehicle_id, v in world.vehicles.items():
+        if not crossing_monitor.is_violator(vehicle_id):
+            continue
+        plate = v.license_plate or "UNKNOWN"
+        vio_frame = violation_frames.get(vehicle_id, -1)
+        print(f"Violation detected — vehicle {vehicle_id}, plate={plate}, frame={vio_frame}")
+        if drive_id:
+            try:
+                r = requests.post("http://localhost:5000/api/internal/violation", json={
+                    "driveId": drive_id,
+                    "videoClipPath": sys.argv[1],
+                    "carId": plate,
+                    "calculatedSpeed": 0,
+                    "lat": 0,
+                    "lon": 0
+                })
+                print(f"  → POST /internal/violation: {r.status_code} {r.json()}")
+            except Exception as e:
+                print(f"  → POST failed: {e}")
 
 
 # the main function of the program

@@ -1,3 +1,5 @@
+const { spawn } = require('child_process');
+const path = require('path');
 const Drive = require('../models/Drive');
 const Notification = require('../models/Notification');
 
@@ -35,6 +37,17 @@ const uploadDrive = async (req, res) => {
     });
 
     res.status(201).json({ success: true, message: 'Drive uploaded successfully', data: { sessionId: drive.sessionId, driveId: drive._id, speedSamplesCount: parsedSpeedSamples.length } });
+
+    const mainPy = path.join(__dirname, '..', '..', 'main.py');
+    const videoFullPath = path.join(__dirname, '..', 'uploads', 'videos', req.file.filename);
+    const pythonBin = process.env.PYTHON_BIN || 'python';
+    const brain = spawn(pythonBin, [mainPy, videoFullPath, drive._id.toString()], {
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+    brain.stdout.on('data', d => console.log(`[brain ${drive._id}] ${d.toString().trim()}`));
+    brain.stderr.on('data', d => console.error(`[brain ${drive._id}] ${d.toString().trim()}`));
+    brain.on('close', code => console.log(`[brain ${drive._id}] finished (code ${code})`));
+    brain.unref();
 };
 
 const getNotifications = async (req, res) => {
