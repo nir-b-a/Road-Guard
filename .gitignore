@@ -57,3 +57,25 @@ test_videos/
 
 # IDE
 .idea/
+
+# RoadGuard local pipeline media & diagnostics — keep heavy outputs out of git.
+# (note: outputs/ is the cache dir above; output/ is the singular render/diagnostics dir)
+output/
+output_*/
+**/anomaly_frames/
+
+# Media (videos/audio) anywhere — never commit heavy media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4a
+*.wav
+
+# Model weights anywhere (large binaries; share via release/storage, not git)
+*.pt
+*.pth
+*.onnx
+*.weights
+*.engine
