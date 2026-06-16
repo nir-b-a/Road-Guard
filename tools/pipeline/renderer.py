@@ -23,6 +23,40 @@ def scale_params(w: int, h: int) -> dict:
     }
 
 
+# distinct-ish colours so neighbouring track ids don't collide visually
+_TRACK_PALETTE = [
+    (0, 255, 0), (255, 128, 0), (0, 200, 255), (255, 0, 255), (0, 255, 255),
+    (128, 255, 0), (80, 80, 255), (200, 200, 0), (255, 80, 80), (160, 0, 255),
+]
+
+
+def track_color(track_id: int) -> tuple:
+    """Stable BGR colour for a track id (so the SAME id keeps its colour across frames)."""
+    return _TRACK_PALETTE[int(track_id) % len(_TRACK_PALETTE)]
+
+
+def draw_track_box(frame: Any, *, bbox, track_id: int) -> Any:
+    """Thin id-coloured box + 'ID N' tag for EVERY tracked vehicle (diagnostic overlay). Lighter
+    than draw_violation: no banner/border, just enough to trace the raw tracker output per frame."""
+    import cv2  # lazy
+
+    h, w = frame.shape[:2]
+    p = scale_params(w, h)
+    color = track_color(track_id)
+    th = max(1, p["thick"] - 1)
+    fs = max(0.4, p["font_scale"] * 0.7)
+    x1, y1, x2, y2 = (int(round(c)) for c in bbox)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, th)
+
+    label = f"ID {track_id}"
+    (tw, tht), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, max(1, th))
+    ly = max(tht + 4, y1)                                   # keep the tag on-screen near the top edge
+    cv2.rectangle(frame, (x1, ly - tht - 4), (x1 + tw + 4, ly), color, -1)
+    cv2.putText(frame, label, (x1 + 2, ly - 2), cv2.FONT_HERSHEY_SIMPLEX, fs,
+                (0, 0, 0), max(1, th), cv2.LINE_AA)
+    return frame
+
+
 def draw_violation(frame: Any, *, bbox, track_id: int, plate: str | None,
                    violation_type: str, confidence: float, in_event: bool = True) -> Any:
     """Draw the red vehicle box, a top violation banner, and a bottom id/plate strip -- all scaled

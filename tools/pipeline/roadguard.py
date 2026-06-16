@@ -90,7 +90,8 @@ class RoadGuard:
         return plate, score, evidence_crops
 
     # --- annotated full-video render (dynamic scaling) ----------------------- #
-    def _render(self, cache, violations, plate_map, prefix, evidence_crops=None) -> str | None:
+    def _render(self, cache, violations, plate_map, prefix, evidence_crops=None,
+                diagnostic=False) -> str | None:
         import cv2
         evidence_crops = evidence_crops or {}
         # per-frame active violations: frame -> {track_id: (confidence, plate)}
@@ -106,7 +107,8 @@ class RoadGuard:
                          for fr in cache["frames"]}
 
         os.makedirs(self.out_dir, exist_ok=True)
-        out_path = os.path.join(self.out_dir, f"{prefix}_annotated.mp4")
+        suffix = "diagnostic_tracking" if diagnostic else "annotated"
+        out_path = os.path.join(self.out_dir, f"{prefix}_{suffix}.mp4")
         cap = cv2.VideoCapture(cache["path"])
         if not cap.isOpened():
             print(f"[render] cannot open {cache['path']}")
@@ -121,6 +123,11 @@ class RoadGuard:
                 h, w = frame.shape[:2]
                 dims = (w, h)
                 writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            # diagnostic: label EVERY tracked vehicle with its raw track id, every frame (drawn
+            # first so the red violation overlay sits on top where they coincide)
+            if diagnostic:
+                for tid, bbox in bbox_by_frame.get(fi, {}).items():
+                    renderer.draw_track_box(frame, bbox=bbox, track_id=tid)
             for tid, (conf, plate) in active.get(fi, {}).items():
                 bbox = bbox_by_frame.get(fi, {}).get(tid)
                 if bbox:
@@ -163,7 +170,7 @@ class RoadGuard:
             cv2.imwrite(png, card)
             print(f"   evidence -> {png}")
 
-    def process(self, prefix, video_path=None, refresh=True) -> dict:
+    def process(self, prefix, video_path=None, refresh=True, diagnostic=False) -> dict:
         video_path = video_path or _find_video(prefix)
         cache = heavy_pass.run_heavy_pass(prefix, video_path=video_path, refresh=refresh)
         violations = violation_consumer.find_violations(cache, self.model, k_sec=self.k_sec, prefix=prefix)
@@ -182,7 +189,7 @@ class RoadGuard:
         for tid in sorted(plate_map):
             pm = plate_map[tid]
             print(f"  car#{tid:<4} -> {pm['plate_candidate'] or 'UNKNOWN':<12} (score {pm['plate_confidence_score']:.2f})")
-        self._render(cache, violations, plate_map, prefix, evidence_crops)
+        self._render(cache, violations, plate_map, prefix, evidence_crops, diagnostic=diagnostic)
         return {"prefix": prefix, "n_violations": len(violations), "plate_map": plate_map}
 
 
@@ -192,6 +199,9 @@ def main() -> None:
     ap.add_argument("--video", default=None, help="explicit path for a single prefix")
     ap.add_argument("--reader", default="fast_alpr", choices=["fast_alpr", "paddle", "none"])
     ap.add_argument("--no-refresh", action="store_true", help="reuse existing cache if present")
+    ap.add_argument("--diagnostic", action="store_true",
+                    help="label EVERY tracked vehicle with its raw track id on every frame "
+                         "(outputs <prefix>_diagnostic_tracking.mp4) to trace tracker ID continuity")
     ap.add_argument("--out", default=DEFAULT_OUT)
     args = ap.parse_args()
     try:
@@ -203,7 +213,8 @@ def main() -> None:
     summary = []
     for prefix in args.prefixes:
         video = args.video if (args.video and len(args.prefixes) == 1) else None
-        summary.append(rg.process(prefix, video_path=video, refresh=not args.no_refresh))
+        summary.append(rg.process(prefix, video_path=video, refresh=not args.no_refresh,
+                                   diagnostic=args.diagnostic))
     with open(os.path.join(args.out, "roadguard_report.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=2)
     print(f"\n[done] {len(summary)} clip(s) -> {args.out}")
