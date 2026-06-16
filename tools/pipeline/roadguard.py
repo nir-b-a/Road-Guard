@@ -33,6 +33,8 @@ import lpr_consumer                        # noqa: E402
 import plate_char_voter as pcv             # noqa: E402
 import renderer                            # noqa: E402
 import evidence                            # noqa: E402
+import reid_linker                         # noqa: E402  Module F: cross-track temporal plate memory
+import reid_embedders                      # noqa: E402
 from run_pipeline import build_ocr_object, DEFAULT_OUT   # noqa: E402
 
 VIOLATION_TYPE = "SOLID WHITE LINE CROSSING"
@@ -60,6 +62,7 @@ class RoadGuard:
         self.min_area = min_area
         self.out_dir = out_dir
         self.hold_sec = hold_sec        # keep each violation box on screen this long so a human can see it
+        self.reid = reid_embedders.HistogramEmbedder() if self._reader_obj is not None else None
         self.model = violation_consumer.load_confidence_model()
 
     # --- plate reading: sharpest frames + per-character voting --------------- #
@@ -140,9 +143,10 @@ class RoadGuard:
             writer.write(frame)
             fi += 1
 
-        # tail: one held zoomed-plate evidence page per violating car (for human verification)
+        # tail: one held zoomed-plate evidence page per VIOLATING car (for human verification)
+        violating = sorted({v["track_id"] for v in violations})
         if writer is not None and dims is not None and evidence_crops:
-            self._append_evidence(writer, dims, fps, plate_map, evidence_crops, prefix)
+            self._append_evidence(writer, dims, fps, plate_map, evidence_crops, prefix, violating)
 
         cap.release()
         if writer is not None:
@@ -150,24 +154,37 @@ class RoadGuard:
         print(f"   annotated -> {out_path}")
         return out_path
 
-    def _append_evidence(self, writer, dims, fps, plate_map, evidence_crops, prefix) -> None:
-        """Append held evidence cards to the open writer and save each as a standalone PNG."""
+    def _zoom_set(self, crops, n):
+        """Zoom the top-n crops; return (zoom_imgs, any_real_plate)."""
+        zoom_imgs, has_plate = [], False
+        for crop in (crops or [])[:n]:
+            z, is_plate = evidence.zoom_crop(crop, self._reader_obj)
+            zoom_imgs.append(z)
+            has_plate = has_plate or is_plate
+        return zoom_imgs, has_plate
+
+    def _append_evidence(self, writer, dims, fps, plate_map, evidence_crops, prefix, violating) -> None:
+        """Append a held evidence card per violating car + save each as a PNG. For a plate inherited
+        via Re-ID, show BOTH the source track's plate zoom and this car's crop so the human editor
+        can confirm they are the same vehicle."""
         import cv2
         w, h = dims
         hold = max(1, round(fps * evidence.HOLD_SEC))
-        for tid in sorted(evidence_crops):
-            crops = evidence_crops.get(tid) or []
-            zoom_imgs, has_plate = [], False
-            for crop in crops[:3]:
-                z, is_plate = evidence.zoom_crop(crop, self._reader_obj)
-                zoom_imgs.append(z)
-                has_plate = has_plate or is_plate
+        for tid in violating:
             pm = plate_map.get(tid, {})
+            source = pm.get("plate_source")
+            if source and source.startswith("reid_inherited"):
+                src = pm.get("reid_inherited_from")
+                src_imgs, _ = self._zoom_set(evidence_crops.get(src), 2)      # the readable plate
+                own_imgs, _ = self._zoom_set(evidence_crops.get(tid), 1)      # this violator's car
+                zoom_imgs, has_plate = src_imgs + own_imgs, True
+            else:
+                zoom_imgs, has_plate = self._zoom_set(evidence_crops.get(tid), 3)
             card = evidence.compose_card(w, h, track_id=tid,
                                          plate=pm.get("plate_candidate"),
                                          score=pm.get("plate_confidence_score", 0.0),
                                          violation_type=VIOLATION_TYPE,
-                                         zoom_imgs=zoom_imgs, has_plate=has_plate)
+                                         zoom_imgs=zoom_imgs, has_plate=has_plate, source=source)
             for _ in range(hold):
                 writer.write(card)
             png = os.path.join(self.out_dir, f"{prefix}_car{tid}_evidence.png")
@@ -181,20 +198,57 @@ class RoadGuard:
         index = lpr_consumer.build_track_index(cache)
 
         plate_map, evidence_crops = {}, {}
+        violating = sorted({v["track_id"] for v in violations})
         if self.reader is not None and violations:
             fp = lpr_consumer.make_video_frame_provider(cache["path"])
-            for tid in sorted({v["track_id"] for v in violations}):
+            for tid in violating:
                 plate, score, crops = self.read_track_plate(cache, tid, fp, index)
                 plate_map[tid] = {"plate_candidate": plate, "plate_confidence_score": round(score, 4)}
                 evidence_crops[tid] = crops
+            # Module F: a violating car with no readable plate may be a re-acquired track -> try to
+            # inherit a plate from an appearance-matched predecessor that died shortly before it.
+            self._reid_inherit(cache, index, violating, plate_map, evidence_crops, fp)
 
         print(f"\n=== {prefix}: {len(violations)} violation(s), "
-              f"{len(plate_map)} car(s) ===")
-        for tid in sorted(plate_map):
-            pm = plate_map[tid]
-            print(f"  car#{tid:<4} -> {pm['plate_candidate'] or 'UNKNOWN':<12} (score {pm['plate_confidence_score']:.2f})")
+              f"{len(violating)} car(s) ===")
+        for tid in violating:
+            pm = plate_map.get(tid, {})
+            src = pm.get("plate_source", "own" if pm.get("plate_candidate") else "none")
+            tag = f"  [{src}]" if src.startswith("reid_inherited") else ""
+            print(f"  car#{tid:<4} -> {pm.get('plate_candidate') or 'UNKNOWN':<12} "
+                  f"(score {pm.get('plate_confidence_score', 0.0):.2f}){tag}")
         self._render(cache, violations, plate_map, prefix, evidence_crops, diagnostic=diagnostic)
         return {"prefix": prefix, "n_violations": len(violations), "plate_map": plate_map}
+
+    def _reid_inherit(self, cache, index, violating, plate_map, evidence_crops, fp) -> None:
+        """For each UNKNOWN violating car, OCR + embed appearance-matched predecessor tracks and, if
+        one is the same vehicle (cosine + gap, no temporal overlap), inherit its plate. Mutates
+        plate_map/evidence_crops in place. Recall-first: only ADDS plates; tags reid_inherited."""
+        if self.reid is None:
+            return
+        unknown = [t for t in violating if not (plate_map.get(t) or {}).get("plate_candidate")]
+        if not unknown:
+            return
+        spans = {t: (s[0][0], s[-1][0]) for t, s in index.items() if s}
+        max_gap = max(1, round(reid_linker.DEFAULT_MAX_GAP_SEC * cache["fps"]))
+        preds = reid_linker.candidate_predecessors(spans, unknown, max_gap_frames=max_gap,
+                                                   exclude=set(violating))
+        if not preds:
+            return
+        # OCR + keep crops for predecessor tracks we haven't read yet
+        for o in preds:
+            if o not in plate_map:
+                plate, score, crops = self.read_track_plate(cache, o, fp, index)
+                plate_map[o] = {"plate_candidate": plate, "plate_confidence_score": round(score, 4)}
+                evidence_crops[o] = crops
+        subset = set(unknown) | preds
+        sub_spans = {t: spans[t] for t in subset if t in spans}
+        embeddings = reid_embedders.build_track_embeddings(cache, index, fp, self.reid,
+                                                           track_ids=subset, min_area=self.min_area)
+        enriched, _canon = reid_linker.reid_enrich(sub_spans, embeddings, plate_map,
+                                                   fps=cache["fps"])
+        for tid, pm in enriched.items():                  # fold inherited plates back in
+            plate_map[tid] = pm
 
 
 def main() -> None:

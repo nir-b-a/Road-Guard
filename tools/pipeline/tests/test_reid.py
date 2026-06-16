@@ -45,6 +45,21 @@ def test_dissimilar_appearance_not_linked():
     assert canon[1] != canon[2]
 
 
+def test_candidate_predecessors_window_and_overlap():
+    spans = {1: (0, 445), 6: (256, 445), 7: (447, 789), 2: (0, 42)}
+    # target = the unknown violator tid 7 (born 447); exclude the violating set
+    preds = rl.candidate_predecessors(spans, [7], max_gap_frames=600, exclude={6, 7})
+    assert 1 in preds                                      # tid1 died f445, gap 2 -> candidate
+    assert 2 in preds                                      # tid2 died f42, gap 405 -> within window
+    assert 6 not in preds                                  # excluded (also a violator)
+
+
+def test_candidate_predecessors_rejects_overlap_and_far():
+    spans = {1: (0, 445), 9: (300, 800)}                   # 9 overlaps 1 in time
+    preds = rl.candidate_predecessors(spans, [9], max_gap_frames=50)
+    assert 1 not in preds                                  # overlapping -> never a predecessor
+
+
 def test_plate_propagates_to_plateless_member():
     canonical = {1: 1, 2: 1}                               # one identity
     plate_map = {1: {"plate_candidate": "47-396-81", "plate_confidence_score": 0.97},

@@ -86,6 +86,26 @@ def candidate_links(spans: dict, embeddings: dict, *, sim_threshold: float,
     return pairs
 
 
+def candidate_predecessors(spans: dict, target_tids, *, max_gap_frames: int,
+                           exclude=None) -> set:
+    """Tracks that could be the SAME car re-acquired as one of `target_tids`: died strictly before
+    the target was born, within the gap window, and not time-overlapping it. Appearance is checked
+    later -- this only narrows WHICH crops are worth embedding/OCR-ing (perf bound)."""
+    exclude = set(exclude or [])
+    preds = set()
+    for t in target_tids:
+        st = spans.get(t)
+        if st is None:
+            continue
+        for o, so in spans.items():
+            if o == t or o in exclude:
+                continue
+            gap = st[0] - so[1]
+            if 0 < gap <= max_gap_frames and not spans_overlap(so, st):
+                preds.add(o)
+    return preds
+
+
 def link_tracks(spans: dict, embeddings: dict, *, sim_threshold: float = DEFAULT_SIM_THRESHOLD,
                 max_gap_frames: int = 600) -> dict:
     """Return {track_id: canonical_id}. Union-find over candidate links; the smallest (oldest)

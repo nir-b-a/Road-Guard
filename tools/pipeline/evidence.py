@@ -81,10 +81,13 @@ def _fit_into(img: Any, box: dict) -> "tuple[Any, int, int]":
 
 
 def compose_card(canvas_w: int, canvas_h: int, *, track_id: int, plate: str | None,
-                 score: float, violation_type: str, zoom_imgs: list, has_plate: bool) -> Any:
+                 score: float, violation_type: str, zoom_imgs: list, has_plate: bool,
+                 source: str | None = None) -> Any:
     """Build one full-frame (canvas_h x canvas_w) evidence page. Black background, title with the
     violation type + car id, a row of zoomed plate crops, and a big caption with the recognized
-    plate (or a manual-review note when UNKNOWN)."""
+    plate (or a manual-review note when UNKNOWN). A Re-ID-inherited plate (source=
+    'reid_inherited:<tid>') is captioned in yellow as 'inherited from ID <tid> - verify' so the
+    human editor confirms the two crops are the same vehicle."""
     import cv2
     import numpy as np
 
@@ -114,7 +117,11 @@ def compose_card(canvas_w: int, canvas_h: int, *, track_id: int, plate: str | No
     # caption band: recognized plate + score, or manual-review note
     c = lay["caption"]
     cv2.rectangle(canvas, (0, c["y"]), (canvas_w, canvas_h), (40, 40, 40), -1)
-    if plate:
+    if plate and source and source.startswith("reid_inherited"):
+        src_id = source.split(":", 1)[1] if ":" in source else "?"
+        cap = f"PLATE  {plate}   (inherited from ID {src_id} - verify)"
+        colour = yellow                                  # flag for the reviewer: confirm same vehicle
+    elif plate:
         cap = f"PLATE  {plate}   (score {score:.2f})"
         colour = green if score >= 0.6 else yellow
     else:
