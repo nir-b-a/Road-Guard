@@ -1,0 +1,173 @@
+"""
+RoadGuard -- end-to-end clip processor.
+
+For one clip: run the heavy pass (BoT-SORT vehicles + lanes), detect solid-white-line violations,
+then for each VIOLATING car read its plate using SHARPEST-FRAME selection (area x Laplacian
+sharpness, not just biggest) + PER-CHARACTER temporal voting, and render a dynamically-scaled
+annotated video (works for 9:16 Shorts and 16:9). Reuses the tested pipeline components; heavy
+models load only at run time, so this module imports fine on CPU (cv2 lazy in render).
+
+Run (roadguard-dl env):
+  python tools/pipeline/roadguard.py 7E35VSQbAH8
+  (auto-finds the video under tests_videos/raw_videos/solid_line_crossing_with_pl/<prefix>.mp4)
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+from collections import defaultdict
+
+_PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
+_TOOLS_DIR = os.path.dirname(_PIPELINE_DIR)
+_REPO = os.path.dirname(_TOOLS_DIR)
+for _p in (_PIPELINE_DIR, _TOOLS_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import heavy_pass                         # noqa: E402
+import violation_consumer                 # noqa: E402
+import lpr_consumer                        # noqa: E402
+import plate_char_voter as pcv             # noqa: E402
+import renderer                            # noqa: E402
+from run_pipeline import build_ocr_reader, DEFAULT_OUT   # noqa: E402
+
+VIOLATION_TYPE = "SOLID WHITE LINE CROSSING"
+NEW_CLIPS_DIR = os.path.join(_REPO, "tests_videos", "raw_videos", "solid_line_crossing_with_pl")
+
+
+def _find_video(prefix: str) -> str | None:
+    for d in (NEW_CLIPS_DIR, os.path.join(_REPO, "tests_videos", "raw_videos", "crossing_solid_line")):
+        hits = [f for f in glob.glob(os.path.join(d, prefix + "*.mp4")) if "_annotated" not in f]
+        if hits:
+            return hits[0]
+    return None
+
+
+class RoadGuard:
+    def __init__(self, reader_kind: str = "fast_alpr",
+                 k_sec: float = violation_consumer.DEFAULT_K_SEC,
+                 max_frames: int = 8, min_area: float = lpr_consumer.DEFAULT_MIN_AREA,
+                 out_dir: str = DEFAULT_OUT):
+        self.reader = build_ocr_reader(reader_kind)     # crop -> (plate, conf), or None
+        self.k_sec = k_sec
+        self.max_frames = max_frames
+        self.min_area = min_area
+        self.out_dir = out_dir
+        self.model = violation_consumer.load_confidence_model()
+
+    # --- plate reading: sharpest frames + per-character voting --------------- #
+    def read_track_plate(self, cache, tid, frame_provider, index) -> tuple[str | None, float]:
+        candidates = [(f, b) for f, b in index.get(tid, [])
+                      if lpr_consumer.bbox_area(b) > self.min_area]
+        scored = []
+        for frame_id, bbox in candidates:
+            frame = frame_provider(frame_id)
+            if frame is None:
+                continue
+            x1, y1, x2, y2 = (int(round(c)) for c in bbox)
+            crop = frame[y1:y2, x1:x2]
+            if getattr(crop, "size", 0) == 0:
+                continue
+            sharp = lpr_consumer.laplacian_variance(crop)         # readability = size x sharpness
+            scored.append((lpr_consumer.bbox_area(bbox) * sharp, crop))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        reads = []
+        for _, crop in scored[:self.max_frames]:
+            plate, conf = self.reader(crop)
+            if plate:
+                reads.append((plate, conf))
+        return pcv.vote_characters(reads)
+
+    # --- annotated full-video render (dynamic scaling) ----------------------- #
+    def _render(self, cache, violations, plate_map, prefix) -> str | None:
+        import cv2
+        # per-frame active violations: frame -> {track_id: (confidence, plate)}
+        active: dict = defaultdict(dict)
+        for v in violations:
+            tid = v["track_id"]
+            plate = plate_map.get(tid, {}).get("plate_candidate")
+            for f in range(v["start_frame"], v["end_frame"] + 1):
+                prev = active[f].get(tid)
+                if prev is None or v["confidence"] > prev[0]:
+                    active[f][tid] = (v["confidence"], plate)
+        bbox_by_frame = {fr["frame"]: {vv["track_id"]: vv["bbox"] for vv in fr.get("vehicles", [])}
+                         for fr in cache["frames"]}
+
+        os.makedirs(self.out_dir, exist_ok=True)
+        out_path = os.path.join(self.out_dir, f"{prefix}_annotated.mp4")
+        cap = cv2.VideoCapture(cache["path"])
+        if not cap.isOpened():
+            print(f"[render] cannot open {cache['path']}")
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS) or float(cache.get("fps", 30.0))
+        writer, fi = None, 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if writer is None:
+                h, w = frame.shape[:2]
+                writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            for tid, (conf, plate) in active.get(fi, {}).items():
+                bbox = bbox_by_frame.get(fi, {}).get(tid)
+                if bbox:
+                    renderer.draw_violation(frame, bbox=bbox, track_id=tid, plate=plate,
+                                            violation_type=VIOLATION_TYPE, confidence=conf)
+            writer.write(frame)
+            fi += 1
+        cap.release()
+        if writer is not None:
+            writer.release()
+        print(f"   annotated -> {out_path}")
+        return out_path
+
+    def process(self, prefix, video_path=None, refresh=True) -> dict:
+        video_path = video_path or _find_video(prefix)
+        cache = heavy_pass.run_heavy_pass(prefix, video_path=video_path, refresh=refresh)
+        violations = violation_consumer.find_violations(cache, self.model, k_sec=self.k_sec, prefix=prefix)
+        index = lpr_consumer.build_track_index(cache)
+
+        plate_map = {}
+        if self.reader is not None and violations:
+            fp = lpr_consumer.make_video_frame_provider(cache["path"])
+            for tid in sorted({v["track_id"] for v in violations}):
+                plate, score = self.read_track_plate(cache, tid, fp, index)
+                plate_map[tid] = {"plate_candidate": plate, "plate_confidence_score": round(score, 4)}
+
+        print(f"\n=== {prefix}: {len(violations)} violation(s), "
+              f"{len(plate_map)} car(s) ===")
+        for tid in sorted(plate_map):
+            pm = plate_map[tid]
+            print(f"  car#{tid:<4} -> {pm['plate_candidate'] or 'UNKNOWN':<12} (score {pm['plate_confidence_score']:.2f})")
+        self._render(cache, violations, plate_map, prefix)
+        return {"prefix": prefix, "n_violations": len(violations), "plate_map": plate_map}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="RoadGuard end-to-end clip processor.")
+    ap.add_argument("prefixes", nargs="+")
+    ap.add_argument("--video", default=None, help="explicit path for a single prefix")
+    ap.add_argument("--reader", default="fast_alpr", choices=["fast_alpr", "paddle", "none"])
+    ap.add_argument("--no-refresh", action="store_true", help="reuse existing cache if present")
+    ap.add_argument("--out", default=DEFAULT_OUT)
+    args = ap.parse_args()
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+    rg = RoadGuard(reader_kind=args.reader, out_dir=args.out)
+    summary = []
+    for prefix in args.prefixes:
+        video = args.video if (args.video and len(args.prefixes) == 1) else None
+        summary.append(rg.process(prefix, video_path=video, refresh=not args.no_refresh))
+    with open(os.path.join(args.out, "roadguard_report.json"), "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, ensure_ascii=False, indent=2)
+    print(f"\n[done] {len(summary)} clip(s) -> {args.out}")
+
+
+if __name__ == "__main__":
+    main()
