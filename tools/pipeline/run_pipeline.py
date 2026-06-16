@@ -32,10 +32,10 @@ import hard_negatives        # noqa: E402  Module E
 DEFAULT_OUT = os.path.join(_REPO, "outputs", "pipeline")
 
 
-def build_ocr_reader(kind: str = "fast_alpr"):
-    """Construct an OCR callable: crop -> (plate | None, confidence), or None for kind="none"
-    (skip LPR entirely -> every plate is PLATE_UNKNOWN). Heavy imports are lazy so importing this
-    module (e.g. for tests) never pulls in the OCR stack."""
+def build_ocr_object(kind: str = "fast_alpr"):
+    """Construct the underlying LPRReader OBJECT (or None for kind="none"). Exposed separately
+    from build_ocr_reader so callers that need plate localisation (evidence crops via
+    reader.crop_plate) can reach the object, not just the read callable. Heavy imports are lazy."""
     if kind == "none":
         return None
     if _REPO not in sys.path:
@@ -46,8 +46,14 @@ def build_ocr_reader(kind: str = "fast_alpr"):
         raise RuntimeError(
             f"[pipeline] OCR backend unavailable ({e}). Run in the roadguard-dl env with "
             f"fast-alpr / paddleocr installed, or pass --reader none.") from e
-    reader = {"fast_alpr": FastALPRReader, "paddle": PaddleOCRDetectorReader}[kind]()
-    return lambda crop: reader.read_plate_with_conf(crop)
+    return {"fast_alpr": FastALPRReader, "paddle": PaddleOCRDetectorReader}[kind]()
+
+
+def build_ocr_reader(kind: str = "fast_alpr"):
+    """Construct an OCR callable: crop -> (plate | None, confidence), or None for kind="none"
+    (skip LPR entirely -> every plate is PLATE_UNKNOWN)."""
+    obj = build_ocr_object(kind)
+    return (lambda crop: obj.read_plate_with_conf(crop)) if obj is not None else None
 
 
 def run(prefix: str, *, out_dir: str = DEFAULT_OUT, k_sec: float = violation_consumer.DEFAULT_K_SEC,

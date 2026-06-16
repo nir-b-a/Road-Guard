@@ -50,6 +50,12 @@ class LPRReader(ABC):
         (vote_fraction * mean_OCR_conf). Other readers can override as their OCR exposes it."""
         return self.read_plate(vehicle_crop), 1.0
 
+    def crop_plate(self, vehicle_crop: np.ndarray):
+        """Return the tight plate-region sub-crop inside `vehicle_crop`, or None if no plate is
+        localised. Used to build zoomed evidence images for human verification. Default: no
+        localiser available -> None (callers fall back to the whole vehicle crop)."""
+        return None
+
 
 def _ocr_confidence(conf: float | list[float]) -> float:
     return float(np.mean(conf)) if isinstance(conf, list) else conf
@@ -72,6 +78,23 @@ class FastALPRReader(LPRReader):
         if best.ocr is None:
             return None, 0.0
         return _validate_israeli_plate(best.ocr.text), float(_ocr_confidence(best.ocr.confidence))
+
+    def crop_plate(self, vehicle_crop: np.ndarray):
+        """Tight plate-region sub-crop via the detector box (highest-confidence plate), or None."""
+        results = self._alpr.predict(vehicle_crop)
+        if not results:
+            return None
+        best = max(results, key=lambda r: r.detection.confidence if r.detection else 0.0)
+        if best.detection is None:
+            return None
+        bb = best.detection.bounding_box
+        h, w = vehicle_crop.shape[:2]
+        x1, y1 = max(0, int(bb.x1)), max(0, int(bb.y1))
+        x2, y2 = min(w, int(bb.x2)), min(h, int(bb.y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        plate_crop = vehicle_crop[y1:y2, x1:x2]
+        return plate_crop if plate_crop.size else None
 
 
 class EasyOCRReader(LPRReader):

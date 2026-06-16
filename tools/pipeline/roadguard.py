@@ -32,7 +32,8 @@ import violation_consumer                 # noqa: E402
 import lpr_consumer                        # noqa: E402
 import plate_char_voter as pcv             # noqa: E402
 import renderer                            # noqa: E402
-from run_pipeline import build_ocr_reader, DEFAULT_OUT   # noqa: E402
+import evidence                            # noqa: E402
+from run_pipeline import build_ocr_object, DEFAULT_OUT   # noqa: E402
 
 VIOLATION_TYPE = "SOLID WHITE LINE CROSSING"
 NEW_CLIPS_DIR = os.path.join(_REPO, "tests_videos", "raw_videos", "solid_line_crossing_with_pl")
@@ -51,7 +52,9 @@ class RoadGuard:
                  k_sec: float = violation_consumer.DEFAULT_K_SEC,
                  max_frames: int = 8, min_area: float = lpr_consumer.DEFAULT_MIN_AREA,
                  out_dir: str = DEFAULT_OUT):
-        self.reader = build_ocr_reader(reader_kind)     # crop -> (plate, conf), or None
+        self._reader_obj = build_ocr_object(reader_kind)   # LPRReader object (for plate localisation), or None
+        self.reader = ((lambda crop: self._reader_obj.read_plate_with_conf(crop))
+                       if self._reader_obj is not None else None)   # crop -> (plate, conf), or None
         self.k_sec = k_sec
         self.max_frames = max_frames
         self.min_area = min_area
@@ -59,7 +62,10 @@ class RoadGuard:
         self.model = violation_consumer.load_confidence_model()
 
     # --- plate reading: sharpest frames + per-character voting --------------- #
-    def read_track_plate(self, cache, tid, frame_provider, index) -> tuple[str | None, float]:
+    def read_track_plate(self, cache, tid, frame_provider, index, n_evidence: int = 3):
+        """Vote a plate from the track's sharpest crops. Returns (plate|None, score, evidence_crops)
+        where evidence_crops are the top-`n_evidence` sharpest vehicle crops (for zoom cards) --
+        kept even when the read fails so UNKNOWN cars still get a human-review card."""
         candidates = [(f, b) for f, b in index.get(tid, [])
                       if lpr_consumer.bbox_area(b) > self.min_area]
         scored = []
@@ -68,7 +74,7 @@ class RoadGuard:
             if frame is None:
                 continue
             x1, y1, x2, y2 = (int(round(c)) for c in bbox)
-            crop = frame[y1:y2, x1:x2]
+            crop = frame[max(0, y1):y2, max(0, x1):x2]
             if getattr(crop, "size", 0) == 0:
                 continue
             sharp = lpr_consumer.laplacian_variance(crop)         # readability = size x sharpness
@@ -79,11 +85,14 @@ class RoadGuard:
             plate, conf = self.reader(crop)
             if plate:
                 reads.append((plate, conf))
-        return pcv.vote_characters(reads)
+        plate, score = pcv.vote_characters(reads)
+        evidence_crops = [crop for _, crop in scored[:n_evidence]]
+        return plate, score, evidence_crops
 
     # --- annotated full-video render (dynamic scaling) ----------------------- #
-    def _render(self, cache, violations, plate_map, prefix) -> str | None:
+    def _render(self, cache, violations, plate_map, prefix, evidence_crops=None) -> str | None:
         import cv2
+        evidence_crops = evidence_crops or {}
         # per-frame active violations: frame -> {track_id: (confidence, plate)}
         active: dict = defaultdict(dict)
         for v in violations:
@@ -103,13 +112,14 @@ class RoadGuard:
             print(f"[render] cannot open {cache['path']}")
             return None
         fps = cap.get(cv2.CAP_PROP_FPS) or float(cache.get("fps", 30.0))
-        writer, fi = None, 0
+        writer, fi, dims = None, 0, None
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             if writer is None:
                 h, w = frame.shape[:2]
+                dims = (w, h)
                 writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
             for tid, (conf, plate) in active.get(fi, {}).items():
                 bbox = bbox_by_frame.get(fi, {}).get(tid)
@@ -118,11 +128,40 @@ class RoadGuard:
                                             violation_type=VIOLATION_TYPE, confidence=conf)
             writer.write(frame)
             fi += 1
+
+        # tail: one held zoomed-plate evidence page per violating car (for human verification)
+        if writer is not None and dims is not None and evidence_crops:
+            self._append_evidence(writer, dims, fps, plate_map, evidence_crops, prefix)
+
         cap.release()
         if writer is not None:
             writer.release()
         print(f"   annotated -> {out_path}")
         return out_path
+
+    def _append_evidence(self, writer, dims, fps, plate_map, evidence_crops, prefix) -> None:
+        """Append held evidence cards to the open writer and save each as a standalone PNG."""
+        import cv2
+        w, h = dims
+        hold = max(1, round(fps * evidence.HOLD_SEC))
+        for tid in sorted(evidence_crops):
+            crops = evidence_crops.get(tid) or []
+            zoom_imgs, has_plate = [], False
+            for crop in crops[:3]:
+                z, is_plate = evidence.zoom_crop(crop, self._reader_obj)
+                zoom_imgs.append(z)
+                has_plate = has_plate or is_plate
+            pm = plate_map.get(tid, {})
+            card = evidence.compose_card(w, h, track_id=tid,
+                                         plate=pm.get("plate_candidate"),
+                                         score=pm.get("plate_confidence_score", 0.0),
+                                         violation_type=VIOLATION_TYPE,
+                                         zoom_imgs=zoom_imgs, has_plate=has_plate)
+            for _ in range(hold):
+                writer.write(card)
+            png = os.path.join(self.out_dir, f"{prefix}_car{tid}_evidence.png")
+            cv2.imwrite(png, card)
+            print(f"   evidence -> {png}")
 
     def process(self, prefix, video_path=None, refresh=True) -> dict:
         video_path = video_path or _find_video(prefix)
@@ -130,19 +169,20 @@ class RoadGuard:
         violations = violation_consumer.find_violations(cache, self.model, k_sec=self.k_sec, prefix=prefix)
         index = lpr_consumer.build_track_index(cache)
 
-        plate_map = {}
+        plate_map, evidence_crops = {}, {}
         if self.reader is not None and violations:
             fp = lpr_consumer.make_video_frame_provider(cache["path"])
             for tid in sorted({v["track_id"] for v in violations}):
-                plate, score = self.read_track_plate(cache, tid, fp, index)
+                plate, score, crops = self.read_track_plate(cache, tid, fp, index)
                 plate_map[tid] = {"plate_candidate": plate, "plate_confidence_score": round(score, 4)}
+                evidence_crops[tid] = crops
 
         print(f"\n=== {prefix}: {len(violations)} violation(s), "
               f"{len(plate_map)} car(s) ===")
         for tid in sorted(plate_map):
             pm = plate_map[tid]
             print(f"  car#{tid:<4} -> {pm['plate_candidate'] or 'UNKNOWN':<12} (score {pm['plate_confidence_score']:.2f})")
-        self._render(cache, violations, plate_map, prefix)
+        self._render(cache, violations, plate_map, prefix, evidence_crops)
         return {"prefix": prefix, "n_violations": len(violations), "plate_map": plate_map}
 
 
