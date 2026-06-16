@@ -1,6 +1,7 @@
-"""Oncoming-direction filter tests (CPU-only). A solid-white-line crossing is a SAME-DIRECTION
-violation; an opposite-direction car must be dropped here. We stub the heavy deps (mirrors
-test_phase2_wrappers) and use synthetic caches with hand-built motion."""
+"""Oncoming-direction down-weight tests (CPU-only). An oncoming car CAN cross the solid line (a
+valid violation) so it is KEPT, but its confidence is multiplied by oncoming_factor (~0.30) because
+the geometry is noisier. We stub the heavy deps (mirrors test_phase2_wrappers) and use synthetic
+caches with hand-built motion."""
 import os
 import sys
 import types
@@ -35,8 +36,8 @@ def _cache():
 def test_classify_marks_descending_track_oncoming():
     onc = vcons.classify_track_direction(_cache())
     assert onc[1] > onc[2]
-    assert onc[1] >= vcons.DEFAULT_ONCOMING_P              # descending = oncoming -> filtered
-    assert onc[2] < vcons.DEFAULT_ONCOMING_P               # stable/high = same-direction -> kept
+    assert onc[1] >= vcons.DEFAULT_ONCOMING_P              # descending = oncoming -> down-weighted
+    assert onc[2] < vcons.DEFAULT_ONCOMING_P               # stable/high = same-direction -> full conf
 
 
 def _patched_find(cache, **kw):
@@ -47,16 +48,19 @@ def _patched_find(cache, **kw):
          mock.patch.object(vcons, "events_from_timeline", return_value=events), \
          mock.patch.object(vcons.vc, "event_features",
                            side_effect=lambda c, ev: {"distance": 10.0, "angle_off": 0.1}), \
-         mock.patch.object(vcons.vc, "confidence_lr", return_value=0.7):
+         mock.patch.object(vcons.vc, "confidence_lr", return_value=0.8):
         return vcons.find_violations(cache, model, prefix="syn", **kw)
 
 
-def test_find_violations_drops_oncoming_track():
-    out = _patched_find(_cache())
-    tids = {o["track_id"] for o in out}
-    assert tids == {2}                                     # oncoming tid 1 dropped, same-dir tid 2 kept
+def test_oncoming_kept_but_downweighted():
+    out = {o["track_id"]: o["confidence"] for o in _patched_find(_cache(), oncoming_factor=0.30)}
+    assert set(out) == {1, 2}                              # BOTH kept -- oncoming is a valid violation
+    assert abs(out[1] - 0.8 * 0.30) < 1e-9                 # oncoming tid 1 down-weighted x0.30
+    assert abs(out[2] - 0.8) < 1e-9                        # same-direction tid 2 keeps full confidence
 
 
-def test_filter_oncoming_can_be_disabled():
-    out = _patched_find(_cache(), filter_oncoming=False)
-    assert {o["track_id"] for o in out} == {1, 2}          # both kept when the gate is off
+def test_penalty_can_be_disabled():
+    out = {o["track_id"]: o["confidence"] for o in _patched_find(_cache(), oncoming_factor=1.0)}
+    assert set(out) == {1, 2}
+    assert abs(out[1] - 0.8) < 1e-9                        # no penalty when factor == 1.0
+    assert abs(out[2] - 0.8) < 1e-9
