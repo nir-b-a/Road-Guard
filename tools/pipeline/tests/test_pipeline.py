@@ -103,6 +103,22 @@ def test_lpr_no_reads_returns_none():
     assert plate is None and score == 0.0
 
 
+def test_run_lpr_for_tracks_targets_only_requested_tracks():
+    # track 1 appears in 2 frames (frame 1 bigger), track 2 in one frame. Ask only for track 1.
+    frames = [
+        {"frame": 0, "shift": [0, 0], "vehicles": [{"track_id": 1, "bbox": [0, 0, 200, 100]},
+                                                    {"track_id": 2, "bbox": [0, 0, 200, 100]}]},
+        {"frame": 1, "shift": [0, 0], "vehicles": [{"track_id": 1, "bbox": [0, 0, 400, 100]}]},
+    ]
+    cache = cache_from_frames(frames)
+    blur = {0: 500.0, 1: 500.0}
+    ocr = {0: ("AA-AAA-AA", 0.9), 1: ("BB-BBB-BB", 0.9)}
+    out = lpr_consumer.run_lpr_for_tracks(cache, [1], make_frame_provider(),
+                                          make_ocr_reader(ocr), make_blur_fn(blur))
+    assert set(out.keys()) == {1}                       # track 2 never OCR'd
+    assert out[1]["plate_candidate"] == "BB-BBB-BB"     # larger frame wins the area tie-break
+
+
 # =========================================================================== #
 # Test 2 -- Ego-compensated handshake
 # =========================================================================== #

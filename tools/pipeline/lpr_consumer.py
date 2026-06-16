@@ -171,6 +171,52 @@ def run_lpr(
     return out
 
 
+def run_lpr_for_tracks(
+    cache: dict,
+    track_ids,
+    frame_provider: FrameProvider,
+    ocr_reader: OCRReader,
+    blur_fn: BlurFn,
+    *,
+    min_area: float = DEFAULT_MIN_AREA,
+    blur_min_variance: float = DEFAULT_BLUR_MIN_VARIANCE,
+    max_frames_per_track: int = 8,
+    track_index: "Optional[dict[int, list[tuple[int, list]]]]" = None,
+) -> "dict[int, dict]":
+    """Violation-driven LPR: read plates ONLY for the given tracks (e.g. the violators), and only
+    on each track's LARGEST-area frames (best plate pixels), capped at max_frames_per_track. Far
+    cheaper than run_lpr over every track x every frame -- it targets exactly the cars we must bill.
+
+    Returns the same shape as run_lpr: track_id -> {plate_candidate, plate_confidence_score, n_reads}.
+    """
+    index = track_index if track_index is not None else build_track_index(cache)
+    w, h = cache["w"], cache["h"]
+    out: "dict[int, dict]" = {}
+    for tid in track_ids:
+        ordered = sorted((fb for fb in index.get(tid, []) if bbox_area(fb[1]) > min_area),
+                         key=lambda fb: bbox_area(fb[1]), reverse=True)[:max_frames_per_track]
+        reads: "list[PlateRead]" = []
+        for frame_id, bbox in ordered:
+            frame = frame_provider(frame_id)
+            if frame is None:
+                continue
+            x1, y1, x2, y2 = (int(round(c)) for c in bbox)
+            crop = frame[y1:y2, x1:x2]
+            if getattr(crop, "size", 0) == 0:
+                continue
+            if blur_fn(crop) < blur_min_variance:
+                continue
+            plate, conf = ocr_reader(crop)
+            if not plate:
+                continue
+            reads.append(PlateRead(plate=plate, ocr_conf=float(conf), area=bbox_area(bbox),
+                                   center_dist=center_distance(bbox, w, h), frame=frame_id))
+        plate, score = vote_plate(reads)
+        out[tid] = {"plate_candidate": plate,
+                    "plate_confidence_score": round(score, 6), "n_reads": len(reads)}
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # production-side adapters (kept here so the core stays import-light; mocked in tests)
 # --------------------------------------------------------------------------- #
