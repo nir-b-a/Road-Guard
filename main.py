@@ -1,6 +1,5 @@
 import sys
 import cv2
-from collections import Counter
 from video_handler import VideoHandler
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
@@ -141,12 +140,6 @@ def main():
     
     # release video resources
     vh.release()
-
-    for v in world.vehicles.values():
-        if v._plate_candidates:
-            counts = Counter(v._plate_candidates)
-            max_count = max(counts.values())
-            v.license_plate = next(p for p in reversed(v._plate_candidates) if counts[p] == max_count)
 
     """ the algorithm we'll write will be here"""
 

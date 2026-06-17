@@ -70,6 +70,11 @@ pillow==10.4.0
 # yt-dlp: fetch dataset videos (tests_videos/download_videos.py).
 yt-dlp
 
+# LPR (license plate recognition): PaddleOCRDetectorReader uses our custom-trained
+# YOLO detector (israeli_plates.pt) to locate the plate, then PaddleOCR (det=False,
+# cls=False) purely for text recognition on the located crop.
+paddleocr==2.7.3
+
 # NOTE: torch / torchvision are intentionally NOT listed here — install them in
 # STEP 3 from the cu118 index, or pip will pull a CPU-only build.
 # NOTE: do not add UnLanedet itself here; it is NOT on PyPI. Clone its repo and

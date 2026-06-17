@@ -4,7 +4,6 @@ import numpy as np
 from abc import ABC, abstractmethod
 from collections import Counter
 from typing import TYPE_CHECKING
-from fast_alpr import ALPR
 
 if TYPE_CHECKING:
     from Objects.Vehicle import Vehicle
@@ -47,75 +46,13 @@ def _ocr_confidence(conf: float | list[float]) -> float:
     return float(np.mean(conf)) if isinstance(conf, list) else conf
 
 
-class FastALPRReader(LPRReader):
-    def __init__(self):
-        # detector_model default: yolo-v9-t-384-license-plate-end2end
-        # ocr_model: global-plates-mobile-vit-v2-model gives broader plate coverage
-        self._alpr = ALPR(ocr_model="global-plates-mobile-vit-v2-model")
-
-    def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
-        results = self._alpr.predict(vehicle_crop)
-        if not results:
-            return None
-        best = max(results, key=lambda r: _ocr_confidence(r.ocr.confidence) if r.ocr else 0.0)
-        if best.ocr is None:
-            return None
-        return _validate_israeli_plate(best.ocr.text)
-
-
-class EasyOCRReader(LPRReader):
-    def __init__(self):
-        import easyocr
-        # Use fast-alpr's detector only for plate localisation; replace its OCR with EasyOCR
-        self._alpr = ALPR(ocr_model="global-plates-mobile-vit-v2-model")
-        # digit-only allowlist since Israeli plates are purely numeric
-        self._ocr = easyocr.Reader(['en'], gpu=False)
-
-    def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
-        results = self._alpr.predict(vehicle_crop)
-        if not results:
-            return None
-        best = max(results, key=lambda r: r.detection.confidence)
-        bb = best.detection.bounding_box
-        plate_crop = vehicle_crop[bb.y1:bb.y2, bb.x1:bb.x2]
-        if plate_crop.size == 0:
-            return None
-        ocr_results = self._ocr.readtext(plate_crop, allowlist='0123456789', detail=0)
-        if not ocr_results:
-            return None
-        return _validate_israeli_plate(''.join(ocr_results))
-
-
-class CustomDetectorReader(LPRReader):
-    def __init__(self, detector_path: str = "israeli_plates.pt"):
-        from ultralytics import YOLO
-        import easyocr
-        self._detector = YOLO(detector_path)
-        self._ocr = easyocr.Reader(['en'], gpu=False)
-
-    def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
-        results = self._detector.predict(vehicle_crop, verbose=False, conf=0.3)
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            return None
-        best_idx = int(boxes.conf.argmax().item())
-        x1, y1, x2, y2 = map(int, boxes.xyxy[best_idx].tolist())
-        plate_crop = vehicle_crop[y1:y2, x1:x2]
-        if plate_crop.size == 0:
-            return None
-        plate_crop = _preprocess_plate(plate_crop)
-        ocr_results = self._ocr.readtext(plate_crop, allowlist='0123456789', detail=0)
-        if not ocr_results:
-            return None
-        return _validate_israeli_plate(''.join(ocr_results))
-
-
 class PaddleOCRDetectorReader(LPRReader):
-    def __init__(self, detector_path: str = "israeli_plates.pt"):
+    def __init__(self, detector_path: str = "israeli_plates.pt", min_ocr_confidence: float = 0.6):
         from ultralytics import YOLO
         from paddleocr import PaddleOCR
         self._detector = YOLO(detector_path)
         self._ocr = PaddleOCR(use_angle_cls=False, lang='en', use_gpu=False, show_log=False)
+        self._min_ocr_confidence = min_ocr_confidence
 
     def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
         results = self._detector.predict(vehicle_crop, verbose=False, conf=0.3)
@@ -131,7 +68,12 @@ class PaddleOCRDetectorReader(LPRReader):
         result = self._ocr.ocr(plate_crop, det=False, cls=False)
         if not result or not result[0]:
             return None
-        text = ''.join([item[0] for item in result[0] if item])
+        items = [item for item in result[0] if item]
+        if not items:
+            return None
+        if _ocr_confidence([item[1] for item in items]) < self._min_ocr_confidence:
+            return None
+        text = ''.join(item[0] for item in items)
         return _validate_israeli_plate(text)
 
 
