@@ -6,6 +6,7 @@ import android.view.View
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.example.roadgaurd.R
+import com.example.roadgaurd.storage.SessionStore
 import okhttp3.*
 import org.json.JSONObject
 import java.io.IOException
@@ -18,6 +19,9 @@ class HomeActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_home)
+
+        // Reclaim un-uploaded sessions left on the device beyond the retention window.
+        SessionStore.sweepStaleSessions(this)
 
         fetchNotifications()
 

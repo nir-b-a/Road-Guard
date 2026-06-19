@@ -18,6 +18,13 @@ import java.io.IOException
 
 class SplashActivity : AppCompatActivity() {
 
+    private companion object {
+        // DEV: while the backend is offline, skip the login screen entirely so the app
+        // is testable. Set to false (or delete the block in onCreate) to restore the
+        // real login/register flow once the server is up.
+        const val BYPASS_LOGIN = true
+    }
+
     private val BASE_URL = "http://10.0.2.2:5000/api"
     private lateinit var prefs: SharedPreferences
     private var isRegisterMode = false
@@ -25,6 +32,20 @@ class SplashActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("roadguard", MODE_PRIVATE)
+
+        // ── DEV login bypass (server down) ──
+        if (BYPASS_LOGIN) {
+            if (prefs.getString("token", null) == null) {
+                prefs.edit()
+                    .putString("token", "dev-offline-token")
+                    .putString("userId", "dev-user")
+                    .putString("name", "Dev Driver")
+                    .apply()
+            }
+            startActivity(Intent(this, HomeActivity::class.java))
+            finish()
+            return
+        }
 
         val token = prefs.getString("token", null)
         if (token != null) {

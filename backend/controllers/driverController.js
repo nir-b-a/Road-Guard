@@ -3,11 +3,34 @@ const Notification = require('../models/Notification');
 
 const FPS = 30;
 
+// Upload field name (== on-device file name) -> Drive.files key.
+const FILE_KEYS = {
+    'video':           'video',
+    'frames.csv':      'frames',
+    'gps.csv':         'gps',
+    'gravity.csv':     'gravity',
+    'gyro.csv':        'gyro',
+    'linacc.csv':      'linacc',
+    'intrinsics.json': 'intrinsics',
+    'tags.json':       'tags'
+};
+
 const uploadDrive = async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No video file uploaded', data: null });
+    // upload.fields() -> req.files is { fieldName: [file], ... }; the video is required.
+    const files = req.files || {};
+    const videoFile = files.video && files.video[0];
+    if (!videoFile) return res.status(400).json({ success: false, message: 'No video file uploaded', data: null });
 
     const { sessionId, tags, speed_json } = req.body;
     if (!sessionId) return res.status(400).json({ success: false, message: 'sessionId is required', data: null });
+
+    // Map every received artifact to the relative path it is served from (/uploads/...).
+    const storedFiles = {};
+    for (const [field, list] of Object.entries(files)) {
+        const key = FILE_KEYS[field];
+        const f = list && list[0];
+        if (key && f) storedFiles[key] = 'uploads/sessions/' + req._sessionId + '/' + f.filename;
+    }
 
     let parsedTags = [];
     try { parsedTags = tags ? JSON.parse(tags) : []; } catch { parsedTags = []; }
@@ -27,14 +50,15 @@ const uploadDrive = async (req, res) => {
     const drive = await Drive.create({
         driverId:     req.user._id,
         sessionId,
-        videoPath:    'uploads/videos/' + req.file.filename,
+        videoPath:    storedFiles.video,   // back-compat alias of files.video
+        files:        storedFiles,
         tags:         parsedTags,
         speedSamples: parsedSpeedSamples,
         fps:          FPS,
         status:       'pending'
     });
 
-    res.status(201).json({ success: true, message: 'Drive uploaded successfully', data: { sessionId: drive.sessionId, driveId: drive._id, speedSamplesCount: parsedSpeedSamples.length } });
+    res.status(201).json({ success: true, message: 'Drive uploaded successfully', data: { sessionId: drive.sessionId, driveId: drive._id, files: Object.keys(storedFiles), speedSamplesCount: parsedSpeedSamples.length } });
 };
 
 const getNotifications = async (req, res) => {

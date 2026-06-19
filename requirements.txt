@@ -1,81 +1,84 @@
 # =============================================================================
-# Road Guard — DL lane-detection environment (Phase 0)
-# Target machine: Windows 11, NVIDIA GTX 1060 6GB (Pascal sm_61), Python 3.10
+# Road Guard — Python pipeline requirements
+# Target: Windows 10/11, NVIDIA GPU (CUDA 11.8), Python 3.10
+# Versions below are the EXACT ones from the working .venv (proven to run
+# main.py + the violation harness on yolo11x + torch 2.1.2+cu118).
 # =============================================================================
 #
-# DO NOT `pip install -r requirements.txt` blindly. torch must come from the
-# CUDA-specific index, and the CUDA toolchain must exist FIRST. Follow the
-# ordered steps below, then reconcile against UnLanedet's own setup.py after
-# cloning (its pins win for anything it lists).
+# IMPORTANT — DO NOT `pip install -r requirements.txt` blindly.
+# torch/torchvision are NOT listed here: they must come from the CUDA-specific
+# wheel index, or pip pulls a CPU-only build and GPU inference silently breaks.
+# Install in this order:
 #
-# -----------------------------------------------------------------------------
-# STEP 1 — Create a clean conda env (NOT the system 3.13 Store Python).
-#   conda create -n roadguard-dl python=3.10 -y
-#   conda activate roadguard-dl
+#   STEP 1  Create + activate a clean Python 3.10 env
+#             python -m venv .venv
+#             .venv\Scripts\activate            (PowerShell: .venv\Scripts\Activate.ps1)
+#           (or:  conda create -n roadguard python=3.10 -y && conda activate roadguard)
 #
-# STEP 2 — Provide the CUDA compiler IN-ENV (this is why `nvcc` was missing).
-#   conda install -c "nvidia/label/cuda-11.8.0" cuda-toolkit -y
-#   # also install Visual Studio 2019/2022 Build Tools (C++ workload) once,
-#   # system-wide — MSVC is required to compile the C++ side of the ops.
-#   # Verify: `nvcc --version` must now print 11.8.
+#   STEP 2  Install torch built for CUDA 11.8 (Pascal-compatible, e.g. GTX 1060):
+#             pip install torch==2.1.2 torchvision==0.16.2 \
+#                 --index-url https://download.pytorch.org/whl/cu118
+#           (CPU-only fallback, no GPU:  pip install torch==2.1.2 torchvision==0.16.2)
 #
-# STEP 3 — Install torch built for CUDA 11.8 (Pascal-compatible):
-#   pip install torch==2.1.2 torchvision==0.16.2 \
-#       --index-url https://download.pytorch.org/whl/cu118
+#   STEP 3  Install everything in this file:
+#             pip install -r requirements.txt
 #
-# STEP 4 — Install the rest (this file):
-#   pip install -r requirements.txt
-#
-# STEP 5 — (OPTIONAL) Clone + build UnLanedet. Only needed for the CLRerNet
-#   co-run tool (tools/test_corun_video.py). main.py and the violation pipeline
-#   (crossing_violation_test / wrong_way / shoulder) do NOT need UnLanedet — they
-#   run on ultralytics YOLO + the committed weights/phase3_v3_yellowprotect.pt.
+# The YOLO base weights are auto-downloaded by ultralytics on first run
+# (yolo11x.pt ~109 MB, yolov8m.pt for the violation harness). They are gitignored.
 # -----------------------------------------------------------------------------
 
-# --- Pinned for collision avoidance ------------------------------------------
-# numpy<2: numpy 2.0 broke the ABI for a lot of compiled CV/ML wheels
-# (detectron2 lineage, older opencv). Pin below 2.0 until everything is 2.0-ready.
+# --- CORE: required to run main.py (speed estimation) -------------------------
+# numpy<2 — numpy 2.0 broke the ABI for many compiled CV/ML wheels. Keep pinned.
 numpy==1.26.4
-
-# YOLOv8. 8.2.x is permissive about torch version and works with torch 2.1.x.
-ultralytics==8.2.103
-
-# OpenCV (already used by the classical pipeline). Keep headed build for cv2.imshow.
+# YOLO11 detection + tracking. 8.4.x supports yolo11x and works with torch 2.1.x.
+ultralytics==8.4.68
+# OpenCV — headed build (keeps cv2.imshow available for the debug windows).
 opencv-python==4.10.0.84
-
-# Build helper for torch C++/CUDA extensions — UnLanedet's ops compile via this.
-ninja==1.11.1.1
-
-# setuptools<81: torch 2.1.2's cpp_extension imports `pkg_resources`, which
-# setuptools 81+ removed. Without this pin a fresh env / `pip install -U` breaks
-# inline CUDA op compilation (smoke test stage 6) with ModuleNotFoundError.
-setuptools<81
-
-# Common transitive deps that UnLanedet / lanedet expect; pinned conservatively.
-pyyaml==6.0.2
+# Linear-assignment backend for the BoT-SORT / ByteTrack trackers (ultralytics).
+lapx==0.9.4
+# Savitzky-Golay smoothing, Kalman/RTS math (speed_estimation/).
 scipy==1.13.1
+# Per-vehicle speed/distance plots + ego-speed plot (speed_estimation/draw_vehicle_plots.py).
+matplotlib==3.10.9
+# Overpass speed-limit lookup for the overspeed step (speed_estimation/speed_limit_lookup.py).
+requests==2.28.1
+# Pulled in by ultralytics; pinned for a reproducible resolve.
+pandas==2.2.2
+pillow==10.4.0
+pyyaml==6.0.2
 tqdm==4.66.5
+
+# --- OPTIONAL: license-plate recognition (lpr/) -------------------------------
+# Only needed if you enable the LPR path (commented out in main.py by default).
+# fast_alpr is the active reader; it runs on onnxruntime.
+fast_alpr==0.4.0
+onnxruntime==1.23.2
+# (Alternative readers referenced in lpr/reader.py but NOT installed by default:
+#  easyocr, paddleocr/paddlepaddle. Install only if you switch to that path.)
+
+# --- OPTIONAL: dataset download (tests_videos/download_videos.py) -------------
+yt-dlp
+
+# --- OPTIONAL: DL lane detection / CLRerNet co-run tool -----------------------
+# Needed ONLY for tools/test_corun_video.py and line_crossing/dl_lane_detector.py.
+# main.py and the violation pipeline (crossing_violation_test / wrong_way /
+# shoulder) do NOT need any of these — they run on ultralytics YOLO + the
+# committed weights/phase3_v3_yellowprotect.pt.
+#
+# UnLanedet itself is NOT on PyPI — clone its repo and install editable:
+#     pip install -e ./UnLanedet        (UnLanedet/ is gitignored)
+# Its build + transitive deps (its own setup.py pins win if they differ):
+ninja==1.11.1.1
 addict==2.4.0
 yapf==0.40.2
 imgaug==0.4.0
-pandas==2.2.2
-scikit-learn==1.5.1
+# albumentations 1.4.10 needs albucore<0.1 (0.1+ removed preserve_channel_dim
+# from albucore.utils and breaks `import albumentations`).
 albumentations==1.4.10
-# albucore<0.1: albumentations 1.4.10 only requires albucore>=0.0.11, but
-# albucore 0.1+ removed `preserve_channel_dim` from albucore.utils, which breaks
-# `import albumentations` (and thus UnLanedet's al.Resize at inference). Pin it.
 albucore==0.0.13
-pillow==10.4.0
-
-# yt-dlp: fetch dataset videos (tests_videos/download_videos.py).
-yt-dlp
-
-# NOTE: torch / torchvision are intentionally NOT listed here — install them in
-# STEP 3 from the cu118 index, or pip will pull a CPU-only build.
-# NOTE: do not add UnLanedet itself here; it is NOT on PyPI. Clone its repo and
-#   install editable:  pip install -e ./UnLanedet  (UnLanedet/ is gitignored).
-# NOTE: the CLRerNet base weight weights/clrernet_model_best_culane.pth (~264 MB,
-#   from the CLRerNet model zoo) is gitignored and ONLY required by
-#   tools/test_corun_video.py. Download it into weights/ if you run that tool.
-# NOTE: YOLO base weights (yolov8m.pt, yolov8n-seg.pt, ...) are NOT committed —
-#   ultralytics auto-downloads them on first use.
+scikit-learn==1.5.1
+scikit-image==0.25.2
+shapely==2.1.2
+# torch 2.1.2's cpp_extension imports pkg_resources, removed in setuptools 81+.
+# Keep setuptools<81 if you compile UnLanedet's inline CUDA ops.
+setuptools<81
