@@ -3,7 +3,7 @@ import StatusBadge from './StatusBadge';
 const ViolationCard = ({ violation }) => {
   const navigate = useNavigate();
   return (
-    <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 hover:border-red-600 transition cursor-pointer" onClick={() => navigate('/violations/' + violation._id)}>
+    <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 hover:border-cyan-600 transition cursor-pointer" onClick={() => navigate('/violations/' + violation._id)}>
       <div className="flex justify-between items-start mb-2">
         <span className="font-bold text-white text-lg">{violation.carId}</span>
         <StatusBadge status={violation.status} />

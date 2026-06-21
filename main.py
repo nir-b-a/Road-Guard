@@ -15,7 +15,7 @@ CLASSES = DetectClass.Detection_Classes
 CONFIDENCE_LVL = 0.5
 
 
-# load yolov8 model and set it to YOLO_MODEL (for now we'll use model x)
+# load yolov8 model and set it to YOLO_MODEL
 def loadYoloModel():
     #global YOLO_MODEL
     try:
