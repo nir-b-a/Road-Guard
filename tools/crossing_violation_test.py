@@ -76,7 +76,7 @@ def find_clip(prefix: str) -> str | None:
 # Pass 1: build per-clip cache (models run here ONLY)
 # --------------------------------------------------------------------------- #
 def build_cache(prefix: str, lane_model, veh_weights: str, lane_conf: float, veh_conf: float,
-                path: str | None = None) -> dict | None:
+                path: str | None = None, tracker: str = "bytetrack.yaml") -> dict | None:
     if path is None:
         path = find_clip(prefix)
     if not path:
@@ -90,7 +90,7 @@ def build_cache(prefix: str, lane_model, veh_weights: str, lane_conf: float, veh
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"[pass1] {prefix}: {w}x{h}@{fps:.2f}fps {total} frames -> caching")
+    print(f"[pass1] {prefix}: {w}x{h}@{fps:.2f}fps {total} frames, tracker={tracker} -> caching")
 
     frames = []
     fi = 0
@@ -122,7 +122,7 @@ def build_cache(prefix: str, lane_model, veh_weights: str, lane_conf: float, veh
         # --- vehicles (track) ---
         vehicles = []
         vres = veh_model.track(frame, persist=True, classes=VEHICLE_CLASSES, conf=veh_conf,
-                               tracker="bytetrack.yaml", verbose=False)[0]
+                               tracker=tracker, verbose=False)[0]
         if vres.boxes is not None and vres.boxes.id is not None:
             for tid, b in zip(vres.boxes.id.tolist(), vres.boxes.xyxy.tolist()):
                 x1, y1, x2, y2 = b

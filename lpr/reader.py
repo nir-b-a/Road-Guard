@@ -41,9 +41,60 @@ class LPRReader(ABC):
         """Returns a validated Israeli plate string (XX-XXX-XX or XXX-XX-XXX), or None."""
         pass
 
+    def read_plate_with_conf(self, vehicle_crop: np.ndarray) -> tuple[str | None, float]:
+        """Return (validated plate | None, OCR confidence in [0,1]).
+
+        Default delegates to read_plate with a neutral confidence of 1.0. FastALPRReader
+        overrides this with the real OCR confidence, which feeds the Module B pipeline score
+        (vote_fraction * mean_OCR_conf). Other readers can override as their OCR exposes it."""
+        return self.read_plate(vehicle_crop), 1.0
+
+    def crop_plate(self, vehicle_crop: np.ndarray):
+        """Return the tight plate-region sub-crop inside `vehicle_crop`, or None if no plate is
+        localised. Used to build zoomed evidence images for human verification. Default: no
+        localiser available -> None (callers fall back to the whole vehicle crop)."""
+        return None
+
 
 def _ocr_confidence(conf: float | list[float]) -> float:
     return float(np.mean(conf)) if isinstance(conf, list) else conf
+
+
+class FastALPRReader(LPRReader):
+    def __init__(self):
+        from fast_alpr import ALPR  # lazy import: only required when this reader is constructed
+        # detector_model default: yolo-v9-t-384-license-plate-end2end
+        # ocr_model: global-plates-mobile-vit-v2-model gives broader plate coverage
+        self._alpr = ALPR(ocr_model="global-plates-mobile-vit-v2-model")
+
+    def read_plate(self, vehicle_crop: np.ndarray) -> str | None:
+        return self.read_plate_with_conf(vehicle_crop)[0]
+
+    def read_plate_with_conf(self, vehicle_crop: np.ndarray) -> tuple[str | None, float]:
+        results = self._alpr.predict(vehicle_crop)
+        if not results:
+            return None, 0.0
+        best = max(results, key=lambda r: _ocr_confidence(r.ocr.confidence) if r.ocr else 0.0)
+        if best.ocr is None:
+            return None, 0.0
+        return _validate_israeli_plate(best.ocr.text), float(_ocr_confidence(best.ocr.confidence))
+
+    def crop_plate(self, vehicle_crop: np.ndarray):
+        """Tight plate-region sub-crop via the detector box (highest-confidence plate), or None."""
+        results = self._alpr.predict(vehicle_crop)
+        if not results:
+            return None
+        best = max(results, key=lambda r: r.detection.confidence if r.detection else 0.0)
+        if best.detection is None:
+            return None
+        bb = best.detection.bounding_box
+        h, w = vehicle_crop.shape[:2]
+        x1, y1 = max(0, int(bb.x1)), max(0, int(bb.y1))
+        x2, y2 = min(w, int(bb.x2)), min(h, int(bb.y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        plate_crop = vehicle_crop[y1:y2, x1:x2]
+        return plate_crop if plate_crop.size else None
 
 
 class PaddleOCRDetectorReader(LPRReader):
