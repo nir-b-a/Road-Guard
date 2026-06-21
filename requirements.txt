@@ -82,3 +82,22 @@ shapely==2.1.2
 # torch 2.1.2's cpp_extension imports pkg_resources, removed in setuptools 81+.
 # Keep setuptools<81 if you compile UnLanedet's inline CUDA ops.
 setuptools<81
+pillow==10.4.0
+
+# yt-dlp: fetch dataset videos (tests_videos/download_videos.py).
+yt-dlp
+
+# LPR (license plate recognition): PaddleOCRDetectorReader uses our custom-trained
+# YOLO detector (israeli_plates.pt) to locate the plate, then PaddleOCR (det=False,
+# cls=False) purely for text recognition on the located crop.
+paddleocr==2.7.3
+
+# NOTE: torch / torchvision are intentionally NOT listed here — install them in
+# STEP 3 from the cu118 index, or pip will pull a CPU-only build.
+# NOTE: do not add UnLanedet itself here; it is NOT on PyPI. Clone its repo and
+#   install editable:  pip install -e ./UnLanedet  (UnLanedet/ is gitignored).
+# NOTE: the CLRerNet base weight weights/clrernet_model_best_culane.pth (~264 MB,
+#   from the CLRerNet model zoo) is gitignored and ONLY required by
+#   tools/test_corun_video.py. Download it into weights/ if you run that tool.
+# NOTE: YOLO base weights (yolov8m.pt, yolov8n-seg.pt, ...) are NOT committed —
+#   ultralytics auto-downloads them on first use.
