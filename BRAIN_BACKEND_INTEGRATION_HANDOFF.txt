@@ -1,0 +1,396 @@
+================================================================================
+ROAD GUARD — BRAIN <-> BACKEND INTEGRATION HANDOFF
+For the assistant / developers building the WEB + APP + BACKEND side.
+Written 2026-06-24. Branch: feature/yellow-solid-line-violation.
+================================================================================
+
+Hi. You're building the backend / web dashboard / mobile app for Road Guard. THIS document
+describes the contract that the "brain" (the computer-vision pipeline) already implements, so you
+can build your side (storage, API, dashboard, app dataset) to plug straight into it with no surprises.
+
+Read sections 0–7 to integrate. Sections 8–14 are context, honesty, and pointers.
+
+Everything below is implemented and tested in this repo. Code pointers are in section 12.
+
+
+--------------------------------------------------------------------------------
+0. TL;DR (the 60-second version)
+--------------------------------------------------------------------------------
+- Road Guard is a Human-in-the-Loop (HITL) traffic-violation system. A dashcam/clip is analysed by
+  the "brain" (GPU vision). For each detected violation the brain produces an EVIDENCE PACKAGE and
+  ships it to YOUR backend for human review + storage + display in the web/app.
+
+- The transport is ONE gzip tarball ("the bundle", `violations.tar.gz`) POSTed to your backend as
+  multipart/form-data. Inside it: a top-level `manifest.json` (the machine-readable index, RANKED)
+  plus ONE FOLDER PER VIOLATION, each self-contained:
+      v<vehicleId>_<TYPE>_f<frame>/
+        clip.mp4                         <- 10s annotated clip (red box on the offending vehicle)
+        v<id>_<TYPE>.txt                 <- human-readable one-pager (key=value)
+        violation.json                   <- machine record (same fields the manifest lists)
+        v<id>_<TYPE>_0_f<frame>.png      <- vehicle picture 1  (+ _plate.png plate crop)
+        v<id>_<TYPE>_1_f<frame>.png      <- vehicle picture 2  (+ _plate.png)
+        v<id>_<TYPE>_2_f<frame>.png      <- vehicle picture 3  (+ _plate.png)
+        report.docx                      <- ONLY for SPEEDING (describes the calculated speed)
+
+- The review queue ORDER is decided by the brain and is LEXICOGRAPHIC by violation TYPE
+  (Solid-line crossing > Speeding > other > Yellow-line). Preserve this order in your UI.
+
+- The plate read is EVIDENCE ONLY. It NEVER affects priority/ranking. An unreadable plate
+  ("UNKNOWN", manual_review=true) must not bury a serious violation.
+
+- Two integration modes (pick one; both implemented): (A) brain pulls the video from you and pushes
+  the bundle back, or (B) you DISPATCH a job to the brain service and it calls you back (async).
+
+
+--------------------------------------------------------------------------------
+1. WHAT THIS PART OF THE PROJECT IS (and what happened here)
+--------------------------------------------------------------------------------
+Road Guard = HITL SaaS for road-violation enforcement. Optimised for RECALL, not precision (a false
+positive is cheap for a human reviewer to dismiss; a missed violation is the costly failure). That
+is WHY: violations are reported even with no readable plate; the plate never down-ranks a violation;
+"3 pictures" are always shipped even when OCR failed.
+
+This part = the CLIENT-SIDE (brain) half of the brain<->backend integration contract + a fully
+working LOCAL end-to-end loop that proves it, using a mock backend so we didn't need your real
+server to develop against.
+
+What was built and proven here (on a real clip, DeNnDugXxP0.mp4, 1280x720 @ 30fps):
+  * A prioritised, self-describing evidence bundle (the structure in section 0).
+  * Hard type-tiered ranking (section 7), replacing an earlier confidence×severity blend.
+  * Per-violation annotated clip (red box + caption), 3 vehicle pics each with a plate crop, a .txt
+    + .json document, and a .docx for speeding.
+  * A download + INTEGRITY handshake (section 4) so corrupted/recompressed video is caught early.
+  * BOTH integration modes (section 3), including the brain running as an async job service.
+  * A mock backend that serves the video, returns its reference fingerprint, receives the bundle,
+    and auto-unpacks it into a browsable folder tree.
+
+What is NOT done yet: wiring this into the live GPU pipeline (main.py), and a real remote backend
+(only the local mock exists). See section 14.
+
+
+--------------------------------------------------------------------------------
+2. VOCABULARY
+--------------------------------------------------------------------------------
+  BRAIN        the vision pipeline (this side). Detects violations, builds + sends the bundle.
+  BACKEND      YOUR server. Stores the original video, receives bundles, feeds the web/app.
+  BUNDLE       one gzip tarball (violations.tar.gz): manifest.json + per-violation folders.
+  MANIFEST     manifest.json — the ranked, machine-readable index of all violations in the bundle.
+  VIOLATION    one incident: one vehicle, one violation type, one key frame.
+  EVIDENCE     per violation: the clip + pictures + plate crops + documents.
+  VideoMeta    a video fingerprint {filename,width,height,fps,frame_count,sha256,duration_sec,codec}.
+
+
+--------------------------------------------------------------------------------
+3. THE TWO INTEGRATION MODES (pick one; both work today)
+--------------------------------------------------------------------------------
+MODE A — BRAIN-INITIATED (brain pulls, then pushes). Simplest.
+    brain  GET  {backend}/video/{name}/meta      -> reference VideoMeta (for integrity)
+    brain  GET  {backend}/video/{name}           -> the raw video bytes
+    brain  ...analyse...
+    brain  POST {backend}/ingest                 -> the bundle (multipart). Done.
+
+MODE B — BACKEND-INITIATED (you dispatch a job; brain calls back). Realistic for production,
+because real analysis is minutes of GPU and you don't want to block. ASYNC (202 + callback):
+    backend POST {brain}/jobs {video_name, source_base_url, callback_url, job_id}  -> 202 Accepted
+    brain   GET  {source_base_url}/video/{name}/meta + /video/{name}               (pull + verify)
+    brain   ...analyse...
+    brain   POST {callback_url}  (= your /ingest)  -> the bundle, tagged with job_id
+    (you can poll GET {brain}/jobs/{job_id} for status: accepted|running|done|error)
+
+In BOTH modes the bundle that lands on /ingest is byte-for-byte the same structure (sections 5–6).
+
+
+--------------------------------------------------------------------------------
+4. THE INTEGRITY HANDSHAKE (why /video/{name}/meta exists)
+--------------------------------------------------------------------------------
+You (the backend) hold the ORIGINAL video, so you are the source of truth for its fingerprint.
+  * Expose GET /video/{name}/meta returning the reference VideoMeta (run ffprobe once; see schema
+    in section 6 under source_video). Include sha256 of the file.
+  * The brain re-probes its downloaded copy and compares (resolution, fps, frame_count, sha256). If
+    the transfer lost fidelity (truncation, a recompressing proxy, downscale), the brain FAILS FAST
+    before burning GPU time — and can tell you which hop broke it.
+  * A faithful transfer is byte-identical, so a sha256 mismatch == something tampered with the bytes.
+This is optional for a first integration, but if you serve /video you should also serve /meta.
+
+
+--------------------------------------------------------------------------------
+5. THE BUNDLE — exactly what you receive on /ingest
+--------------------------------------------------------------------------------
+Transport: HTTP POST, multipart/form-data, to your /ingest endpoint.
+  - File part field name: "bundle"   (filename "violations.tar.gz", content-type application/gzip)
+  - Sibling form fields: "manifest_version" (e.g. "2.0"), "source_video" (the video name),
+    and "job_id" (present in MODE B so you can correlate the callback to the job you dispatched).
+
+The file is a gzip-compressed tar. Extract it and you get:
+
+    manifest.json                                  <- ranked index of ALL violations (section 6)
+    v1_SOLID_LINE_CROSSING_f149/                   <- one folder per violation
+        clip.mp4
+        v1_SOLID_LINE_CROSSING.txt
+        violation.json
+        v1_SOLID_LINE_CROSSING_0_f104.png
+        v1_SOLID_LINE_CROSSING_0_f104_plate.png
+        v1_SOLID_LINE_CROSSING_1_f149.png
+        v1_SOLID_LINE_CROSSING_1_f149_plate.png
+        v1_SOLID_LINE_CROSSING_2_f194.png
+        v1_SOLID_LINE_CROSSING_2_f194_plate.png
+    v901_SPEEDING_f1200/
+        clip.mp4
+        v901_SPEEDING.txt
+        violation.json
+        report.docx                                <- speeding only
+        v901_SPEEDING_0_f1155.png  (+ _plate.png)
+        v901_SPEEDING_1_f1182.png  (+ _plate.png)
+        v901_SPEEDING_2_f1208.png  (+ _plate.png)
+    v951_YELLOW_LINE_RIGHT_f1500/
+        ...same shape, no report.docx...
+
+FILE NAMING RULES (parse these if you want, or just read manifest.json which lists every file):
+  - Folder:  v<vehicleId>_<VIOLATION_TYPE>_f<keyFrame>/
+  - Clip:    clip.mp4   (the 10s evidence clip: ~10s before the incident to ~5s after, ANNOTATED
+             with a red box on the offending vehicle + a caption describing the violation)
+  - Pics:    v<id>_<TYPE>_<i>_f<frame>.png        (i = 0,1,2 ; <frame> = the source frame index)
+  - Plates:  v<id>_<TYPE>_<i>_f<frame>_plate.png  (the plate crop for that same picture)
+  - Docs:    v<id>_<TYPE>.txt (always) ; violation.json (always) ; report.docx (SPEEDING only)
+
+INTEGRITY: every media file's sha256 is recorded in manifest.json. You SHOULD verify the bytes you
+stored match (catches a broken upload). gzip tar is deterministic on our side.
+
+
+--------------------------------------------------------------------------------
+6. manifest.json — FULL FIELD REFERENCE (this is your DB/ingest schema)
+--------------------------------------------------------------------------------
+Top level:
+{
+  "manifest_version": "2.0",
+  "created_utc": 1750000000.0,                      // unix seconds, when the brain built the bundle
+  "client": { "app": "roadguard", "component": "run_brain", "demo": true },
+  "source_video": {                                 // the VideoMeta fingerprint of the analysed video
+      "filename": "DeNnDugXxP0.mp4",
+      "width": 1280, "height": 720, "fps": 30.0,
+      "frame_count": 2700, "sha256": "….", "duration_sec": 90.0, "codec": "h264"
+  },
+  "priority_model": {                               // documents how violations[] are ordered
+      "model": "lexicographic_type_tier",
+      "summary": "Hard type tiers; confidence orders WITHIN a tier only, never across tiers.",
+      "tiers": [
+        {"rank":0,"type":"SOLID_LINE_CROSSING","intra_order":"confidence_desc"},
+        {"rank":1,"type":"SPEEDING","intra_order":"confidence_desc (margin-over-limit)"},
+        {"rank":2,"type":"<other>","intra_order":"confidence_desc"},
+        {"rank":3,"type":"YELLOW_LINE_RIGHT","intra_order":"chronological (key_frame asc)"}
+      ],
+      "type_tier": {"SOLID_LINE_CROSSING":0,"SPEEDING":1,"YELLOW_LINE_RIGHT":3},
+      "default_tier": 2,
+      "speeding_confidence_from_margin": {"floor":0.30,"full_over_kmh":40.0},
+      "severity_weights_informational": { … },      // INFORMATIONAL ONLY, not used for ordering
+      "plate_confidence_excluded": true
+  },
+  "violation_count": 5,
+  "violations": [ <violation record>, … ]           // ALREADY SORTED worst/most-urgent first
+}
+
+Each <violation record> (this is the row you'd store + render; violation.json in each folder is an
+exact copy of its own record):
+{
+  "violation_id": "v1_SOLID_LINE_CROSSING_f149",    // stable unique id (== folder name)
+  "vehicle_id": 1,                                  // tracker id of the offending vehicle
+  "violation": "SOLID_LINE_CROSSING",               // <-- USE THIS as the violation type
+  "violation_type": "SOLID_LINE_CROSSING",          // alias of "violation" (back-compat)
+  "tier": 0,                                         // 0..3, lower = higher priority (section 7)
+  "key_frame": 149,                                  // the representative frame of the incident
+  "detector_confidence": 0.926241,                  // [0,1] detector certainty (orders WITHIN tier)
+  "crossing_solid_line_confidence": 0.926241,       // crossing conf on a crossing row; null otherwise
+  "plate": null,                                     // "40-418-79" or null (null => UNKNOWN)
+  "plate_score": 0.0,                                // OCR confidence [0,1]. EVIDENCE ONLY, never ranks
+  "n_reads": 0,                                      // how many frames produced a plate string
+  "manual_review": true,                             // true => a human must confirm the plate
+  "severity_weight": 0.8,                            // INFORMATIONAL ONLY (do not rank on it)
+  "description": "Vehicle 1 crossed a solid white lane line (crossing confidence 0.93).",
+  "details": { … type-specific … },                 // see below
+  "record_file": "v1_SOLID_LINE_CROSSING_f149/violation.json",
+  "summary_file": "v1_SOLID_LINE_CROSSING_f149/v1_SOLID_LINE_CROSSING.txt",
+  "evidence": {
+     "plate": null, "plate_score": 0.0, "n_reads": 0, "manual_review": true,
+     "clip": {                                        // the annotated 10s evidence video
+        "file": "v1_SOLID_LINE_CROSSING_f149/clip.mp4",
+        "bytes": 10370187, "sha256": "….",
+        "container": "mp4", "recompressed": true,     // true: annotated clips are re-encoded by design
+        "window": {"start_frame":0,"end_frame":299,"start_sec":0.0,"end_sec":10.0,
+                   "key_frame":149,"duration_sec":10.0}
+     },
+     "report": null,                                  // {file,bytes,sha256,kind,content_type} for SPEEDING
+     "crops": [                                       // the 3 vehicle pictures
+        {"file":"…_0_f104.png","frame_id":104,"bytes":…,"sha256":"…",
+         "plate":{"file":"…_0_f104_plate.png","bytes":…,"sha256":"…"}},
+        … two more …
+     ],
+     "plate_crop": null                               // legacy single best plate crop (usually null here)
+  }
+}
+
+details (type-specific payload):
+  SPEEDING:            {"est_speed_kmh":96.0,"speed_limit_kmh":50.0,"over_by_kmh":46.0, …}
+  SOLID_LINE_CROSSING: {"start_frame":…,"end_frame":…,"source":"cached_real_analysis", …}
+  YELLOW_LINE_RIGHT:   {"shoulder_overlap_frac":0.6, …}
+  (any event may carry "_synthetic": true and "_note": "…" — see section 9)
+
+
+--------------------------------------------------------------------------------
+7. PRIORITY / REVIEW-QUEUE ORDER (important for the dashboard + app)
+--------------------------------------------------------------------------------
+violations[] is ALREADY sorted by the brain, worst/most-urgent FIRST. Preserve that order in the
+review queue. The rule is HARD TYPE TIERS (lexicographic) — type dominates absolutely:
+
+    TIER 0  SOLID_LINE_CROSSING   (always first; within the tier: detector_confidence DESC)
+    TIER 1  SPEEDING              (within: confidence DESC, where speeding confidence is derived
+                                   from how far over the limit it was — see speeding_confidence_from_margin)
+    TIER 2  <any other type>      (within: confidence DESC)
+    TIER 3  YELLOW_LINE_RIGHT     (LAST; ordered CHRONOLOGICALLY by key_frame, no confidence ranking)
+
+Consequence to respect in UI/logic: a low-confidence crossing STILL outranks a very confident
+speeder, because TYPE wins. Confidence only breaks ties WITHIN a tier.
+
+DO NOT rank on: plate / plate_score (evidence only), or severity_weight (informational only).
+If you re-sort server-side, sort by (tier ASC, then -detector_confidence) for tiers 0/1/2, and by
+(tier ASC, key_frame ASC) for tier 3 — or just keep the array order we sent.
+
+
+--------------------------------------------------------------------------------
+8. THE PER-VIOLATION .txt and violation.json (what a reviewer sees in a folder)
+--------------------------------------------------------------------------------
+v<id>_<TYPE>.txt is a flat key=value human one-pager, e.g.:
+    vehicle_id=901
+    violation=SPEEDING
+    plate=40-418-79
+    plate_score=0.971
+    n_reads=6
+    manual_review=False
+    crossing_solid_line_confidence=None
+    tier=1
+    detector_confidence=1.0
+    est_speed_kmh=96.0
+    speed_limit_kmh=50.0
+    over_by_kmh=46.0
+    description=Vehicle 901 was speeding: ~96 km/h in a 50 km/h zone (+46 km/h over the limit).
+
+violation.json is the EXACT manifest record for that one violation (section 6). Use the .json for
+machine ingest; the .txt is for a human glancing at a single folder.
+
+
+--------------------------------------------------------------------------------
+9. WHAT IS REAL vs DEMO RIGHT NOW (please read — don't trust demo data as production)
+--------------------------------------------------------------------------------
+The local proof ran on DeNnDugXxP0.mp4, a real dashcam crossing clip. In that proof:
+  * SOLID_LINE_CROSSING violations are REAL (from a prior real analysis; 0 readable plates).
+  * SPEEDING and YELLOW_LINE_RIGHT events are SYNTHETIC, clearly flagged "_synthetic": true in
+    details. That clip has no GPS (so no real speeding) and no yellow-line event; they were injected
+    ONLY to exercise tiers 1 & 3 and the .docx so you can see the full payload shape.
+  * The speeding plate "40-418-79" (score 0.971, 6 reads) is DEMO data on the synthetic event.
+  * Because no plate was readable on this clip, the *_plate.png crops are a heuristic crop of the
+    lower-centre of the vehicle box (where a plate sits). In production the real pipeline supplies a
+    localised plate crop instead. The MEDIA SHAPE is identical either way.
+So: trust the STRUCTURE, the field names, the ordering rules, and the transport. Do NOT treat the
+demo's specific plate/speed values as real detections.
+
+
+--------------------------------------------------------------------------------
+10. WHAT YOU NEED TO IMPLEMENT ON THE BACKEND / WEB / APP
+--------------------------------------------------------------------------------
+Minimum to integrate (MODE A):
+  [ ] GET  /video/{name}            -> stream the raw video bytes (so the brain can pull it)
+  [ ] GET  /video/{name}/meta       -> JSON VideoMeta (ffprobe of your stored original; section 4/6)
+  [ ] POST /ingest                  -> accept multipart (file field "bundle" + form fields
+                                       manifest_version, source_video, job_id?). Store the tarball,
+                                       unpack it, parse manifest.json, persist each violation row +
+                                       its media, verify sha256s.
+
+To also support MODE B (recommended for production, async):
+  [ ] A job dispatcher that POSTs {video_name, source_base_url, callback_url, job_id} to the brain's
+      POST /jobs, where source_base_url is where the brain pulls the video and callback_url is your
+      /ingest. (The brain returns 202 and calls back when done; poll GET /jobs/{id} if you want.)
+
+Web dashboard:
+  [ ] Render the review queue in the order violations[] arrives (tier first). Show type, vehicle_id,
+      confidence, plate (or "UNKNOWN — manual review"), the 3 pictures + plate crops, and the clip.
+  [ ] A manual-review action for rows with manual_review=true (confirm/correct the plate).
+
+Mobile app dataset:
+  [ ] Same records; likely a lighter view (type, plate, one thumbnail, the clip, status).
+
+
+--------------------------------------------------------------------------------
+11. SUGGESTED DB / DATASET SHAPE (map straight from section 6)
+--------------------------------------------------------------------------------
+violations table (one row per violation record):
+  violation_id (PK, string)        | vehicle_id (int)      | violation (enum string)
+  tier (int 0..3)                  | key_frame (int)       | detector_confidence (float)
+  crossing_solid_line_confidence (float, nullable)
+  plate (string, nullable)         | plate_score (float)   | n_reads (int)
+  manual_review (bool)             | description (text)    | source_video (string)
+  created_utc (timestamp)          | job_id (string, nullable, MODE B)
+  details (json)                   | review_status (your column: pending/confirmed/dismissed)
+
+media table (one row per file, FK violation_id):
+  kind (clip|vehicle_pic|plate_pic|report_docx|summary_txt|record_json)
+  path/url | frame_id (nullable) | bytes | sha256
+
+Index/sort the queue on (tier ASC, detector_confidence DESC) — but yellow (tier 3) by key_frame ASC.
+
+
+--------------------------------------------------------------------------------
+12. WHERE THE CODE IS (this repo)
+--------------------------------------------------------------------------------
+The CONTRACT (brain side, portable, pure-ish stdlib — your reference for exact behaviour):
+  violations/export.py          - manifest + bundle assembly, priority/ordering, payload fields
+  violations/clip_extract.py    - the 10s (10 pre / 5 post) clip window + ffmpeg cut
+  violations/annotate_clip.py   - red box on the offending vehicle + caption burnt into the clip
+  violations/docx_report.py     - the SPEEDING .docx (stdlib OOXML, no python-docx dependency)
+  violations/video_integrity.py - VideoMeta + ffprobe fingerprint + per-hop checks
+  violations/ingest_client.py   - the brain's download + fail-fast integrity check
+  violations/event.py           - ViolationEvent / ViolationType (the violation-agnostic record)
+
+The LOCAL DEMO (a mock of YOUR backend + the brain driver/service — read these to see the wire):
+  backend_loop_demo/mock_backend.py   - example backend: /video, /video/{name}/meta, /ingest, /dispatch
+  backend_loop_demo/run_brain.py      - brain driver (MODE A): pull -> analyse -> annotate -> push
+  backend_loop_demo/brain_server.py   - brain as a service (MODE B): POST /jobs (202) + callback
+  backend_loop_demo/README.md         - run instructions + commands
+  backend_loop_demo/test_pipeline_integration.py - opt-in end-to-end tests for BOTH modes
+
+Tests for the contract math/structure: violations/tests/  (46 fast unit tests, no GPU/ffmpeg needed).
+
+
+--------------------------------------------------------------------------------
+13. HOW TO SEE IT WORK LOCALLY (5 minutes, no GPU)
+--------------------------------------------------------------------------------
+MODE A (brain pulls + pushes):
+  Terminal 1:  python backend_loop_demo/mock_backend.py --port 8000
+  Terminal 2:  python backend_loop_demo/run_brain.py --base-url http://127.0.0.1:8000
+  Result:      a bundle + browsable *_unpacked/ folder appears in ~/Desktop/backend_received_evidence/
+
+MODE B (backend dispatches; brain calls back, async):
+  Terminal 1:  python backend_loop_demo/mock_backend.py --port 8000
+  Terminal 2:  python backend_loop_demo/brain_server.py --port 9000
+  Terminal 3:  curl -X POST http://127.0.0.1:8000/dispatch -H "Content-Type: application/json" \
+                    -d '{"brain_url":"http://127.0.0.1:9000"}'
+  Then:        poll  curl http://127.0.0.1:9000/jobs/<job_id>   ; bundle lands in the same folder.
+
+Automated proof of both modes (opt-in, heavier — needs ffmpeg + the sample video):
+  ROADGUARD_RUN_INTEGRATION=1 pytest backend_loop_demo/test_pipeline_integration.py -s
+
+
+--------------------------------------------------------------------------------
+14. OPEN ITEMS / NOT DONE YET (so you know the seams)
+--------------------------------------------------------------------------------
+  - The contract is NOT yet wired into the live GPU pipeline (main.py). In production the real
+    pipeline emits ViolationEvent + EvidenceResult and feeds the SAME violations/export.py — so the
+    bundle/manifest/transport you integrate against will be identical; only the data source changes.
+  - There is no real remote backend yet — only the local mock. Your job is to build the real one to
+    the spec in sections 4–6 and 10.
+  - SPEEDING needs a clip WITH GPS to produce a genuine event (the demo's speeding was synthetic).
+  - AUTH/idempotency are not specified yet: /ingest currently takes no auth token. Decide on an
+    auth header + an idempotency key (e.g. job_id or violation_id) so retried uploads de-duplicate.
+  - manifest_version is "2.0"; treat it as a compatibility gate (reject/transform unknown majors).
+
+Questions about the contract? The single source of truth is violations/export.py (build_export) and
+the manifest it emits — when in doubt, build a bundle locally (section 13) and read the real JSON.
+================================================================================

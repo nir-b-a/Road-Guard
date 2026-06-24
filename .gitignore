@@ -27,12 +27,17 @@ roadguard-dl/
 
 # --- Model weights ------------------------------------------------------------
 # Large + auto-downloadable: ultralytics fetches yolo11x.pt / yolov8*.pt on first
-# run; the CLRerNet base weight comes from its model zoo. Ignore all *.pt, then
-# re-include ONLY the two small weights we intentionally commit.
-#*.pt
-#!israeli_plates.pt              # custom LPR plate detector (~6 MB)
-#weights/*
-#!weights/phase3_v3_yellowprotect.pt   # validated lane model used by the violation pipeline (~6.5 MB)
+# run; the CLRerNet base weight comes from its model zoo. Ignore all weight blobs
+# (*.pt/*.pth/*.onnx/*.engine), then re-include ONLY the two small weights we
+# intentionally commit. (Files already tracked stay tracked regardless of this.)
+*.pt
+*.pth
+*.onnx
+*.engine
+# re-include the two small weights we intentionally commit (custom LPR detector ~6MB;
+# validated lane model used by the violation pipeline ~6.5MB):
+!israeli_plates.pt
+!weights/phase3_v3_yellowprotect.pt
 yolo11x.pt
 
 # --- Large local-only data / media -------------------------------------------
@@ -50,6 +55,10 @@ test_videos/
 # Artifacts written next to the input video by main.py / the violation harness.
 HOW_TO_RUN.txt
 outputs/
+# 700MB+ of batch annotated videos + per-clip evidence dumps:
+violations_demo/
+# local mock-backend inbox (received evidence bundles), if pointed inside the repo:
+backend_received_evidence/
 output.mp4
 *_annotated.mp4
 *_vehicles.csv
