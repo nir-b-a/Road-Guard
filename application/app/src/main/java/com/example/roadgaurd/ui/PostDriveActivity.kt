@@ -23,7 +23,7 @@ class PostDriveActivity : AppCompatActivity() {
     private var sessionId: String? = null
     private var tagsJson: String = "[]"
     private var speedJson: String = "[]"
-    private val BASE_URL = "http://10.0.2.2:5000/api"
+    private val BASE_URL = "http://192.168.1.106:5000/api"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

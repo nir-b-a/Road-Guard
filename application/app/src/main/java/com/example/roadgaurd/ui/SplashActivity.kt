@@ -18,7 +18,7 @@ import java.io.IOException
 
 class SplashActivity : AppCompatActivity() {
 
-    private val BASE_URL = "http://10.0.2.2:5000/api"
+    private val BASE_URL = "http://192.168.1.106:5000/api"
     private lateinit var prefs: SharedPreferences
     private var isRegisterMode = false
 
