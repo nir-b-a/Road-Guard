@@ -16,8 +16,8 @@ const getAuthorityToken = async () => {
 };
 
 const seedViolation = async (driverId) => {
-    const drive = await Drive.create({ driverId, sessionId: 'session_' + Date.now(), videoPath: 'uploads/videos/test.mp4', tags: [{ timestamp: Date.now(), lat: 32.08, lon: 34.78 }], status: 'pending' });
-    const violation = await Violation.create({ driveId: drive._id, driverId, videoClipPath: 'uploads/videos/clip_test.mp4', carId: 'ABC-1234', calculatedSpeed: 95, location: { lat: 32.08, lon: 34.78 }, status: 'pending' });
+    const drive = await Drive.create({ driverId, sessionId: 'session_' + Date.now(), videoPath: 'sessions/s/video.mp4', status: 'processed' });
+    const violation = await Violation.create({ driveId: drive._id, driverId, videoClipPath: 'sessions/s/out/clip.mp4', carId: 'ABC-1234', calculatedSpeed: 95, location: { lat: 32.08, lon: 34.78 }, status: 'pending' });
     return { drive, violation };
 };
 

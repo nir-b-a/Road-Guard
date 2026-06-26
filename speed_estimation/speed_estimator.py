@@ -30,8 +30,9 @@ from Objects.World import World
 import Constants
 from Constants import (VEHICLE_HEIGHTS, DEFAULT_VEHICLE_HEIGHT_M, DEFAULT_CAMERA_HEIGHT_M,
                        LATERAL_REF_CENTER, LATERAL_REF_NEAR_EDGE)
-from speed_estimation.smoothers import (Run, _odd,
+from speed_estimation.smoothers import (Run, _odd, hampel_filter, hampel_clean_runs,
                        kalman_speed_runs, savgol_speed_runs, theil_sen_speed_runs)
+from speed_estimation.occlusion import compute_occlusion
 
 
 # ============================================================================
@@ -218,7 +219,7 @@ def estimateDistance(world: World, fx: float, fy: float, cx: float, cy: float,
     """
     for vehicle in world.vehicles.values():
         height_m = VEHICLE_HEIGHTS.get(vehicle.vehicle_type, DEFAULT_VEHICLE_HEIGHT_M)
-        estimator = _build_estimator("combined", fx, fy, cx, cy, height_m, camera_height_m)
+        estimator = _build_estimator(Constants.DISTANCE_CALCULATION_METHOD, fx, fy, cx, cy, height_m, camera_height_m)
         for frame, bbox in vehicle.bounding_box.items():
             r = estimator(bbox)
             vehicle.dist_per_frame[frame] = r[0] if r is not None else 0.0
@@ -243,13 +244,20 @@ def smooth_distances(world: World,
                      smooth_window: int = Constants.SMOOTH_WINDOW,
                      polyorder: int = Constants.POLYORDER):
     """
-    In-place Savitzky-Golay smoothing of vehicle.dist_per_frame.
+    In-place Hampel spike rejection + Savitzky-Golay smoothing of
+    vehicle.dist_per_frame.
 
     Operates per vehicle, per contiguous run of valid (positive) distances.
     Zero / placeholder distances are left alone; they split runs.
 
+    Each run is Hampel-cleaned BEFORE the Savgol pass -- the same robust
+    median/MAD spike rejection the speed path applies to its world positions.
+    A single bad bbox makes one depth spike that Savgol would otherwise smear
+    across its whole window; rejecting it at the source keeps the exported
+    distance honest. replace="median" keeps the series dense so Savgol is valid.
+
     This affects the exported distance CSV and the distance plot, NOT the
-    speed estimation (which uses its own smoothing).
+    speed estimation (which Hampel-cleans its own world-position runs).
     """
     smooth_window = _odd(smooth_window)
 
@@ -267,6 +275,7 @@ def smooth_distances(world: World,
             if sw < polyorder + 2:
                 continue
             distances = np.array([vehicle.dist_per_frame[f] for f in run])
+            distances, _ = hampel_filter(distances)   # robust spike rejection first
             smoothed = savgol_filter(distances, sw, polyorder)
             for i, f in enumerate(run):
                 vehicle.dist_per_frame[f] = float(smoothed[i])
@@ -327,6 +336,110 @@ def _edge_touch_noise_scale(bboxes: list[tuple[int, int, int, int]],
     return out
 
 
+def _occlusion_noise_scale(occ: np.ndarray) -> np.ndarray:
+    """Per-frame measurement-noise multiplier (>= 1) from occlusion fraction.
+
+    scale = 1/(1 - occ), capped at Constants.OCC_MAX_NOISE_SCALE: a box half hidden
+    (occ=0.5) is trusted half as much (2x std), a nearly fully hidden box hits the
+    cap. occ=0 -> scale 1 (no change). See speed_estimation/occlusion.py.
+    """
+    scale = 1.0 / np.maximum(1.0 - occ, 1e-6)
+    return np.minimum(scale, Constants.OCC_MAX_NOISE_SCALE)
+
+
+def _aspect_ratio_noise_scale(bboxes: list[tuple[int, int, int, int]],
+                              half_window: int = Constants.ASPECT_HALF_WINDOW,
+                              n_sigmas: float = Constants.ASPECT_N_SIGMAS,
+                              max_scale: float = Constants.ASPECT_MAX_NOISE_SCALE
+                              ) -> np.ndarray:
+    """Per-frame measurement-noise multiplier (>= 1) that grows when a bbox's
+    width/height ratio is a LOCAL outlier.
+
+    The reference is a sliding-window MEDIAN/MAD of the aspect ratio (robust, the
+    same idea as the Hampel filter), so a SMOOTH ratio change -- a vehicle TURNING,
+    its silhouette opening over many frames -- moves WITH the median and is NOT
+    penalised. Only a frame whose ratio departs from its local median by more than
+    `n_sigmas` robust-sigmas is down-weighted (scale = departure/threshold, capped
+    at `max_scale`): abrupt clipping at the border, a box collapsing behind a nearer
+    object, or detector flicker. A degenerate (zero-height) box gets `max_scale`.
+    """
+    n = len(bboxes)
+    out = np.ones(n)
+    if n == 0:
+        return out
+    ar = np.array([(x2 - x1) / (y2 - y1) if (y2 - y1) > 0 else np.nan
+                   for (x1, y1, x2, y2) in bboxes])
+    for i in range(n):
+        if np.isnan(ar[i]):
+            out[i] = max_scale            # no height -> unusable box
+            continue
+        lo, hi = max(0, i - half_window), min(n, i + half_window + 1)
+        win = ar[lo:hi]
+        win = win[~np.isnan(win)]
+        if len(win) < 3:
+            continue                      # too little local context to judge
+        med = np.median(win)
+        sigma = 1.4826 * np.median(np.abs(win - med))   # MAD -> robust sigma
+        # Floor the sigma at a fraction of the median ratio. Without it a STEADY box
+        # (MAD=0) could never flag a clip; with it, a steady box uses a relative
+        # threshold while a turning box keeps its larger MAD-based sigma (ramp not flagged).
+        sigma = max(sigma, Constants.ASPECT_SIGMA_FLOOR_FRAC * abs(med))
+        if sigma <= 0:
+            continue                      # degenerate (ratio ~0) -> can't judge -> no penalty
+        dev = abs(ar[i] - med) / (n_sigmas * sigma)     # 1.0 exactly at the threshold
+        if dev > 1.0:
+            out[i] = float(min(dev, max_scale))
+    return out
+
+
+def _drop_mask(frames: list[int],
+               bboxes_by_frame: dict[int, tuple[int, int, int, int]],
+               image_wh: tuple[int, int] | None,
+               edge_drop: bool, shrink_drop: bool,
+               valid_roi: tuple[int, int, int, int] | None = None) -> list[bool]:
+    """Per-frame boolean: True = IGNORE this frame for SPEED (treat it as a gap so
+    the world-position run is cut there). The bbox stays in the vehicle dict and the
+    distance path is untouched -- this only removes the frame from the speed runs.
+
+    Two independent triggers (OR'd):
+      edge_drop   -> bbox within Constants.EDGE_DROP_MARGIN_PX of the usable image
+                     border (clipped silhouette); needs `image_wh`, inert without it.
+                     `valid_roi`=(x1,y1,x2,y2) is the usable pixel rectangle when the
+                     frames were undistorted (the warp leaves an invalid band inside
+                     the frame); the test uses THAT inner border. None -> the raw
+                     frame edge (0,0,w,h).
+      shrink_drop -> width OR height collapsed by > Constants.SHRINK_DROP_RATIO vs
+                     the last NON-dropped frame (degrading silhouette). Comparing
+                     against the last GOOD frame -- not just the previous one --
+                     keeps a sustained collapse gated all the way out, instead of
+                     un-gating once the tiny box stops shrinking step-to-step.
+    """
+    n = len(frames)
+    drop = [False] * n
+
+    if edge_drop and image_wh is not None:
+        w, h = image_wh
+        rx1, ry1, rx2, ry2 = valid_roi if valid_roi is not None else (0, 0, w, h)
+        m = Constants.EDGE_DROP_MARGIN_PX
+        for i, f in enumerate(frames):
+            x1, y1, x2, y2 = bboxes_by_frame[f]
+            if x1 <= rx1 + m or y1 <= ry1 + m or x2 >= rx2 - m or y2 >= ry2 - m:
+                drop[i] = True
+
+    if shrink_drop:
+        keep = 1.0 - Constants.SHRINK_DROP_RATIO
+        ref_w = ref_h = None  # dims of the last NON-dropped frame
+        for i, f in enumerate(frames):
+            x1, y1, x2, y2 = bboxes_by_frame[f]
+            bw, bh = x2 - x1, y2 - y1
+            if (ref_w is not None and ref_w > 0 and ref_h > 0
+                    and (bw < ref_w * keep or bh < ref_h * keep)):
+                drop[i] = True
+            elif not drop[i]:                 # don't reference an already-dropped frame
+                ref_w, ref_h = bw, bh
+    return drop
+
+
 def build_world_runs(bboxes_by_frame: dict[int, tuple[int, int, int, int]],
                      estimator: DistanceEstimator,
                      ego_pos: dict[int, tuple[float, float]],
@@ -335,23 +448,50 @@ def build_world_runs(bboxes_by_frame: dict[int, tuple[int, int, int, int]],
                      min_run_len: int,
                      reweight: bool = False,
                      edge_gate: bool = False,
-                     image_wh: tuple[int, int] | None = None) -> list[Run]:
+                     image_wh: tuple[int, int] | None = None,
+                     edge_drop: bool = False,
+                     shrink_drop: bool = False,
+                     occ_by_frame: dict[int, float] | None = None,
+                     aspect_gate: bool = False,
+                     valid_roi: tuple[int, int, int, int] | None = None,
+                     distance_drop: bool = False,
+                     max_distance: float = Constants.MAX_SPEED_DISTANCE_M) -> list[Run]:
     """Reconstruct target absolute world position (Tx, Ty) per contiguous run.
 
     Optional per-frame Kalman noise multipliers (Run.meta['noise_scale'], trusted
     LESS where >1) combine multiplicatively:
-      `reweight`  -> grows with the target's bearing (wide-angle frames).
-      `edge_gate` -> large on frames whose bbox touches the image border
-                     (needs `image_wh`=(width,height); ignored if None).
-    With both off the runs carry no meta (unchanged behaviour).
+      `reweight`     -> grows with the target's bearing (wide-angle frames).
+      `edge_gate`    -> large on frames whose bbox touches the image border
+                        (needs `image_wh`=(width,height); ignored if None).
+      `occ_by_frame` -> {frame: occlusion_fraction} for THIS vehicle (note #2);
+                        grows as the box is hidden behind a nearer vehicle. None
+                        -> no occlusion term.
+      `aspect_gate`  -> grows on frames whose width/height ratio is a LOCAL outlier
+                        (abrupt clip/collapse/flicker; a smooth turn is NOT flagged).
+    With all off the runs carry no meta (unchanged behaviour).
+
+    Optional HARD drops (frame removed from the speed run, treated as a gap; bbox
+    is left in the vehicle dict, distance path untouched):
+      `edge_drop`     -> bbox touches the usable image border (needs `image_wh`;
+                         `valid_roi` is the inner usable rectangle after undistort).
+      `shrink_drop`   -> bbox width/height collapses fast vs the last good frame.
+      `distance_drop` -> the estimated DEPTH (forward distance) is >= `max_distance`
+                         (too far for a trustworthy height-based depth).
+    See _drop_mask (edge/shrink). A drop cuts the run there, so a collapsing or
+    too-distant tail is truncated.
     """
     apply_edge = edge_gate and image_wh is not None
     runs: list[Run] = []
     valid = sorted(f for f, b in bboxes_by_frame.items() if b != (0, 0, 0, 0))
     for run in _contiguous_runs(valid):
+        drop = _drop_mask(run, bboxes_by_frame, image_wh, edge_drop, shrink_drop,
+                          valid_roi=valid_roi)
         flushed: list[list[tuple[int, float, float]]] = [[]]
-        for f in run:
-            r = estimator(bboxes_by_frame[f])
+        for idx, f in enumerate(run):
+            r = None if drop[idx] else estimator(bboxes_by_frame[f])
+            # Far-distance drop: too-distant depth is too noisy to differentiate.
+            if r is not None and distance_drop and max_distance > 0 and r[0] >= max_distance:
+                r = None
             if r is None:
                 if flushed[-1]:
                     flushed.append([])
@@ -370,13 +510,19 @@ def build_world_runs(bboxes_by_frame: dict[int, tuple[int, int, int, int]],
             Tx = ex + depth * c + lat_sign * lateral * s
             Ty = ey + depth * s - lat_sign * lateral * c
             meta = {}
-            if reweight or apply_edge:
+            if reweight or apply_edge or occ_by_frame is not None or aspect_gate:
                 scale = np.ones(len(frames))
                 if reweight:
                     scale = scale * _wide_angle_noise_scale(depth, lateral)
                 if apply_edge:
                     scale = scale * _edge_touch_noise_scale(
                         [bboxes_by_frame[f] for f in frames], image_wh)
+                if occ_by_frame is not None:
+                    occ = np.array([occ_by_frame.get(f, 0.0) for f in frames])
+                    scale = scale * _occlusion_noise_scale(occ)
+                if aspect_gate:
+                    scale = scale * _aspect_ratio_noise_scale(
+                        [bboxes_by_frame[f] for f in frames])
                 meta = {"noise_scale": scale}
             runs.append(Run(frames=frames, x=Tx, y=Ty, meta=meta))
     return runs
@@ -395,11 +541,19 @@ def estimate_world_speeds(world: World,
                           lateral_ref: str = Constants.LATERAL_REF,
                           wide_angle_reweight: bool = Constants.WIDE_ANGLE_REWEIGHT,
                           edge_gate: bool = Constants.EDGE_GATE,
+                          edge_drop: bool = Constants.EDGE_DROP,
+                          shrink_drop: bool = Constants.SHRINK_DROP,
+                          occlusion_gate: bool = Constants.OCCLUSION_GATE,
+                          aspect_gate: bool = Constants.ASPECT_GATE,
+                          distance_drop: bool = Constants.DISTANCE_DROP,
+                          max_speed_distance: float = Constants.MAX_SPEED_DISTANCE_M,
                           image_width: int | None = None,
                           image_height: int | None = None,
+                          valid_roi: tuple[int, int, int, int] | None = None,
                           camera_height_m: float = Constants.DEFAULT_CAMERA_HEIGHT_M,
                           min_track_seconds: float = Constants.MIN_TRACK_SECONDS,
                           min_run_len: int | None = None,
+                          reject_ids: set[int] | None = None,
                           store: bool = True
                           ) -> dict[int, dict[int, tuple[float, float]]]:
     """
@@ -426,7 +580,30 @@ def estimate_world_speeds(world: World,
         edge_gate:    when True (Constants.EDGE_GATE), heavily down-weight frames
                       whose bbox touches the image border (clipped -> corrupted
                       depth & lateral). Needs image_width/image_height.
-        image_width, image_height: video frame size in px, required by edge_gate.
+        edge_drop:    when True (Constants.EDGE_DROP), DROP (ignore for speed only,
+                      as a gap) frames whose bbox touches the border. Stronger than
+                      edge_gate (full removal vs down-weight). Needs image size.
+        shrink_drop:  when True (Constants.SHRINK_DROP), DROP frames whose bbox
+                      width/height collapses fast vs the last good frame (degrading
+                      silhouette at vehicle exit/occlusion). No image size needed.
+        occlusion_gate: when True (Constants.OCCLUSION_GATE), DOWN-WEIGHT frames
+                      where a vehicle is hidden behind a nearer one (note #2). The
+                      occlusion map is built once from all vehicles' bboxes and fed
+                      per-frame as a Kalman noise multiplier (no frame is dropped).
+        aspect_gate:  when True (Constants.ASPECT_GATE), DOWN-WEIGHT frames whose
+                      bbox width/height ratio is a local outlier (abrupt clip/
+                      collapse/flicker); a smooth turn tracks the local median and
+                      is not penalised. Down-weight only (no frame is dropped).
+        distance_drop: when True (Constants.DISTANCE_DROP), DROP frames whose
+                      estimated depth >= max_speed_distance (too far for a
+                      trustworthy height-based depth). Speed-only, like edge_drop.
+        max_speed_distance: depth cutoff in metres for distance_drop
+                      (Constants.MAX_SPEED_DISTANCE_M).
+        image_width, image_height: video frame size in px, required by edge_gate
+                      and edge_drop.
+        valid_roi:    (x1,y1,x2,y2) usable-pixel rectangle for edge_drop when the
+                      frames were undistorted (the warp leaves an invalid inner
+                      band). None -> the raw frame edge is used.
         camera_height_m: ground-plane camera height.
         min_track_seconds: vehicles with fewer real detections than this many
                       seconds' worth of frames are skipped entirely (issue #4).
@@ -434,6 +611,9 @@ def estimate_world_speeds(world: World,
                       process. Defaults to max(SMOOTH_WINDOW, DERIV_WINDOW) -- the
                       validated value. Separate from min_track_seconds (the coarse
                       whole-track gate).
+        reject_ids:   vehicle ids to SKIP entirely (no speed estimated/stored) --
+                      the off-road/oncoming vehicles relevance_flags rejected
+                      (note #1). None -> estimate every vehicle (unchanged).
         store:        if True, write speed/std back onto each Vehicle (issue #2).
 
     Returns:
@@ -464,10 +644,19 @@ def estimate_world_speeds(world: World,
               f"pose (ego motion not cancelled there). Likely frames.csv shorter than the "
               f"video / a capture gap -> frame-index misalignment.")
 
+    # Occlusion map (note #2): {vid: {frame: occ_fraction}}, built once from ALL
+    # vehicles' bboxes (a rejected/non-estimated vehicle can still be an occluder).
+    occ_map = compute_occlusion(world) if occlusion_gate else {}
+
     results: dict[int, dict[int, tuple[float, float]]] = {}
     skipped_short = 0
+    skipped_rejected = 0
 
     for vid, vehicle in world.vehicles.items():
+        if reject_ids and vid in reject_ids:    # off-road/oncoming (note #1)
+            skipped_rejected += 1
+            continue
+
         real_frames = sum(1 for b in vehicle.bounding_box.values()
                           if b != (0, 0, 0, 0))
         if real_frames < min_track_frames:
@@ -483,9 +672,23 @@ def estimate_world_speeds(world: World,
                                 reweight=wide_angle_reweight,
                                 edge_gate=edge_gate,
                                 image_wh=(image_width, image_height)
-                                if image_width and image_height else None)
+                                if image_width and image_height else None,
+                                edge_drop=edge_drop,
+                                shrink_drop=shrink_drop,
+                                occ_by_frame=occ_map.get(vid),
+                                aspect_gate=aspect_gate,
+                                valid_roi=valid_roi,
+                                distance_drop=distance_drop,
+                                max_distance=max_speed_distance)
         if not runs:
             continue
+
+        # Robust spike rejection on the world-position series BEFORE differentiation:
+        # one bad bbox -> one position outlier -> a velocity spike on BOTH sides of it
+        # (the finite difference each side). hampel_clean_runs replaces outliers with
+        # the local median IN PLACE, so frame/length alignment -- and any per-frame
+        # noise_scale meta -- are preserved for every smoother (kalman/savgol/theilsen).
+        hampel_clean_runs(runs)
 
         speed = smooth(runs, fps, frame_ts)
         if not speed:
@@ -499,11 +702,17 @@ def estimate_world_speeds(world: World,
 
     edge_state = (edge_gate if (image_width and image_height)
                   else f"{edge_gate} (DISABLED: no image size)")
+    edge_drop_state = (edge_drop if (image_width and image_height)
+                       else f"{edge_drop} (DISABLED: no image size)")
     print(f"[world-speed] estimated {len(results)} vehicle(s) "
           f"(method={method}, smoother={smoother}, lat_sign={lat_sign}, "
           f"lateral_ref={lateral_ref}, wide_angle_reweight={wide_angle_reweight}, "
-          f"edge_gate={edge_state}); "
-          f"skipped {skipped_short} track(s) shorter than {min_track_seconds}s")
+          f"edge_gate={edge_state}, edge_drop={edge_drop_state}, "
+          f"shrink_drop={shrink_drop}, occlusion_gate={occlusion_gate}, "
+          f"aspect_gate={aspect_gate}, distance_drop={distance_drop}"
+          f"{f' (>= {max_speed_distance:.0f}m)' if distance_drop else ''}); "
+          f"skipped {skipped_short} track(s) shorter than {min_track_seconds}s, "
+          f"rejected {skipped_rejected} off-road/oncoming track(s)")
     return results
 
 

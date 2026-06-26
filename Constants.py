@@ -70,12 +70,13 @@ VEHICLE_HEIGHTS = {
     DetectClass.TRUCK: 3.5,
 }
 DEFAULT_VEHICLE_HEIGHT_M = 1.5   # fallback when a resolved class has no entry
-DEFAULT_CAMERA_HEIGHT_M = 1.2    # dashcam mount height (also the CARLA default)
+DEFAULT_VEHICLE_WIDTH_M = 1.8
+DEFAULT_CAMERA_HEIGHT_M = 1.4    # dashcam mount height (also the CARLA default)
 
 # ── Detection / tracking ──────────────────────────────────────────────────────
 YOLO_VERSION = "yolo11x.pt"
 CONFIDENCE_LVL = 0.5             # YOLO minimum detection confidence
-YOLO_IMGSZ = 1984                # YOLO inference image size (px); 1984 w/o half
+YOLO_IMGSZ = 1280                # YOLO inference image size (px); 1984 w/o half
 YOLO_TRACKER = "botsort.yaml"    # ultralytics tracker config
 
 # ── Bounding-box gap interpolation ────────────────────────────────────────────
@@ -88,6 +89,9 @@ FOV_HORIZONTAL_DEG = 90.0        # horizontal field of view (square pixels)
 SMOOTH_WINDOW = 101               # pre-smoothing savgol window (odd; ~1.7s @30fps)
 DERIV_WINDOW = 61                # differentiation savgol window (odd; ~0.7s @30fps)
 POLYORDER = 2                    # savgol polynomial order
+
+# ── Distance calculation method ──────────────────────────────────────────────────────
+DISTANCE_CALCULATION_METHOD = "height"
 
 # ── World-frame reconstruction ────────────────────────────────────────────────
 # Resolves coordinate-system handedness when de-rotating camera-frame (depth,
@@ -143,6 +147,49 @@ EDGE_GATE = False                  # master toggle (False -> no change to anythi
 EDGE_MARGIN_PX = 3                 # a bbox within this many px of a border counts as touching
 EDGE_NOISE_SCALE = 8.0             # noise-std multiplier on touching frames (8x std = 64x variance)
 
+# ── Frame-edge DROP gate (clipped-bbox REMOVAL from the SPEED path) ────────────
+# Unlike EDGE_GATE above (which only DOWN-WEIGHTS a touching frame), this IGNORES
+# the frame for speed entirely: a gated frame is treated as a gap, so the
+# world-position run is cut there and the collapsing tail never reaches the
+# differentiator. The bbox is STILL stored on the vehicle and STILL used by the
+# distance path (estimateDistance iterates the raw bbox dict independently) -- the
+# drop is speed-only. A bbox within EDGE_DROP_MARGIN_PX of any border counts as
+# touching. OFF by default; main.py: --edge-drop 1.
+#   NOTE: on the undistorted Pixel-8 clip the usable image ends ~117 px short of
+#   the right border (the undistort warp leaves an invalid band), so boxes clip at
+#   x~1803, NOT 1919. With --undistort, the FrameUndistorter now reports the valid
+#   pixel rectangle and the drop test uses THAT inner border (not the raw frame
+#   edge), so boxes touching the warped invalid band are dropped automatically --
+#   no manual margin bump needed. Without --undistort the test uses the frame edge.
+EDGE_DROP = True                   # ON by default: drop frames whose bbox touches the (valid) edge
+EDGE_DROP_MARGIN_PX = 8            # bbox within this many px of a border -> dropped for speed
+
+# ── Far-distance DROP gate (too-distant bbox REMOVAL from the SPEED path) ──────
+# Height-based depth error grows with range: a far car is only a few px tall, so a
+# 1 px height error becomes a large depth error and differentiates into a large
+# speed error. Beyond MAX_SPEED_DISTANCE_M the per-frame depth is too noisy to
+# trust, so those frames are DROPPED from the speed runs (treated as a gap; the
+# bbox and the distance export are untouched -- speed-only). A vehicle that is
+# always farther than the cutoff therefore gets no speed at all. The threshold is
+# on the estimator's DEPTH (forward distance) -- the same quantity stored in
+# dist_per_frame. ON by default; main.py: --distance-drop 0 to disable, or
+# --max-speed-distance <m> to change the cutoff.
+DISTANCE_DROP = True               # master toggle (False -> no distance-based drop)
+MAX_SPEED_DISTANCE_M = 90.0        # drop frames whose estimated depth >= this (m)
+
+# ── Shrink-rate DROP gate (collapsing-bbox REMOVAL from the SPEED path) ────────
+# A bbox that COLLAPSES fast is a degrading measurement: as a vehicle exits (or is
+# occluded) its silhouette shrinks asymmetrically, so its height (-> depth) jumps
+# and the differentiated speed spikes -- even while the SMOOTHED distance still
+# looks fine (smoothing hides the transient that differentiation amplifies). This
+# gate IGNORES (for speed only, as a gap) any frame whose width OR height has
+# dropped by more than SHRINK_DROP_RATIO relative to the last NON-dropped frame --
+# so it catches the collapse wherever it happens, with no dependence on the frame
+# border. Genuine recession (a car getting smoothly smaller) shrinks only
+# ~1-2%/frame and is NOT gated. OFF by default; main.py: --shrink-drop 1.
+SHRINK_DROP = False                # master toggle (False -> no change to anything)
+SHRINK_DROP_RATIO = 0.12           # fractional width/height collapse vs last good frame that triggers
+
 # ── Android heading integration ───────────────────────────────────────────────
 # Sign applied when integrating the phone's vertical-axis yaw RATE into a world
 # heading (ego_yaw.ego_heading_from_android). Like LAT_SIGN this is handedness /
@@ -163,3 +210,64 @@ DEFAULT_SMOOTHER = SMOOTHER_KALMAN
 # coarse whole-track gate; it is intentionally SEPARATE from the per-contiguous-
 # run length the smoother's window requires (max(SMOOTH_WINDOW, DERIV_WINDOW)).
 MIN_TRACK_SECONDS = 1.0
+
+# ── Relevance rejection (note #1) ─────────────────────────────────────────────
+# A vehicle is REJECTED from speed estimation entirely (no speed stored, so no
+# speed plot and no overspeed flag) when it is probably NOT on our road. Two
+# criteria, each judged over the vehicle's tracked life and OR'd:
+#   * |cross-track world offset| > REJECT_LATERAL_M (m) -- a large, persistent
+#     lateral offset means another road/lane far from ego.
+#   * its own motion points TOWARD the ego (oncoming) -- the other carriageway.
+# A criterion rejects only if it holds for at least REJECT_LIFE_FRACTION of the
+# vehicle's life (so a momentary wide bearing or a noisy frame can't reject a
+# real target). Reconstruction is the SAME world geometry the speed path uses.
+#   WARNING: this is a HARD filter -- it can backfire on far on-road traffic and
+#   on curves. Raise the thresholds (or revert to advisory tagging) if it drops
+#   vehicles you care about.
+# Master toggles for the two criteria (independent). Set either to False (or pass
+# --reject-lateral 0 / --reject-direction 0) to disable that criterion alone; set
+# BOTH to False to switch relevance rejection off entirely (no vehicle is dropped).
+REJECT_BIG_LATERAL = False        # enable the persistent-lateral-offset criterion
+REJECT_DIRECTION = True          # enable the oncoming (motion-toward-ego) criterion
+REJECT_LATERAL_M = 7.0           # lateral threshold (m)
+REJECT_LIFE_FRACTION = 0.5       # fraction of tracked life a criterion must hold to reject
+
+# ── Occlusion down-weighting (note #2) ────────────────────────────────────────
+# A vehicle partially hidden behind a NEARER vehicle (one whose bbox bottom edge
+# sits lower in the image) has a truncated silhouette, so its height/width (->
+# depth) and center (-> lateral) are corrupted on those frames. When OCCLUSION_GATE
+# is on, each frame's Kalman measurement noise is inflated by 1/(1-occ_fraction),
+# capped at OCC_MAX_NOISE_SCALE, so the smoother LEANS ON ITS MODEL through the
+# occluded stretch instead of chasing the bad box (it is down-weighted, NOT
+# dropped -- so a mid-track occlusion never cuts the run / loses the track). An
+# occlusion that hides less than OCC_MIN_FRACTION of the box is ignored. SPEED
+# only -- the distance path is untouched. See speed_estimation/occlusion.py.
+OCCLUSION_GATE = False            # master toggle (False -> no change to anything)
+OCC_MIN_FRACTION = 0.15          # ignore overlaps hiding less than this fraction of a box
+OCC_MAX_NOISE_SCALE = 10.0       # cap on the noise-std multiplier (occ ~0.9 hits the cap)
+
+# ── Aspect-ratio gate (abrupt width/height-ratio distortion) ──────────────────
+# A bbox whose width/height RATIO changes abruptly is usually corrupted: clipped
+# at the frame border (entering/exiting), collapsed where a nearer object cuts its
+# width/height, or detector flicker. When ASPECT_GATE is on, each frame's Kalman
+# measurement noise is inflated when its aspect ratio is a LOCAL outlier -- it
+# departs from a sliding-window MEDIAN of the ratio by more than ASPECT_N_SIGMAS
+# robust-sigmas. Using the local MEDIAN as the reference is the whole point: a
+# SMOOTH ratio change (a vehicle TURNING, its silhouette opening over many frames)
+# moves WITH the median and is NOT penalised -- only an abrupt jump is. Down-weight,
+# not drop. SPEED only (the distance path is untouched). Complements OCCLUSION_GATE
+# (tracked occluders) and the edge gates (border clipping) by also catching
+# non-tracked occluders and detector errors, and SUSTAINED distortion the
+# position-level Hampel would miss.
+#   NOTE: this is the most false-positive-prone gate (a sharp turn can momentarily
+#   trip it). Validate on footage with turns; disable with --aspect-gate 0.
+ASPECT_GATE = True               # master toggle (False -> no change to anything)
+ASPECT_HALF_WINDOW = 9           # frames each side for the local ratio baseline (~0.3s @30fps)
+ASPECT_N_SIGMAS = 3.0            # robust-sigma departure from the local median before down-weighting
+ASPECT_MAX_NOISE_SCALE = 8.0     # cap on the noise-std multiplier
+# Floor on the robust sigma, as a fraction of the local median ratio. Without it a
+# STEADY box (ratio ~constant -> MAD=0) could never flag a clip; with it, a steady
+# box uses a simple relative threshold (flag a jump > ASPECT_N_SIGMAS * this * ratio,
+# i.e. ~15% by default), while a TURNING box keeps the larger MAD-based sigma (so its
+# smooth ramp still isn't flagged). Raise it to be LESS sensitive on steady boxes.
+ASPECT_SIGMA_FLOOR_FRAC = 0.05
