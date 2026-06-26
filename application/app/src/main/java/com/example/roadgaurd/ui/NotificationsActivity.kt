@@ -15,7 +15,7 @@ import java.io.IOException
 
 class NotificationsActivity : AppCompatActivity() {
 
-    private val BASE_URL = "http://10.0.2.2:5000/api"
+    private val BASE_URL = "http://10.100.102.129:5000/api"
     private val notifications = mutableListOf<NotificationItem>()
     private lateinit var adapter: NotificationAdapter
 

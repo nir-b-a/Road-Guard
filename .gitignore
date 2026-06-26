@@ -63,6 +63,11 @@ test_1_yolo.jsonl
 tools/_archive/
 line_crossing/experiments/
 line_crossing/lab_classifiers_v3.py
+# Removable speed-pipeline diagnostics (not imported by main.py) — keep local.
+ego_cancel_diag.py
+wide_angle_diag.py
+
+ground_distance/
 
 # --- Cloned, not-on-PyPI framework (install editable; never commit) -----------
 UnLanedet/
@@ -91,3 +96,8 @@ output_*/
 *.webm
 *.m4a
 *.wav
+
+# --- Worker runtime -----------------------------------------------------------
+# worker.py stages each job's downloaded files here before processing —
+# regenerated every run, never commit.
+_worker_jobs/

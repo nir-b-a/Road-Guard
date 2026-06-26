@@ -104,9 +104,11 @@ class RecordingSession(private val sessionId: String) {
 
     /**
      * Writes the per-session files into [dir] exactly per ANDROID_DATA_SPEC.md:
-     * frames.csv, gyro.csv, gravity.csv, gps.csv (always — main.py auto-detects
-     * Android mode by their presence), plus intrinsics.json when known and tags.json
-     * (extra; not consumed by the pipeline).
+     * frames.csv, gyro.csv, gravity.csv, gps.csv, linacc.csv (always — main.py
+     * auto-detects Android mode by their presence) plus intrinsics.json. These 6 files
+     * + the video are the "7-file" contract the backend validates on upload. When camera
+     * intrinsics are unknown we still write intrinsics.json as `{}` so the file is always
+     * present; the pipeline then falls back to frame size + FOV (see ego_yaw.load_intrinsics).
      *
      * Floats are written via Kotlin/Java toString(), which is locale-independent and
      * always uses '.', so there is no locale-comma risk and no precision loss.
@@ -156,9 +158,10 @@ class RecordingSession(private val sessionId: String) {
             }
             File(dir, "intrinsics.json").writeText(json.toString())
         } else {
-            Log.w("RecordingSession", "intrinsics unknown — not writing intrinsics.json (pipeline falls back to FOV)")
+            // Always emit the file (part of the 7-file contract); empty object => pipeline
+            // falls back to frame size + FOV.
+            File(dir, "intrinsics.json").writeText("{}")
+            Log.w("RecordingSession", "intrinsics unknown — wrote empty intrinsics.json (pipeline falls back to FOV)")
         }
-
-        File(dir, "tags.json").writeText(tagsJsonLocked())
     }
 }

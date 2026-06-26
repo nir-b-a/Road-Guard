@@ -13,6 +13,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.location.Location
+import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import android.os.SystemClock
@@ -67,6 +68,14 @@ class RecordingActivity : AppCompatActivity() {
         val CALIB_FY: Float? = null
         val CALIB_CX: Float? = null
         val CALIB_CY: Float? = null
+
+        // On-device lens-distortion correction (API 28+). When true we ask the camera HAL
+        // to rectify its own frames (HIGH_QUALITY if the device supports it, else FAST), so
+        // the recorded video is ~pinhole edge-to-edge and the Python pipeline needs no
+        // undistort. Set false to record raw (and undistort offline instead). HIGH_QUALITY
+        // MAY cost a little throughput on some devices; flip to FAST-only by setting this
+        // false-ish if you ever see the 30 fps pin slip (FAST is guaranteed not to slow it).
+        const val DISTORTION_CORRECTION_PREFER_HIGH_QUALITY = true
     }
 
     private var videoCapture: VideoCapture<Recorder>? = null
@@ -94,6 +103,10 @@ class RecordingActivity : AppCompatActivity() {
     // elapsedRealtimeNanos (BOOTTIME) clock used by every other stream.
     private var frameTsIsRealtime = true
     private var frameTsOffsetNs = 0L
+
+    // Resolved once from the camera's supported modes; applied to the capture request in
+    // startCamera(). null -> unsupported (older API / device), leave the capture default.
+    private var distortionCorrectionMode: Int? = null
 
     private val permissions = arrayOf(
         Manifest.permission.CAMERA,
@@ -191,6 +204,9 @@ class RecordingActivity : AppCompatActivity() {
             }
             Log.i(TAG, "frame ts source=${if (frameTsIsRealtime) "REALTIME" else "UNKNOWN (+$frameTsOffsetNs ns)"}")
 
+            // ── on-device lens-distortion correction mode (applied in startCamera) ──
+            distortionCorrectionMode = resolveDistortionCorrectionMode(ch)
+
             // ── intrinsics for 1920x1080 (priority: checkerboard CALIB_* >
             //    device LENS_INTRINSIC_CALIBRATION > focal/sensor-width estimate) ──
             val cfx = CALIB_FX; val cfy = CALIB_FY; val ccx = CALIB_CX; val ccy = CALIB_CY
@@ -251,6 +267,42 @@ class RecordingActivity : AppCompatActivity() {
         return true
     }
 
+    /**
+     * Picks the best on-device lens-distortion-correction mode the camera supports so the
+     * HAL rectifies its own frames: HIGH_QUALITY (preferred) > FAST > none. API 28+ only;
+     * returns null when unavailable so the caller leaves the capture default untouched.
+     *
+     * NOTE: enabling this changes the effective intrinsics — the recorded stream becomes
+     * (near) pinhole, so the checkerboard CALIB_* values measured with correction OFF no
+     * longer apply. Recalibrate with this ON (the new report's k1..k3 should collapse to
+     * ~0, which is also how you VERIFY it works), and do NOT also run the Python
+     * --undistort on clips recorded this way (that double-corrects).
+     */
+    private fun resolveDistortionCorrectionMode(ch: CameraCharacteristics): Int? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+        val modes = ch.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES) ?: return null
+        val has = { m: Int -> modes.any { it == m } }
+        val hq = CameraMetadata.DISTORTION_CORRECTION_MODE_HIGH_QUALITY
+        val fast = CameraMetadata.DISTORTION_CORRECTION_MODE_FAST
+        val chosen = when {
+            DISTORTION_CORRECTION_PREFER_HIGH_QUALITY && has(hq) -> hq
+            has(fast) -> fast
+            has(hq) -> hq
+            else -> null
+        }
+        Log.i(TAG, "distortion correction: ${distortionModeName(chosen)} " +
+            "(available=${modes.joinToString { distortionModeName(it) }})")
+        return chosen
+    }
+
+    private fun distortionModeName(mode: Int?): String = when (mode) {
+        null -> "none/unsupported"
+        CameraMetadata.DISTORTION_CORRECTION_MODE_OFF -> "OFF"
+        CameraMetadata.DISTORTION_CORRECTION_MODE_FAST -> "FAST"
+        CameraMetadata.DISTORTION_CORRECTION_MODE_HIGH_QUALITY -> "HIGH_QUALITY"
+        else -> "mode$mode"
+    }
+
     private fun startLocationUpdates() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
             != PackageManager.PERMISSION_GRANTED) return
@@ -292,10 +344,21 @@ class RecordingActivity : AppCompatActivity() {
 
             val previewBuilder = Preview.Builder().setResolutionSelector(ratio16x9)
             // Pin the capture session to 30 fps via the AE target range.
-            Camera2Interop.Extender(previewBuilder)
+            val previewExtender = Camera2Interop.Extender(previewBuilder)
                 .setCaptureRequestOption(
                     CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS)
                 )
+            // Turn on the HAL's own lens-distortion correction. Set here (on preview) because
+            // CameraX merges every use case's Camera2Interop options into the ONE repeating
+            // request shared by the whole session — same mechanism the 30 fps pin rides — so
+            // it also covers the recorded video and the ImageAnalysis frames.
+            distortionCorrectionMode?.let { mode ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    previewExtender.setCaptureRequestOption(
+                        CaptureRequest.DISTORTION_CORRECTION_MODE, mode
+                    )
+                }
+            }
             val preview = previewBuilder.build().also {
                 it.setSurfaceProvider(findViewById<PreviewView>(R.id.previewView).surfaceProvider)
             }
@@ -419,7 +482,6 @@ class RecordingActivity : AppCompatActivity() {
             putExtra("session_id", session.getSessionId())
             putExtra("session_dir", sessionDir.absolutePath)
             putExtra("video_path", savedVideoPath)
-            putExtra("tags_json", session.getTagsAsJson())
         })
         finish()
     }

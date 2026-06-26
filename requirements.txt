@@ -36,17 +36,25 @@ ultralytics==8.4.68
 opencv-python==4.10.0.84
 # Linear-assignment backend for the BoT-SORT / ByteTrack trackers (ultralytics).
 lapx==0.9.4
-# Savitzky-Golay smoothing, Kalman/RTS math (speed_estimation/).
+# Savitzky-Golay smoothing + Kalman/RTS math (speed_estimation/), plus the
+# least-squares camera-height solve and 3D rotations in ground_distance/.
 scipy==1.13.1
 # Per-vehicle speed/distance plots + ego-speed plot (speed_estimation/draw_vehicle_plots.py).
 matplotlib==3.10.9
-# Overpass speed-limit lookup for the overspeed step (speed_estimation/speed_limit_lookup.py).
+# Overpass speed-limit lookup for the overspeed step (speed_estimation/speed_limit_lookup.py),
+# and the GPU worker's HTTP calls to the job server (worker.py).
 requests==2.28.1
-# Pulled in by ultralytics; pinned for a reproducible resolve.
+# Reads the dashcam sensor CSVs in ground_distance/sensors.py (also pulled in by ultralytics).
 pandas==2.2.2
 pillow==10.4.0
 pyyaml==6.0.2
 tqdm==4.66.5
+
+# --- GPU WORKER: only needed to run the cloud worker (worker.py) --------------
+# main.py itself does NOT import boto3. This is the S3 client the worker uses to
+# pull each job's files from / push evidence clips to Cloudflare R2; botocore and
+# s3transfer install automatically alongside it.
+boto3==1.35.36
 
 # --- OPTIONAL: license-plate recognition (lpr/) -------------------------------
 # Only needed if you enable the LPR path (commented out in main.py by default).

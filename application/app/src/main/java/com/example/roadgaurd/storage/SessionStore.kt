@@ -17,12 +17,12 @@ import java.util.concurrent.TimeUnit
 object SessionStore {
 
     // ─────────────────────────────────────────────────────────────────────────
-    // TODO(moshe): pick the retention window for UNSENT sessions.
-    // Until an upload succeeds the session stays on the phone; the launch-time
-    // sweep (HomeActivity) then deletes it only once it is older than this many
-    // hours. Default 48h — change this single constant to your chosen value.
+    // Retention window for UNSENT sessions. A session is deleted the moment it
+    // uploads successfully; if it did NOT upload (e.g. the server rejected it, or
+    // the phone was offline) it stays on disk so the data isn't lost, and the
+    // launch-time sweep (HomeActivity) reclaims it only once it is older than this.
     // ─────────────────────────────────────────────────────────────────────────
-    const val SESSION_RETENTION_HOURS = 48L
+    const val SESSION_RETENTION_HOURS = 24L
 
     private const val TAG = "SessionStore"
 
