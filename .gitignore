@@ -82,6 +82,21 @@ UnLanedet/
 # Local Claude allow-rules (machine-specific paths) — not shared.
 .claude/settings.json
 
+# RoadGuard local pipeline media & diagnostics — keep heavy outputs out of git.
+# (note: outputs/ is the cache dir above; output/ is the singular render/diagnostics dir)
+output/
+output_*/
+**/anomaly_frames/
+
+# Media (videos/audio) anywhere — never commit heavy media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4a
+*.wav
+
 # --- Worker runtime -----------------------------------------------------------
 # worker.py stages each job's downloaded files here before processing —
 # regenerated every run, never commit.
