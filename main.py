@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import json
 import torch
 import cv2
 import numpy as np
@@ -22,6 +23,11 @@ from speed_estimation import ego_yaw
 from speed_estimation import draw_vehicle_plots
 from speed_estimation import annotated_video
 from speed_estimation import overspeed
+from speed_estimation import relevance_flags
+# Clean-room ground-plane distance estimator (separate package). Replaces the old
+# estimateDistance/smooth_distances for the distance step; main.py stays the runner
+# and the YOLO/ByteTrack loop + Vehicle/World population are unchanged.
+#from ground_distance import estimate_ground_distances
 
 # ── Violation -> evidence (LPR + best pictures) ──────────────────────────────
 # ViolationEvent is the generic record every detector emits; EvidenceCollector reads
@@ -46,12 +52,25 @@ _TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 try:
-    from ghost_mask import estimate_ego_shift          # optical-flow ego shift (same as the harness)
+    from ghost_mask import (estimate_ego_shift,        # optical-flow ego shift (same as the harness)
+                            compute_verdict_timeline,  # solid-line crossing verdict timeline
+                            events_from_timeline)
+    from motion_filter import merge_events             # per-vehicle cooldown collapse
     import shoulder_violation                          # yellow-line evaluator (emits ViolationEvent)
     _YELLOW_IMPORT_OK = True
 except Exception as _e:                                # pragma: no cover
     print(f"[yellow] import unavailable ({_e}); yellow-line rule will be skipped")
     _YELLOW_IMPORT_OK = False
+
+# ── Backend export (per-violation clip + 3 pics + .docx -> .tar.gz -> backend) ─
+try:
+    from violations import export as vx, docx_report
+    from violations.clip_extract import clip_window
+    from violations.annotate_clip import annotate_clip
+    _EXPORT_IMPORT_OK = True
+except Exception as _e:                                # pragma: no cover
+    print(f"[export] import unavailable ({_e}); --push-url/--job-payload export will be skipped")
+    _EXPORT_IMPORT_OK = False
 
 
 DEVICE = 0 if torch.cuda.is_available() else 'cpu'
@@ -98,12 +117,16 @@ def _cli_value(flag: str, default):
 
 
 # load yolo vehicle model. --model overrides Constants.YOLO_VERSION (enables the v8m/11x A/B).
+# task="detect" is required for exported engines/onnx -- they don't carry task metadata.
+# .to() only works on .pt models; an exported .engine is already bound to its build device.
 def loadYoloModel():
     weights = _cli_value("--model", Constants.YOLO_VERSION)
+    is_pt = str(weights).endswith(".pt")
     print(f"Loading {weights} on {'GPU' if torch.cuda.is_available() else 'CPU'}")
     try:
-        model = YOLO(weights)
-        model.to(DEVICE)
+        model = YOLO(weights, task="detect")
+        if is_pt:
+            model.to(DEVICE)
         return model
     except Exception as e:
         print(f"Error occurred: {e}")
@@ -138,6 +161,33 @@ def seg_lanes(lane_model, frame, conf: float) -> list:
     return lanes
 
 
+def _shift_frame_dict(d, shift: int):
+    """Re-key a frame->value dict by `shift` frames (sensor<->camera time-sync test).
+
+    Returns a NEW dict where camera frame `f` carries the value that was originally
+    at frame `f + shift`. So `shift=+30` pairs each video frame with the ego sample
+    30 frames LATER (the ego trajectory is pulled earlier/"back" relative to the
+    video); `shift=-30` pairs it with the sample 30 frames earlier. The original
+    frame keys are preserved (full coverage), and out-of-range lookups CLAMP to the
+    nearest real sample instead of falling back to 0 -- a (0,0) ego pose at the
+    boundary would inject a fake jump and spike the differentiated speed.
+    Pure relabel: bbox dict, distance path, and intrinsics are untouched.
+    """
+    if not d or shift == 0:
+        return d
+    keys = sorted(d.keys())
+    lo, hi = keys[0], keys[-1]
+    out = {}
+    for f in keys:
+        src = f + shift
+        if src < lo:
+            src = lo
+        elif src > hi:
+            src = hi
+        out[f] = d[src]
+    return out
+
+
 def run_speed_estimation(world: World, fps: float,
                          fx: float, fy: float, cx: float, cy: float,
                          *,
@@ -145,7 +195,8 @@ def run_speed_estimation(world: World, fps: float,
                          telemetry_csv: str, frames_csv: str,
                          gyro_csv: str, gravity_csv: str, gps_csv: str,
                          linacc_csv: str = "",
-                         image_width: int = 0, image_height: int = 0):
+                         image_width: int = 0, image_height: int = 0,
+                         valid_roi: tuple[int, int, int, int] | None = None):
     smoother     = _cli_value("--smoother", SMOOTHER)
     lat_sign     = int(_cli_value("--lat-sign", Constants.LAT_SIGN))
     heading_sign = int(_cli_value("--heading-sign", Constants.HEADING_SIGN))
@@ -154,6 +205,34 @@ def run_speed_estimation(world: World, fps: float,
         "--wide-angle-reweight", Constants.WIDE_ANGLE_REWEIGHT)).lower() in ("1", "true", "yes", "on")
     edge_gate = str(_cli_value(
         "--edge-gate", Constants.EDGE_GATE)).lower() in ("1", "true", "yes", "on")
+    # Frame-edge DROP: IGNORE (for speed only) frames whose bbox touches the border.
+    # Stronger than --edge-gate. Off by default; pass `--edge-drop 1` to enable.
+    edge_drop = str(_cli_value(
+        "--edge-drop", Constants.EDGE_DROP)).lower() in ("1", "true", "yes", "on")
+    # Shrink-rate DROP: IGNORE (for speed only) frames whose bbox collapses fast.
+    # Off by default; pass `--shrink-drop 1` to enable.
+    shrink_drop = str(_cli_value(
+        "--shrink-drop", Constants.SHRINK_DROP)).lower() in ("1", "true", "yes", "on")
+    # Occlusion down-weighting: trust frames LESS where the vehicle is hidden behind a
+    # nearer one. ON by default; pass `--occlusion-gate 0` to disable.
+    occlusion_gate = str(_cli_value(
+        "--occlusion-gate", Constants.OCCLUSION_GATE)).lower() in ("1", "true", "yes", "on")
+    # Aspect-ratio gate: trust frames LESS where the bbox width/height ratio jumps abruptly.
+    # ON by default; pass `--aspect-gate 0` to disable.
+    aspect_gate = str(_cli_value(
+        "--aspect-gate", Constants.ASPECT_GATE)).lower() in ("1", "true", "yes", "on")
+    # Relevance rejection, two INDEPENDENT criteria. Each ON by default.
+    reject_lateral = str(_cli_value(
+        "--reject-lateral", Constants.REJECT_BIG_LATERAL)).lower() in ("1", "true", "yes", "on")
+    reject_direction = str(_cli_value(
+        "--reject-direction", Constants.REJECT_DIRECTION)).lower() in ("1", "true", "yes", "on")
+    # Far-distance DROP: ignore frames whose estimated depth is beyond max_speed_distance.
+    # ON by default; pass `--distance-drop 0` to disable.
+    distance_drop = str(_cli_value(
+        "--distance-drop", Constants.DISTANCE_DROP)).lower() in ("1", "true", "yes", "on")
+    max_speed_distance = float(_cli_value("--max-speed-distance", Constants.MAX_SPEED_DISTANCE_M))
+    # Ego<->camera time-sync test: shift the ego pose by N frames vs the camera bboxes.
+    ego_shift = int(_cli_value("--ego-shift", 0))
 
     ego_pos = ego_heading = None
     if is_simulation and os.path.exists(telemetry_csv):
@@ -172,24 +251,95 @@ def run_speed_estimation(world: World, fps: float,
               "frames.csv + gyro.csv + gravity.csv + gps.csv)")
         return
 
+    # Ego<->camera time-sync test (--ego-shift N): slide the sensor-clock pose by N frames.
+    if ego_shift:
+        ego_pos     = _shift_frame_dict(ego_pos, ego_shift)
+        ego_heading = _shift_frame_dict(ego_heading, ego_shift)
+
     print(f"[main] world-frame speed: smoother={smoother}, "
           f"lat_sign={lat_sign}, heading_sign={heading_sign}, lateral_ref={lateral_ref}, "
-          f"wide_angle_reweight={wide_angle_reweight}, edge_gate={edge_gate}")
+          f"wide_angle_reweight={wide_angle_reweight}, edge_gate={edge_gate}, "
+          f"edge_drop={edge_drop}, shrink_drop={shrink_drop}, "
+          f"occlusion_gate={occlusion_gate}, aspect_gate={aspect_gate}, "
+          f"reject_lateral={reject_lateral}, reject_direction={reject_direction}, "
+          f"distance_drop={distance_drop} (>= {max_speed_distance:.0f}m), "
+          f"valid_roi={valid_roi}, ego_shift={ego_shift}")
     frame_ts = ego_yaw.load_frame_timestamps(frames_csv) if is_android else None
+    # ── RELEVANCE REJECTION: decide which vehicles are probably NOT on our road
+    # (persistently big lateral offset, or oncoming) and SKIP them in estimate_world_speeds.
+    reject_ids = set(relevance_flags.compute_relevance_flags(
+        world, ego_pos, ego_heading,
+        fx=fx, fy=fy, cx=cx, cy=cy, fps=fps,
+        method=Constants.DISTANCE_CALCULATION_METHOD,
+        lateral_ref=lateral_ref, lat_sign=lat_sign,
+        camera_height_m=Constants.DEFAULT_CAMERA_HEIGHT_M,
+        reject_lateral=reject_lateral, reject_direction=reject_direction))
+
     estimate_world_speeds(
         world, ego_pos, ego_heading, fps,
         fx=fx, fy=fy, cx=cx, cy=cy,
         frame_ts=frame_ts,
-        method="height",
+        method=Constants.DISTANCE_CALCULATION_METHOD,
         smoother=smoother,
         lat_sign=lat_sign,
         lateral_ref=lateral_ref,
         wide_angle_reweight=wide_angle_reweight,
         edge_gate=edge_gate,
+        edge_drop=edge_drop,
+        shrink_drop=shrink_drop,
+        occlusion_gate=occlusion_gate,
+        aspect_gate=aspect_gate,
+        distance_drop=distance_drop,
+        max_speed_distance=max_speed_distance,
         image_width=image_width, image_height=image_height,
+        valid_roi=valid_roi,
         camera_height_m=Constants.DEFAULT_CAMERA_HEIGHT_M,
         min_track_seconds=Constants.MIN_TRACK_SECONDS,
+        reject_ids=reject_ids,
     )
+
+    # ── WIDE-ANGLE DIAG (removable): split each vehicle's speed into along/cross-track
+    # + dump the bbox-slide traces, to localize the wide-angle over-estimation. Delete
+    # this block + wide_angle_diag.py to remove. ──
+    if "--wa-diag" in sys.argv:
+        try:
+            import wide_angle_diag
+            _base = os.path.dirname(os.path.abspath(frames_csv if is_android else telemetry_csv))
+            _wa_id = _cli_value("--wa-diag-id", None)
+            _only_ids = ([int(x) for x in str(_wa_id).split(",") if x.strip()]
+                         if _wa_id else None)
+            wide_angle_diag.dump(
+                world, ego_pos, ego_heading,
+                fx=fx, fy=fy, cx=cx, cy=cy, fps=fps, lat_sign=lat_sign,
+                out_dir=os.path.join(_base, "wa_diag"), frame_ts=frame_ts,
+                only_ids=_only_ids)
+        except Exception as e:
+            print(f"[wa-diag] failed: {e}")
+    # ── end WIDE-ANGLE DIAG block ──
+
+    # ── EGO-CANCEL DIAG (removable) ──
+    if "--cancel-diag" in sys.argv:
+        try:
+            import ego_cancel_diag
+            _base = os.path.dirname(os.path.abspath(frames_csv if is_android else telemetry_csv))
+            _cd_id = _cli_value("--cancel-diag-id", None)
+            _cd_only = ([int(x) for x in str(_cd_id).split(",") if x.strip()]
+                        if _cd_id else None)
+            _cd_sta = _cli_value("--cancel-diag-stationary", None)
+            _cd_sta_ids = (set(int(x) for x in str(_cd_sta).split(",") if x.strip())
+                           if _cd_sta else None)
+            _cd_method = _cli_value("--cancel-diag-method", Constants.DISTANCE_CALCULATION_METHOD)
+            _cd_gps = ego_yaw.ego_speed_from_android(frames_csv, gps_csv) if is_android else None
+            ego_cancel_diag.dump(
+                world, ego_pos, ego_heading,
+                fx=fx, fy=fy, cx=cx, cy=cy, fps=fps, lat_sign=lat_sign,
+                method=_cd_method, lateral_ref=lateral_ref, frame_ts=frame_ts,
+                gps_speed=_cd_gps, only_ids=_cd_only, stationary_ids=_cd_sta_ids,
+                camera_height_m=Constants.DEFAULT_CAMERA_HEIGHT_M,
+                out_dir=os.path.join(_base, "cancel_diag"))
+        except Exception as e:
+            print(f"[cancel-diag] failed: {e}")
+    # ── end EGO-CANCEL DIAG block ──
 
 
 def processFrame(yolo_model, world: World, frame, frame_id):
@@ -280,7 +430,8 @@ def make_speed_lookup(world: World):
 
 
 def evaluate_yellow_line(world: World, seg_frames: list, video_path: str, video_name: str,
-                         frame_width: int, frame_height: int, total_frames: int, fps: float):
+                         frame_width: int, frame_height: int, total_frames: int, fps: float,
+                         once_per_vehicle: bool = False):
     """Run the yellow-line (shoulder) detector over the live-built lane cache.
     Returns (events, recs, incidents). Empty if disabled or no frames."""
     if not (_YELLOW_IMPORT_OK and seg_frames):
@@ -288,10 +439,34 @@ def evaluate_yellow_line(world: World, seg_frames: list, video_path: str, video_
     cache = {"prefix": video_name, "path": video_path, "fps": fps,
              "w": frame_width, "h": frame_height, "total": total_frames, "frames": seg_frames}
     speed_lookup = make_speed_lookup(world)
-    incidents, recs, events, yellow_frames = shoulder_violation.evaluate(cache, speed_lookup)
+    incidents, recs, events, yellow_frames = shoulder_violation.evaluate(
+        cache, speed_lookup, once_per_vehicle=once_per_vehicle)
     print(f"[yellow] {yellow_frames} frames with a yellow line, "
           f"{len(incidents)} incident(s) -> {len(events)} ViolationEvent(s)")
     return events, recs, incidents
+
+
+def evaluate_crossing(seg_frames: list, fps: float, frame_height: int, frame_width: int) -> list:
+    """Solid-line CROSSING detector, wired live off the SAME per-frame lane-seg cache the yellow
+    rule already builds. Returns one ViolationEvent(SOLID_LINE_CROSSING) per incident."""
+    if not (_YELLOW_IMPORT_OK and seg_frames):
+        return []
+    shifts = [fr.get("shift", [0.0, 0.0]) for fr in seg_frames]
+    timeline = compute_verdict_timeline(seg_frames, shifts, frame_height, frame_width, fps,
+                                        ttl_sec=0.5, phantom_min_sec=0.0)
+    k_consec = max(1, round(0.05 * fps))
+    incidents = merge_events(events_from_timeline(timeline, k_consec), fps, cooldown_sec=3.0)
+    events = []
+    for tid, s, e in incidents:
+        events.append(ViolationEvent(
+            vehicle_id=tid,
+            violation_type=ViolationType.SOLID_LINE_CROSSING,
+            key_frame=s,
+            confidence=1.0,
+            details={"start_frame": s, "end_frame": e, "n_frames_over": e - s + 1},
+        ))
+    print(f"[crossing] {len(incidents)} solid-line crossing incident(s) -> ViolationEvent(s)")
+    return events
 
 
 def overspeed_to_events(overspeed_events: list) -> list:
@@ -310,8 +485,8 @@ def overspeed_to_events(overspeed_events: list) -> list:
 
 
 def run_evidence_and_report(world: World, all_events: list, out_dir: str, video_name: str):
-    """For every ViolationEvent (speeding + yellow-line): read the plate ONCE per vehicle from
-    the in-memory buffer, save the best-evidence crops, and write a consolidated violations CSV.
+    """For every ViolationEvent: read the plate ONCE per vehicle from the in-memory buffer,
+    save the best-evidence crops, and write a consolidated violations CSV.
     RECALL-FIRST: an unreadable plate is written as 'UNKNOWN - manual review', never dropped."""
     import csv
     evidence_dir = os.path.join(out_dir, f"{video_name}_evidence")
@@ -343,14 +518,14 @@ def run_evidence_and_report(world: World, all_events: list, out_dir: str, video_
     print(f"[violations] {len(all_events)} event(s) -> {csv_path}")
     if EVIDENCE_COLLECTOR is not None and all_events:
         print(f"[violations] evidence crops -> {evidence_dir}")
+    return results_by_event
 
 
 def write_perframe_and_tracks(world: World, all_frame_vehicles: dict, recs: dict, incidents: list,
                               out_dir: str, video_name: str, fps: float):
-    """Per-frame metrics (speed + yellow conf/violation) and a per-frame boxes table -- the join
-    data the A/B runner merges across detectors (frame-by-frame compare + IoU recall tally)."""
+    """Per-frame metrics (speed + yellow conf/violation) and a per-frame boxes table."""
     import csv
-    firing = set()                              # (frame) -> any vehicle firing a yellow incident
+    firing = set()
     for tid, s, e in incidents:
         firing.update(range(s, e + 1))
 
@@ -366,9 +541,9 @@ def write_perframe_and_tracks(world: World, all_frame_vehicles: dict, recs: dict
                 r = recs.get(vd["track_id"], {}).get(f)
                 if r:
                     yconf = max(yconf, float(r.get("conf", 0.0)))
-                    if r.get("speed"):          # yellow's per-frame speed (world km/h, else proxy)
+                    if r.get("speed"):
                         speeds.append(float(r["speed"]))
-                else:                            # yellow disabled -> fall back to world speed
+                else:
                     v = world.getVehicle(vd["track_id"])
                     s = v.speed_per_frame.get(f) if v is not None else None
                     if s:
@@ -388,6 +563,121 @@ def write_perframe_and_tracks(world: World, all_frame_vehicles: dict, recs: dict
     print(f"[perframe] -> {pf_path}\n[tracks]   -> {tr_path}")
 
 
+# --------------------------------------------------------------------------- #
+# Backend export -- bundle each violation and push to backend.
+# Behind --push-url / --job-payload; a normal run is a no-op here.
+# --------------------------------------------------------------------------- #
+def _load_job_payload():
+    """--job-payload <json|@file.json>: the backend job (Cloudflare presigned upload_url /
+    notify_url, job_id, and optional reference video_meta). Returns the parsed dict, or None."""
+    raw = _cli_value("--job-payload", None)
+    if not raw:
+        return None
+    try:
+        if raw.startswith("@"):
+            with open(raw[1:], encoding="utf-8") as fh:
+                return json.load(fh)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[export] could not parse --job-payload ({e}); export disabled")
+        return None
+
+
+def _video_meta_dict(job, video_path, frame_w, frame_h, fps, total_frames):
+    if job and job.get("video_meta"):
+        return dict(job["video_meta"])
+    return {"filename": os.path.basename(video_path), "width": int(frame_w),
+            "height": int(frame_h), "fps": round(float(fps), 3),
+            "frame_count": int(total_frames), "sha256": None,
+            "duration_sec": round(total_frames / fps, 3) if fps else None, "codec": None}
+
+
+def pull_job_video(job: dict):
+    """Worker-node PULL+VERIFY step: download the source clip from the job's presigned
+    Cloudflare GET URL and fail-fast check it against the reference fingerprint."""
+    import tempfile
+    from violations import ingest_client
+
+    job_id = str(job.get("job_id") or "job")
+    name = job.get("video_name") \
+        or os.path.basename((job.get("video_url") or "video.mp4").split("?")[0]) \
+        or "video.mp4"
+    work_dir = tempfile.mkdtemp(prefix=f"roadguard_{job_id}_")
+    dest = os.path.join(work_dir, name)
+    print(f"[job {job_id}] pulling '{name}' from presigned URL -> {dest}")
+    local_path, ref_meta, local_meta = ingest_client.download_and_verify_from_job(job, dest)
+    print(f"[job {job_id}] integrity OK: {local_meta.width}x{local_meta.height} "
+          f"@ {local_meta.fps:g}fps, {local_meta.frame_count} frames")
+    return local_path, ref_meta.to_dict(), work_dir
+
+
+def export_and_push_violations(world: World, results_by_event: list, *, job: dict | None,
+                               video_path: str, video_name: str, fps: float, frame_w: int,
+                               frame_h: int, total_frames: int, out_dir: str):
+    """Assemble the prioritised evidence bundle for every violation and upload it to the backend."""
+    push_url = _cli_value("--push-url", None)
+    if not push_url and not job:
+        return
+    if not _EXPORT_IMPORT_OK:
+        print("[export] --push-url/--job-payload set but violations.export is unavailable; skipped")
+        return
+    if not results_by_event:
+        print("[export] no violations to export; nothing pushed")
+        return
+
+    video_meta = _video_meta_dict(job, video_path, frame_w, frame_h, fps, total_frames)
+    records = []
+    for event, result in results_by_event:
+        v = world.getVehicle(event.vehicle_id)
+        boxes = v.bounding_box if v is not None else {}
+        win = clip_window(event.key_frame, fps, total_frames=total_frames)
+        stem = vx.violation_id(event)
+        clip = None
+        try:
+            clip = annotate_clip(video_path, os.path.join(out_dir, f"{stem}.mp4"), win,
+                                 box_for_frame=boxes.get,
+                                 caption=vx.describe_violation(event), fps=fps,
+                                 tag=f"VEH {event.vehicle_id} - {event.violation_type}")
+        except Exception as e:
+            print(f"[export] clip render failed for {stem} ({e}); shipping without a clip")
+        report = None
+        if event.violation_type == ViolationType.SPEEDING:
+            try:
+                report = docx_report.speeding_report(event, video_meta=video_meta,
+                                                     window=win.to_dict())
+            except Exception as e:
+                print(f"[export] .docx render failed for {stem} ({e})")
+        records.append((event, result, clip, report))
+
+    bundle = vx.build_export(records, video_meta=video_meta,
+                             client_info={"app": "roadguard", "component": "main",
+                                          "source_video": video_name})
+    targz = vx.bundle_targz(bundle)
+    bundle_path = os.path.join(out_dir, f"{video_name}_violations_bundle.tar.gz")
+    with open(bundle_path, "wb") as fh:
+        fh.write(targz)
+    queue = [(x["violation"], x["vehicle_id"], x["detector_confidence"]) for x in bundle.violations]
+    print(f"[export] {len(bundle.violations)} violation(s), {len(bundle.files)} file(s), "
+          f"{len(targz):,} bytes -> {bundle_path}\n[export] queue order: {queue}")
+
+    job_id = (job or {}).get("job_id")
+    if job and job.get("upload_url"):
+        res = vx.upload_bundle_presigned(
+            job["upload_url"], bundle, notify_url=job.get("notify_url"), job_id=job_id,
+            source_video=video_name, object_key=job.get("object_key"),
+            object_url=job.get("object_url"))
+        print(f"[export] presigned PUT -> {res.put.status_code} (ok={res.put.ok}); "
+              f"notify -> {(res.notify.status_code if res.notify else 'skipped')}")
+    elif push_url:
+        extra = {"source_video": video_name}
+        if job_id:
+            extra["job_id"] = job_id
+        resp = vx.post_bundle(push_url, targz, extra_fields=extra)
+        print(f"[export] POST {push_url} -> {resp.status_code} (ok={resp.ok})")
+    else:
+        print(f"[export] job payload had no upload_url and no --push-url; bundle saved locally only")
+
+
 def main():
     global EVIDENCE_COLLECTOR, LANE_MODEL
 
@@ -397,22 +687,27 @@ def main():
 
     yolo_model = loadYoloModel()
 
-    video_path = sys.argv[1]
+    # ── Worker-node mode (--job-payload) ──────────────────────────────────────
+    # When the backend dispatches a job carrying a presigned video_url, this process behaves as an
+    # autonomous worker: PULL the clip from Cloudflare + FAIL-FAST verify it against the job's
+    # reference fingerprint BEFORE any GPU work.
+    job = _load_job_payload()
+    job_work_dir = None
+    if job and job.get("video_url"):
+        video_path, _job_ref_meta, job_work_dir = pull_job_video(job)
+    else:
+        video_path = sys.argv[1]
     is_simulation = "--simulation" in sys.argv
-    # --benchmark: fast-data mode. Skip every rendered output (per-vehicle plots + the
-    # annotated video) and emit only the CSV/text data.
     benchmark = "--benchmark" in sys.argv
     if benchmark:
         print("[benchmark] fast-data mode: CSV/text outputs only (no plots, no annotated video)")
 
-    # Output routing: --out-dir keeps the two A/B detectors from clobbering each other.
     video_dir  = os.path.dirname(os.path.abspath(video_path))
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     out_dir = _cli_value("--out-dir", video_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Evidence collector (one OCR reader for the whole run). Skipped on --no-evidence or if
-    # fast_alpr is unavailable -- the rest of the pipeline is unaffected.
+    # Evidence collector (one OCR reader for the whole run).
     if _EVIDENCE_IMPORT_OK and "--no-evidence" not in sys.argv:
         try:
             EVIDENCE_COLLECTOR = EvidenceCollector(FastALPRReader().read_plate_with_conf,
@@ -435,6 +730,20 @@ def main():
     lane_conf = float(_cli_value("--lane-conf", 0.25))
     max_frames = int(_cli_value("--max-frames", 0))     # 0 = whole video (quick-test knob)
 
+    # ── UNDISTORT (removable): rectify frames so the pinhole pipeline is valid off-axis ──
+    # Only for clips recorded WITHOUT on-device distortion correction. Delete this block
+    # + the two below (and undistort.py) to remove the experiment entirely.
+    undistorter = None
+    if "--undistort" in sys.argv:
+        import undistort as _undistort
+        _report = _undistort.find_report(os.path.dirname(os.path.abspath(video_path)))
+        if _report:
+            undistorter = _undistort.FrameUndistorter.from_report(_report)
+            print(f"[undistort] using calibration report: {_report}")
+        else:
+            print("[undistort] --undistort set but no calibration report found; running raw")
+    # ── end UNDISTORT block ──
+
     vh = VideoHandler(video_path)
     frame_height, frame_width = vh.get_frame().shape[:2]
     world = World(vh.get_frame_count())
@@ -450,6 +759,8 @@ def main():
     while True:
         t_read = time.time()
         frame = vh.get_frame()
+        if undistorter is not None:        # UNDISTORT (removable)
+            frame = undistorter(frame)
         read_times.append(time.time() - t_read)
         if frame is None:
             read_times.pop()
@@ -468,8 +779,6 @@ def main():
             seg_frames.append({"frame": frame_id, "vehicles": frame_vehicles,
                                "lanes": seg_lanes(LANE_MODEL, frame, lane_conf),
                                "shift": [round(shift[0], 2), round(shift[1], 2)]})
-
-
 
         frame_id += 1
         if max_frames and frame_id >= max_frames:
@@ -517,18 +826,28 @@ def main():
         cx = frame_width / 2
         cy = frame_height / 2
 
+    # ── UNDISTORT (removable): match pipeline geometry to the rectified frames ──
+    if undistorter is not None and undistorter.K_used is not None:
+        K = undistorter.K_used
+        fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+        print(f"[undistort] intrinsics overridden to rectified K: "
+              f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
+    # ── end UNDISTORT block ──
+
     # ── 6. Distance ──────────────────────────────────────────────────────────
-    estimateDistance(world, fx, fy, cx, cy, camera_height_m=Constants.DEFAULT_CAMERA_HEIGHT_M)
-    smooth_distances(world, smooth_window=Constants.SMOOTH_WINDOW)
+    estimateDistance(world, fx, fy, cx, cy, Constants.DEFAULT_CAMERA_HEIGHT_M)
+    smooth_distances(world, Constants.SMOOTH_WINDOW, Constants.POLYORDER)
 
     # ── 7. Speed (world-frame reconstruction + Kalman) ───────────────────────
+    valid_roi = undistorter.valid_roi if undistorter is not None else None
     run_speed_estimation(
         world, fps, fx, fy, cx, cy,
         is_simulation=is_simulation, is_android=is_android,
         telemetry_csv=telemetry_csv, frames_csv=frames_csv,
         gyro_csv=gyro_csv, gravity_csv=gravity_csv, gps_csv=gps_csv,
         linacc_csv=linacc_csv,
-        image_width=frame_width, image_height=frame_height)
+        image_width=frame_width, image_height=frame_height,
+        valid_roi=valid_roi)
 
     # ── 7.5 Overspeed (android-only; needs the ego GPS track as the limit proxy) ──
     overspeed_events = []
@@ -551,13 +870,20 @@ def main():
         world, seg_frames, video_path, video_name,
         frame_width, frame_height, frame_id, fps)
 
-    # ── 7.7 Evidence stage over ALL violations (speeding + yellow), one record shape ──
-    all_events = overspeed_to_events(overspeed_events) + yellow_events
-    run_evidence_and_report(world, all_events, out_dir, video_name)
+    # ── 7.65 Solid-line crossing violation ───────────────────────────────────
+    crossing_events = evaluate_crossing(seg_frames, fps, frame_height, frame_width)
+
+    # ── 7.7 Evidence stage over ALL violations ────────────────────────────────
+    all_events = crossing_events + overspeed_to_events(overspeed_events) + yellow_events
+    results_by_event = run_evidence_and_report(world, all_events, out_dir, video_name)
     write_perframe_and_tracks(world, all_frame_vehicles, recs, incidents, out_dir, video_name, fps)
 
+    # ── 7.75 Backend export (opt-in) ─────────────────────────────────────────
+    export_and_push_violations(
+        world, results_by_event, job=job, video_path=video_path, video_name=video_name, fps=fps,
+        frame_w=frame_width, frame_h=frame_height, total_frames=frame_id, out_dir=out_dir)
+
     # ── 8. Outputs ───────────────────────────────────────────────────────────
-    # CSV data first -- this is the only output --benchmark keeps.
     distanceLogger.export_vehicle_summary(
         world, os.path.join(out_dir, f"{video_name}_vehicles.csv"))
 
@@ -591,7 +917,9 @@ def main():
     # FUSE mount. Off Colab this is a transparent no-op writing straight to out_dir.
     annotated_final = os.path.join(out_dir, f"{video_name}_annotated.mp4")
     with cloud_env.staged_output(annotated_final) as render_path:
-        annotated_video.render_annotated_video(world, video_path, render_path, fps=fps)
+        annotated_video.render_annotated_video(
+            world, video_path, render_path, fps=fps,
+            violation_events=all_events)
 
 
 # the main function of the program
