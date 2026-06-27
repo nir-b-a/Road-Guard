@@ -14,7 +14,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-app.use((req, res, next) => { console.log(req.method, req.originalUrl); next(); });
+// app.use((req, res, next) => { console.log(req.method, req.originalUrl); next(); });
 
 app.use('/api/auth', authRoutes);
 app.use('/api/authority', authorityRoutes);
