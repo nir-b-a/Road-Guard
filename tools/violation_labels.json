@@ -1,5 +1,5 @@
 {
-  "_comment": "Ground-truth violation windows for the 'vehicle on solid white line' test harness. Keyed by clip ID prefix (matches files in tests_videos/raw_videos/crossing_solid_line/, ignoring *_annotated.mp4). Each window: start/end FRAME indices + scoring weight. fps is informational (harness reads it from the video; K/M/cooldown are defined in seconds and converted per-clip). JqDMXT4Eue4 intentionally omitted (occlusion, YOLO unreliable). I3AcpHTrEXI has a 2nd violation our logic cannot catch by design -> intentionally NOT labeled.",
+  "_comment": "Ground-truth violation windows for the 'vehicle on solid white line' test harness. Keyed by clip ID prefix (matches files in tests_videos/raw_videos/crossing_solid_line/, ignoring *_annotated.mp4). Each window: start/end FRAME indices + scoring weight. fps is informational (harness reads it from the video; K/M/cooldown are defined in seconds and converted per-clip). JqDMXT4Eue4 intentionally omitted (occlusion, YOLO unreliable). I3AcpHTrEXI has a 2nd violation our logic cannot catch by design -> intentionally NOT labeled. DeNnDugXxP0 ALSO contains a solid-yellow right-lane violation (f1440-1465) and a traffic-island crossing (f2318-2400) that are NOT solid-white-line events -> intentionally NOT labeled here; see tools/violation_frame_annotations.md. Plates are blurred by the uploader in DeNnDugXxP0/mVvcgAA0rJ8/58zh0ZyUTwU/Aps9SxIsVl8 -> plate detection is N/A on these clips.",
   "clips": {
     "0SmdindPVEY": { "fps": 58.82, "windows": [
       { "start": 350, "end": 540, "weight": 0.3, "note": "YOLO struggles here -> low weight" },
@@ -32,6 +32,26 @@
     ]},
     "DiU52hnxSVY": { "fps": 29.97, "windows": [
       { "start": 220, "end": 240, "weight": 1.0 }
+    ]},
+    "DeNnDugXxP0": { "fps": 30.00, "windows": [
+      { "start": 68, "end": 151, "weight": 1.0, "note": "model expected to fire ~f68-100" },
+      { "start": 170, "end": 240, "weight": 1.0 },
+      { "start": 255, "end": 310, "weight": 1.0 },
+      { "start": 620, "end": 680, "weight": 1.0 },
+      { "start": 1320, "end": 1380, "weight": 1.0 },
+      { "start": 1880, "end": 1939, "weight": 1.0 },
+      { "start": 2624, "end": 2696, "weight": 1.0 }
+    ]},
+    "mVvcgAA0rJ8": { "fps": 23.98, "windows": [
+      { "start": 70, "end": 108, "weight": 1.0 },
+      { "start": 201, "end": 221, "weight": 1.0 },
+      { "start": 344, "end": 395, "weight": 1.0 },
+      { "start": 500, "end": 520, "weight": 1.0 }
+    ]},
+    "Aps9SxIsVl8": { "fps": 23.98, "windows": [
+      { "start": 58, "end": 72, "weight": 1.0 },
+      { "start": 687, "end": 715, "weight": 1.0 },
+      { "start": 788, "end": 800, "weight": 1.0 }
     ]}
   }
 }

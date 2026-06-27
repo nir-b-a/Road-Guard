@@ -18,7 +18,7 @@ import java.io.IOException
 
 class SplashActivity : AppCompatActivity() {
 
-    private val BASE_URL = "http://192.168.1.106:5000/api"
+    private val BASE_URL = "http://10.100.102.129:5000/api"
     private lateinit var prefs: SharedPreferences
     private var isRegisterMode = false
 
@@ -26,12 +26,16 @@ class SplashActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("roadguard", MODE_PRIVATE)
 
+        // Already logged in with a real token -> go straight to Home. A previous DEV build
+        // may have stored a fake "dev-offline-token"; ignore and clear it so the login
+        // screen shows again instead of silently using a token the server will reject.
         val token = prefs.getString("token", null)
-        if (token != null) {
+        if (token != null && token != "dev-offline-token") {
             startActivity(Intent(this, HomeActivity::class.java))
             finish()
             return
         }
+        prefs.edit().remove("token").remove("userId").remove("name").apply()
 
         setContentView(R.layout.activity_splash)
 

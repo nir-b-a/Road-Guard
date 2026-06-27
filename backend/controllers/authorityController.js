@@ -1,6 +1,7 @@
 const Violation = require('../models/Violation');
 const Notification = require('../models/Notification');
 const Drive = require('../models/Drive');
+const r2 = require('../services/r2');
 
 const getViolations = async (req, res) => {
     const { status, date, license_plate } = req.query;
@@ -39,8 +40,14 @@ const dismissViolation = async (req, res) => {
 const getEvidence = async (req, res) => {
     const violation = await Violation.findById(req.params.id);
     if (!violation) return res.status(404).json({ success: false, message: 'Violation not found', data: null });
+    // The clip lives in R2; hand back a short-lived presigned GET URL so the dashboard's
+    // <video> loads it straight from R2 (bytes never pass through this server, bucket stays
+    // private). Falls back to a plain path when R2 isn't configured (local dev / tests).
+    const video_clip_url = r2.isConfigured()
+        ? await r2.presignGet(violation.videoClipPath)
+        : req.protocol + '://' + req.get('host') + '/' + violation.videoClipPath;
     res.json({ success: true, message: 'Evidence retrieved', data: {
-        video_clip_url: req.protocol + '://' + req.get('host') + '/' + violation.videoClipPath,
+        video_clip_url,
         car_id_recognition: violation.carId,
         calculated_speed: violation.calculatedSpeed,
         location: violation.location,

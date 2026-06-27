@@ -6,18 +6,22 @@ import android.view.View
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.example.roadgaurd.R
+import com.example.roadgaurd.storage.SessionStore
 import okhttp3.*
 import org.json.JSONObject
 import java.io.IOException
 
 class HomeActivity : AppCompatActivity() {
 
-    private val BASE_URL = "http://192.168.1.106:5000/api"
+    private val BASE_URL = "http://10.100.102.129:5000/api"
     private var unreadCount = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_home)
+
+        // Reclaim un-uploaded sessions left on the device beyond the retention window.
+        SessionStore.sweepStaleSessions(this)
 
         fetchNotifications()
 

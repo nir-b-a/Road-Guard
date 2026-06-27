@@ -25,7 +25,7 @@ describe('MIDDLEWARE - Role Guard', () => {
     });
     it('authority token cannot access driver upload route', async () => {
         const { token } = await getAuthorityToken();
-        const res = await request(app).post('/api/driver/upload').set('Authorization', 'Bearer ' + token);
+        const res = await request(app).post('/api/driver/upload/init').set('Authorization', 'Bearer ' + token);
         expect(res.statusCode).toBe(403);
     });
     it('driver token passes driver route guard', async () => {

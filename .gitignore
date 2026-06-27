@@ -1,59 +1,103 @@
-# OS
+# =============================================================================
+# Road Guard — repo root .gitignore (Python pipeline)
+# The Android app, Node backend, and React frontend each have their own
+# .gitignore under application/, backend/, and frontend/roadguard-authority/.
+# =============================================================================
+
+# --- OS -----------------------------------------------------------------------
 .DS_Store
 Thumbs.db
 
-# Python bytecode cache
+# --- Python -------------------------------------------------------------------
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+.eggs/
+*.so
+*.pyd
+build/
 
-# Large local-only data / media
-datasets/
-dataset_extraction/
-tests_videos/
-
-# Pipeline outputs (pseudo-labels, hard-example curation, training runs)
-outputs/
-dataset_curation/
-
-# Archived/shelved dev scripts (dataset, upload, training, grids, scratch) — local only
-tools/_archive/
-
-# Shelved lane-classifier experiments — local only
-line_crossing/experiments/
-line_crossing/lab_classifiers_v3.py
-
-# Local Claude allow-rules (machine-specific paths) — not shared
-.claude/settings.json
-
-# Python processing unit outputs
-output.mp4
-notes.txt
-test_1_world.jsonl
-test_1_yolo.jsonl
-
-# YOLOv8 model weights
-yolov8m.pt
-yolov8x.pt
-yolov8n.pt
-yolov8n-seg.pt
-
-# DL lane-detection env (Phase 0) — never commit envs / build artifacts / cloned framework
+# Virtual environments / build dirs — never commit these.
 .venv/
 venv/
 env/
 roadguard-dl/
-UnLanedet/
-weights/
-models/
-*.so
-*.pyd
-build/
-*.egg-info/
-.eggs/
+/models/
 
-# Downloaded dataset videos (use tests_videos/download_videos.py to get them)
-tests_videos/raw_videos/
+# --- Model weights ------------------------------------------------------------
+# Large + auto-downloadable: ultralytics fetches yolo11x.pt / yolov8*.pt on first
+# run; the CLRerNet base weight comes from its model zoo. Ignore all *.pt, then
+# re-include ONLY the two small weights we intentionally commit.
+#*.pt
+#!israeli_plates.pt              # custom LPR plate detector (~6 MB)
+#weights/*
+#!weights/phase3_v3_yellowprotect.pt   # validated lane model used by the violation pipeline (~6.5 MB)
+yolo11x.pt
+
+# --- Large local-only data / media -------------------------------------------
+# real_vids/ is ~5 GB of dashcam clips + sensor CSVs + generated outputs.
+# Never commit it — share via external storage instead.
+real_vids/
+datasets/
+dataset_extraction/
+dataset_curation/
+tests_videos/
+tests_videos/raw_videos/        # downloaded via tests_videos/download_videos.py
 test_videos/
 
-# IDE
+# --- Pipeline outputs ---------------------------------------------------------
+# Artifacts written next to the input video by main.py / the violation harness.
+HOW_TO_RUN.txt
+outputs/
+output.mp4
+*_annotated.mp4
+*_vehicles.csv
+*_overspeed.csv
+*_overspeed.txt
+notes.txt
+test_1_world.jsonl
+test_1_yolo.jsonl
+
+# --- Archived / shelved dev scripts (local only) ------------------------------
+tools/_archive/
+line_crossing/experiments/
+line_crossing/lab_classifiers_v3.py
+# Removable speed-pipeline diagnostics (not imported by main.py) — keep local.
+ego_cancel_diag.py
+wide_angle_diag.py
+
+ground_distance/
+
+# --- Cloned, not-on-PyPI framework (install editable; never commit) -----------
+UnLanedet/
+
+# --- Secrets ------------------------------------------------------------------
+.env
+*.env
+!.env.example
+
+# --- IDE / tooling ------------------------------------------------------------
 .idea/
+# Local Claude allow-rules (machine-specific paths) — not shared.
+.claude/settings.json
+
+# RoadGuard local pipeline media & diagnostics — keep heavy outputs out of git.
+# (note: outputs/ is the cache dir above; output/ is the singular render/diagnostics dir)
+output/
+output_*/
+**/anomaly_frames/
+
+# Media (videos/audio) anywhere — never commit heavy media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4a
+*.wav
+
+# --- Worker runtime -----------------------------------------------------------
+# worker.py stages each job's downloaded files here before processing —
+# regenerated every run, never commit.
+_worker_jobs/

@@ -6,6 +6,9 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Normal permission (auto-granted): lets us sample the gyroscope above 200 Hz
+         via SENSOR_DELAY_FASTEST, which the speed pipeline relies on for yaw rate. -->
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
@@ -33,6 +36,7 @@
 
         <activity
             android:name=".ui.RecordingActivity"
+            android:theme="@style/Theme.RoadGuard.NoActionBar"
             android:screenOrientation="landscape"
             android:exported="false" />
 
