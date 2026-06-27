@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.view.View
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.example.roadgaurd.AppConfig
 import com.example.roadgaurd.R
 import com.example.roadgaurd.storage.SessionStore
 import okhttp3.*
@@ -13,7 +14,6 @@ import java.io.IOException
 
 class HomeActivity : AppCompatActivity() {
 
-    private val BASE_URL = "http://10.100.102.129:5000/api"
     private var unreadCount = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -35,6 +35,10 @@ class HomeActivity : AppCompatActivity() {
             startActivity(Intent(this, NotificationsActivity::class.java))
         }
 
+        findViewById<android.widget.Button>(R.id.btnSettings).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
         findViewById<android.widget.Button>(R.id.btnLogout).setOnClickListener {
             val prefs = getSharedPreferences("roadguard", MODE_PRIVATE)
             prefs.edit().clear().apply()
@@ -52,7 +56,7 @@ class HomeActivity : AppCompatActivity() {
         val userId = prefs.getString("userId", null) ?: return
 
         val request = Request.Builder()
-            .url("$BASE_URL/notifications/$userId")
+            .url("${AppConfig.getBaseUrl(this)}/notifications/$userId")
             .addHeader("Authorization", "Bearer $token")
             .build()
 

@@ -6,46 +6,49 @@
     android:orientation="vertical"
     android:background="@color/bg_dark">
 
-    <!-- Section header + mark all read -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:paddingStart="20dp"
-        android:paddingEnd="8dp"
-        android:paddingTop="12dp">
+        android:background="@color/surface_dark"
+        android:paddingStart="16dp"
+        android:paddingEnd="12dp"
+        android:paddingTop="16dp"
+        android:paddingBottom="16dp">
 
         <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Recent activity"
-            android:textColor="@color/text_secondary"
-            android:textSize="14sp"
+            android:text="Notifications"
+            android:textSize="18sp"
             android:textStyle="bold"
-            android:letterSpacing="0.04" />
+            android:textColor="@color/white"/>
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnMarkAllRead"
-            style="@style/Widget.RoadGuard.Button.Text"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Mark all read"
-            app:icon="@drawable/ic_done_all"
-            app:iconGravity="textStart"
-            app:iconSize="18dp"
-            app:iconTint="@color/accent" />
+            android:layout_height="36dp"
+            android:text="Mark All Read"
+            android:textSize="12sp"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            app:strokeColor="@color/cyan_600"
+            android:textColor="@color/cyan_400"
+            app:cornerRadius="8dp"/>
 
     </LinearLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1.5dp"
+        android:background="@color/cyan_600"/>
 
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/rvNotifications"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:clipToPadding="false"
-        android:paddingTop="4dp"
-        android:paddingBottom="16dp" />
+        android:paddingTop="8dp"/>
 
 </LinearLayout>

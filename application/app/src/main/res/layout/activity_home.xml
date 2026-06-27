@@ -4,87 +4,108 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="@drawable/bg_app_gradient"
-    android:padding="24dp">
+    android:background="@color/bg_dark">
 
-    <!-- Greeting -->
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Welcome back 👋"
-        android:textColor="@color/text_primary"
-        android:textSize="26sp"
-        android:textStyle="bold"
-        android:layout_marginTop="16dp" />
-
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Ready to capture your next drive?"
-        android:textColor="@color/text_secondary"
-        android:textSize="15sp"
-        android:layout_marginTop="6dp"
-        android:layout_marginBottom="32dp" />
-
-    <!-- Primary action -->
-    <Button
-        android:id="@+id/btnStartDrive"
+    <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="64dp"
-        android:text="Start Drive"
-        android:textSize="18sp"
-        app:icon="@drawable/ic_drive"
-        app:iconGravity="textStart"
-        app:iconSize="24dp"
-        android:layout_marginBottom="16dp" />
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="@color/surface_dark"
+        android:padding="16dp">
 
-    <!-- Notifications with unread badge -->
-    <FrameLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content">
-
-        <Button
-            android:id="@+id/btnNotifications"
-            style="@style/Widget.RoadGuard.Button.Tonal"
-            android:layout_width="match_parent"
-            android:layout_height="64dp"
-            android:text="Notifications"
-            android:textSize="17sp"
-            app:icon="@drawable/ic_bell"
-            app:iconGravity="textStart"
-            app:iconSize="24dp" />
+        <ImageView
+            android:layout_width="28dp"
+            android:layout_height="28dp"
+            android:src="@drawable/ic_shield"
+            android:layout_marginEnd="10dp"/>
 
         <TextView
-            android:id="@+id/tvBadge"
-            android:layout_width="22dp"
-            android:layout_height="22dp"
-            android:layout_gravity="top|end"
-            android:layout_marginTop="10dp"
-            android:layout_marginEnd="10dp"
-            android:background="@drawable/bg_badge"
-            android:gravity="center"
-            android:textColor="@color/white"
-            android:textSize="11sp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="RoadGuard"
+            android:textSize="20sp"
             android:textStyle="bold"
-            android:visibility="gone" />
+            android:textColor="@color/cyan_400"/>
 
-    </FrameLayout>
+    </LinearLayout>
 
-    <!-- Spacer -->
     <View
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1" />
+        android:layout_height="1.5dp"
+        android:background="@color/cyan_600"/>
 
-    <!-- Logout -->
-    <Button
-        android:id="@+id/btnLogout"
-        style="@style/Widget.RoadGuard.Button.Outlined"
+    <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="54dp"
-        android:text="Logout"
-        app:icon="@drawable/ic_logout"
-        app:iconGravity="textStart"
-        app:iconSize="20dp" />
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="32dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnStartDrive"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:text="Start Drive"
+            android:textSize="16sp"
+            app:cornerRadius="10dp"
+            android:layout_marginBottom="16dp"/>
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnNotifications"
+                android:layout_width="match_parent"
+                android:layout_height="56dp"
+                android:text="Notifications"
+                android:textSize="16sp"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                app:strokeColor="@color/cyan_600"
+                android:textColor="@color/cyan_400"
+                app:cornerRadius="10dp"/>
+
+            <TextView
+                android:id="@+id/tvBadge"
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:background="@color/red_record"
+                android:textColor="@color/white"
+                android:textSize="10sp"
+                android:gravity="center"
+                android:layout_gravity="top|end"
+                android:layout_margin="6dp"
+                android:visibility="gone"/>
+
+        </FrameLayout>
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnSettings"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:text="Settings"
+            android:textSize="16sp"
+            android:layout_marginTop="16dp"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            app:strokeColor="@color/border_subtle"
+            android:textColor="@color/gray_400"
+            app:cornerRadius="10dp"/>
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnLogout"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:text="Logout"
+            android:textSize="16sp"
+            android:layout_marginTop="12dp"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            app:strokeColor="@color/border_subtle"
+            android:textColor="@color/gray_400"
+            app:cornerRadius="10dp"/>
+
+    </LinearLayout>
 
 </LinearLayout>
