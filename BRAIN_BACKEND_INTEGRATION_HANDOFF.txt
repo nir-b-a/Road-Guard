@@ -1,0 +1,462 @@
+================================================================================
+ROAD GUARD — BRAIN <-> BACKEND INTEGRATION HANDOFF
+For the assistant / developers building the WEB + APP + BACKEND side.
+Written 2026-06-24. Branch: feature/yellow-solid-line-violation.
+================================================================================
+
+Hi. You're building the backend / web dashboard / mobile app for Road Guard. THIS document
+describes the contract that the "brain" (the computer-vision pipeline) already implements, so you
+can build your side (storage, API, dashboard, app dataset) to plug straight into it with no surprises.
+
+Read sections 0–7 to integrate. Sections 8–14 are context, honesty, and pointers.
+
+Everything below is implemented and tested in this repo. Code pointers are in section 12.
+
+
+--------------------------------------------------------------------------------
+0. TL;DR (the 60-second version)
+--------------------------------------------------------------------------------
+- Road Guard is a Human-in-the-Loop (HITL) traffic-violation system. A dashcam/clip is analysed by
+  the "brain" (GPU vision). For each detected violation the brain produces an EVIDENCE PACKAGE and
+  ships it to YOUR backend for human review + storage + display in the web/app.
+
+- The transport is ONE gzip tarball ("the bundle", `violations.tar.gz`). In the target architecture
+  (section 3) the brain PUTs it straight to Cloudflare (R2) via a presigned URL and POSTs a small
+  webhook to your backend; a legacy multipart POST through your server is still supported. Inside the
+  tarball: a top-level `manifest.json` (the machine-readable index, RANKED)
+  plus ONE FOLDER PER VIOLATION, each self-contained:
+      v<vehicleId>_<TYPE>_f<frame>/
+        clip.mp4                         <- 10s annotated clip (red box on the offending vehicle)
+        v<id>_<TYPE>.txt                 <- human-readable one-pager (key=value)
+        violation.json                   <- machine record (same fields the manifest lists)
+        v<id>_<TYPE>_0_f<frame>.png      <- vehicle picture 1  (+ _plate.png plate crop)
+        v<id>_<TYPE>_1_f<frame>.png      <- vehicle picture 2  (+ _plate.png)
+        v<id>_<TYPE>_2_f<frame>.png      <- vehicle picture 3  (+ _plate.png)
+        report.docx                      <- ONLY for SPEEDING (describes the calculated speed)
+
+- The review queue ORDER is decided by the brain and is LEXICOGRAPHIC by violation TYPE
+  (Solid-line crossing > Speeding > other > Yellow-line). Preserve this order in your UI.
+
+- The plate read is EVIDENCE ONLY. It NEVER affects priority/ranking. An unreadable plate
+  ("UNKNOWN", manual_review=true) must not bury a serious violation.
+
+- Two integration modes (pick one; both implemented): (A) brain pulls the video from you and pushes
+  the bundle back, or (B) you DISPATCH a job to the brain service and it calls you back (async).
+
+
+--------------------------------------------------------------------------------
+1. WHAT THIS PART OF THE PROJECT IS (and what happened here)
+--------------------------------------------------------------------------------
+Road Guard = HITL SaaS for road-violation enforcement. Optimised for RECALL, not precision (a false
+positive is cheap for a human reviewer to dismiss; a missed violation is the costly failure). That
+is WHY: violations are reported even with no readable plate; the plate never down-ranks a violation;
+"3 pictures" are always shipped even when OCR failed.
+
+This part = the CLIENT-SIDE (brain) half of the brain<->backend integration contract + a fully
+working LOCAL end-to-end loop that proves it, using a mock backend so we didn't need your real
+server to develop against.
+
+What was built and proven here (on a real clip, DeNnDugXxP0.mp4, 1280x720 @ 30fps):
+  * A prioritised, self-describing evidence bundle (the structure in section 0).
+  * Hard type-tiered ranking (section 7), replacing an earlier confidence×severity blend.
+  * Per-violation annotated clip (red box + caption), 3 vehicle pics each with a plate crop, a .txt
+    + .json document, and a .docx for speeding.
+  * A download + INTEGRITY handshake (section 4) so corrupted/recompressed video is caught early.
+  * BOTH integration modes (section 3), including the brain running as an async job service.
+  * A mock backend that serves the video, returns its reference fingerprint, receives the bundle,
+    and auto-unpacks it into a browsable folder tree.
+
+What is NOT done yet: wiring this into the live GPU pipeline (main.py), and a real remote backend
+(only the local mock exists). See section 14.
+
+
+--------------------------------------------------------------------------------
+2. VOCABULARY
+--------------------------------------------------------------------------------
+  BRAIN        the vision pipeline (this side). Detects violations, builds + sends the bundle.
+  BACKEND      YOUR server. Stores the original video, receives bundles, feeds the web/app.
+  BUNDLE       one gzip tarball (violations.tar.gz): manifest.json + per-violation folders.
+  MANIFEST     manifest.json — the ranked, machine-readable index of all violations in the bundle.
+  VIOLATION    one incident: one vehicle, one violation type, one key frame.
+  EVIDENCE     per violation: the clip + pictures + plate crops + documents.
+  VideoMeta    a video fingerprint {filename,width,height,fps,frame_count,sha256,duration_sec,codec}.
+
+
+--------------------------------------------------------------------------------
+3. INTEGRATION FLOW — CLOUDFLARE PRESIGNED URLS (updated 2026-06-25)
+--------------------------------------------------------------------------------
+ARCHITECTURE CHANGE: the Node backend NO LONGER stores or serves the media bytes. Videos AND the
+evidence bundles live in Cloudflare (R2). The backend's job is to hold METADATA (in MongoDB) and to
+hand out one-time PRESIGNED URLs; the heavy bytes flow directly between the brain and Cloudflare and
+NEVER transit the Node server. Mongo still backs users / login / the violation records.
+
+There are no longer any {backend}/video/{name} or {backend}/video/{name}/meta endpoints. A presigned
+URL is a single opaque signed string — the brain uses it verbatim and never appends a path to it.
+
+MODE A — BRAIN-INITIATED (brain pulls, then uploads). Simplest.
+    brain   GET  <video_url>            (presigned R2 GET, from the backend)  -> raw video bytes
+    brain   ...analyse...
+    brain   PUT  <upload_url>           (presigned R2 PUT)  -> the bundle .tar.gz bytes (Cloudflare)
+    brain   POST <notify_url>           (backend webhook)   -> small JSON: object key + sha256 +
+                                                               ranked violation index (NOT the bytes)
+  (To start the work the brain needs <video_url> + the reference video_meta + <upload_url> +
+   <notify_url> — i.e. a JOB PAYLOAD, section 6. The backend mints these and hands them over.)
+
+MODE B — BACKEND-INITIATED (you dispatch a job; brain calls back). Realistic for production,
+because real analysis is minutes of GPU and you don't want to block. ASYNC (202 + callback):
+    backend POST {brain}/jobs  <JOB PAYLOAD>                                   -> 202 Accepted
+            JOB PAYLOAD = {job_id, video_url, video_meta, upload_url, notify_url}
+    brain   GET  <video_url>            (presigned R2 GET)  -> pull + FAIL-FAST verify (section 4)
+    brain   ...analyse...
+    brain   PUT  <upload_url>           (presigned R2 PUT)  -> the bundle .tar.gz to Cloudflare
+    brain   POST <notify_url>           (your webhook)      -> completion JSON, tagged with job_id
+    (you can poll GET {brain}/jobs/{job_id} for status: accepted|running|done|error)
+
+BUNDLE DESTINATION — "Option B" (this is what the brain implements):
+  The bundle (the SAME .tar.gz structure as sections 5–6) is PUT straight to Cloudflare via the
+  presigned <upload_url>; then a LIGHTWEIGHT webhook (<notify_url>) tells the backend it's there.
+  The webhook body carries: manifest_version, job_id, source_video, bundle{object_key, object_url,
+  bytes, sha256, content_type, filename}, violation_count, and a compact ranked violations[] index
+  (violation_id, violation, tier, vehicle_id, detector_confidence, plate, manual_review). The
+  backend persists rows from that index immediately and fetches/unpacks the tarball from R2 when it
+  wants the media. (The legacy multipart POST of the whole tarball to a backend /ingest endpoint is
+  still supported by the brain — `--push-url` / `post_bundle` — but is NOT the target architecture.)
+
+⚠ PRESIGNED-URL TTL TRAP: mint <upload_url> with a generous TTL, or mint it AFTER analysis. If you
+create it at job dispatch and GPU analysis takes minutes, the PUT URL can EXPIRE before the brain
+uploads. Same applies to <video_url> vs. how long the job sits queued.
+
+
+--------------------------------------------------------------------------------
+4. THE INTEGRITY HANDSHAKE (reference fingerprint now travels IN THE JOB PAYLOAD)
+--------------------------------------------------------------------------------
+The backend no longer holds the video bytes, so it is no longer the byte source — but it IS still the
+source of truth for the reference fingerprint, which now lives in MongoDB and is handed to the brain
+INSIDE the job payload as `video_meta` (NOT fetched from a /meta endpoint, which no longer exists).
+  * Where video_meta comes from: the mobile app computes the VideoMeta (resolution / fps / frame
+    count / sha256) at capture and sends it as metadata when it requests an upload URL; the backend
+    stores it in Mongo. (Cloudflare's object etag/checksum is an acceptable secondary source.)
+  * The brain downloads from the presigned <video_url>, re-probes its local copy, and compares it to
+    `video_meta` (resolution, fps, frame_count, sha256). If the transfer lost fidelity (truncation,
+    a recompressing proxy, a downscale), the brain FAILS FAST before burning GPU time, and can tell
+    you which hop broke it. A faithful transfer is byte-identical, so a sha256 mismatch == the bytes
+    were tampered with / corrupted in transit.
+  * This is the DOWNLOAD-hop guard rail only; the backend should still verify the uploaded bundle's
+    sha256 (sent in the webhook) against the R2 object it stored.
+Include `video_meta` in every job payload. A job with no reference fingerprint cannot be verified and
+the brain treats that as a hard error (it will not silently skip the guard rail).
+
+
+--------------------------------------------------------------------------------
+5. THE BUNDLE — exactly what is in the .tar.gz (same bytes either transport)
+--------------------------------------------------------------------------------
+Target transport (section 3): the brain PUTs the .tar.gz to Cloudflare via the presigned <upload_url>
+and POSTs the completion webhook to <notify_url>. The webhook tells you the object_key + sha256 so
+you fetch + verify the tarball from R2. The CONTENTS below are identical regardless of transport.
+
+Legacy transport (still supported, brain `--push-url`): HTTP POST, multipart/form-data, to a backend
+/ingest endpoint.
+  - File part field name: "bundle"   (filename "violations.tar.gz", content-type application/gzip)
+  - Sibling form fields: "manifest_version" (e.g. "2.0"), "source_video" (the video name),
+    and "job_id" (present in MODE B so you can correlate the callback to the job you dispatched).
+
+The file is a gzip-compressed tar. Extract it and you get:
+
+    manifest.json                                  <- ranked index of ALL violations (section 6)
+    v1_SOLID_LINE_CROSSING_f149/                   <- one folder per violation
+        clip.mp4
+        v1_SOLID_LINE_CROSSING.txt
+        violation.json
+        v1_SOLID_LINE_CROSSING_0_f104.png
+        v1_SOLID_LINE_CROSSING_0_f104_plate.png
+        v1_SOLID_LINE_CROSSING_1_f149.png
+        v1_SOLID_LINE_CROSSING_1_f149_plate.png
+        v1_SOLID_LINE_CROSSING_2_f194.png
+        v1_SOLID_LINE_CROSSING_2_f194_plate.png
+    v901_SPEEDING_f1200/
+        clip.mp4
+        v901_SPEEDING.txt
+        violation.json
+        report.docx                                <- speeding only
+        v901_SPEEDING_0_f1155.png  (+ _plate.png)
+        v901_SPEEDING_1_f1182.png  (+ _plate.png)
+        v901_SPEEDING_2_f1208.png  (+ _plate.png)
+    v951_YELLOW_LINE_RIGHT_f1500/
+        ...same shape, no report.docx...
+
+FILE NAMING RULES (parse these if you want, or just read manifest.json which lists every file):
+  - Folder:  v<vehicleId>_<VIOLATION_TYPE>_f<keyFrame>/
+  - Clip:    clip.mp4   (the 10s evidence clip: ~10s before the incident to ~5s after, ANNOTATED
+             with a red box on the offending vehicle + a caption describing the violation)
+  - Pics:    v<id>_<TYPE>_<i>_f<frame>.png        (i = 0,1,2 ; <frame> = the source frame index)
+  - Plates:  v<id>_<TYPE>_<i>_f<frame>_plate.png  (the plate crop for that same picture)
+  - Docs:    v<id>_<TYPE>.txt (always) ; violation.json (always) ; report.docx (SPEEDING only)
+
+INTEGRITY: every media file's sha256 is recorded in manifest.json. You SHOULD verify the bytes you
+stored match (catches a broken upload). gzip tar is deterministic on our side.
+
+
+--------------------------------------------------------------------------------
+6. manifest.json — FULL FIELD REFERENCE (this is your DB/ingest schema)
+--------------------------------------------------------------------------------
+Top level:
+{
+  "manifest_version": "2.0",
+  "created_utc": 1750000000.0,                      // unix seconds, when the brain built the bundle
+  "client": { "app": "roadguard", "component": "run_brain", "demo": true },
+  "source_video": {                                 // the VideoMeta fingerprint of the analysed video
+      "filename": "DeNnDugXxP0.mp4",
+      "width": 1280, "height": 720, "fps": 30.0,
+      "frame_count": 2700, "sha256": "….", "duration_sec": 90.0, "codec": "h264"
+  },
+  "priority_model": {                               // documents how violations[] are ordered
+      "model": "lexicographic_type_tier",
+      "summary": "Hard type tiers; confidence orders WITHIN a tier only, never across tiers.",
+      "tiers": [
+        {"rank":0,"type":"SOLID_LINE_CROSSING","intra_order":"confidence_desc"},
+        {"rank":1,"type":"SPEEDING","intra_order":"confidence_desc (margin-over-limit)"},
+        {"rank":2,"type":"<other>","intra_order":"confidence_desc"},
+        {"rank":3,"type":"YELLOW_LINE_RIGHT","intra_order":"chronological (key_frame asc)"}
+      ],
+      "type_tier": {"SOLID_LINE_CROSSING":0,"SPEEDING":1,"YELLOW_LINE_RIGHT":3},
+      "default_tier": 2,
+      "speeding_confidence_from_margin": {"floor":0.30,"full_over_kmh":40.0},
+      "severity_weights_informational": { … },      // INFORMATIONAL ONLY, not used for ordering
+      "plate_confidence_excluded": true
+  },
+  "violation_count": 5,
+  "violations": [ <violation record>, … ]           // ALREADY SORTED worst/most-urgent first
+}
+
+Each <violation record> (this is the row you'd store + render; violation.json in each folder is an
+exact copy of its own record):
+{
+  "violation_id": "v1_SOLID_LINE_CROSSING_f149",    // stable unique id (== folder name)
+  "vehicle_id": 1,                                  // tracker id of the offending vehicle
+  "violation": "SOLID_LINE_CROSSING",               // <-- USE THIS as the violation type
+  "violation_type": "SOLID_LINE_CROSSING",          // alias of "violation" (back-compat)
+  "tier": 0,                                         // 0..3, lower = higher priority (section 7)
+  "key_frame": 149,                                  // the representative frame of the incident
+  "detector_confidence": 0.926241,                  // [0,1] detector certainty (orders WITHIN tier)
+  "crossing_solid_line_confidence": 0.926241,       // crossing conf on a crossing row; null otherwise
+  "plate": null,                                     // "40-418-79" or null (null => UNKNOWN)
+  "plate_score": 0.0,                                // OCR confidence [0,1]. EVIDENCE ONLY, never ranks
+  "n_reads": 0,                                      // how many frames produced a plate string
+  "manual_review": true,                             // true => a human must confirm the plate
+  "severity_weight": 0.8,                            // INFORMATIONAL ONLY (do not rank on it)
+  "description": "Vehicle 1 crossed a solid white lane line (crossing confidence 0.93).",
+  "details": { … type-specific … },                 // see below
+  "record_file": "v1_SOLID_LINE_CROSSING_f149/violation.json",
+  "summary_file": "v1_SOLID_LINE_CROSSING_f149/v1_SOLID_LINE_CROSSING.txt",
+  "evidence": {
+     "plate": null, "plate_score": 0.0, "n_reads": 0, "manual_review": true,
+     "clip": {                                        // the annotated 10s evidence video
+        "file": "v1_SOLID_LINE_CROSSING_f149/clip.mp4",
+        "bytes": 10370187, "sha256": "….",
+        "container": "mp4", "recompressed": true,     // true: annotated clips are re-encoded by design
+        "window": {"start_frame":0,"end_frame":299,"start_sec":0.0,"end_sec":10.0,
+                   "key_frame":149,"duration_sec":10.0}
+     },
+     "report": null,                                  // {file,bytes,sha256,kind,content_type} for SPEEDING
+     "crops": [                                       // the 3 vehicle pictures
+        {"file":"…_0_f104.png","frame_id":104,"bytes":…,"sha256":"…",
+         "plate":{"file":"…_0_f104_plate.png","bytes":…,"sha256":"…"}},
+        … two more …
+     ],
+     "plate_crop": null                               // legacy single best plate crop (usually null here)
+  }
+}
+
+details (type-specific payload):
+  SPEEDING:            {"est_speed_kmh":96.0,"speed_limit_kmh":50.0,"over_by_kmh":46.0, …}
+  SOLID_LINE_CROSSING: {"start_frame":…,"end_frame":…,"source":"cached_real_analysis", …}
+  YELLOW_LINE_RIGHT:   {"shoulder_overlap_frac":0.6, …}
+  (any event may carry "_synthetic": true and "_note": "…" — see section 9)
+
+
+--------------------------------------------------------------------------------
+7. PRIORITY / REVIEW-QUEUE ORDER (important for the dashboard + app)
+--------------------------------------------------------------------------------
+violations[] is ALREADY sorted by the brain, worst/most-urgent FIRST. Preserve that order in the
+review queue. The rule is HARD TYPE TIERS (lexicographic) — type dominates absolutely:
+
+    TIER 0  SOLID_LINE_CROSSING   (always first; within the tier: detector_confidence DESC)
+    TIER 1  SPEEDING              (within: confidence DESC, where speeding confidence is derived
+                                   from how far over the limit it was — see speeding_confidence_from_margin)
+    TIER 2  <any other type>      (within: confidence DESC)
+    TIER 3  YELLOW_LINE_RIGHT     (LAST; ordered CHRONOLOGICALLY by key_frame, no confidence ranking)
+
+Consequence to respect in UI/logic: a low-confidence crossing STILL outranks a very confident
+speeder, because TYPE wins. Confidence only breaks ties WITHIN a tier.
+
+DO NOT rank on: plate / plate_score (evidence only), or severity_weight (informational only).
+If you re-sort server-side, sort by (tier ASC, then -detector_confidence) for tiers 0/1/2, and by
+(tier ASC, key_frame ASC) for tier 3 — or just keep the array order we sent.
+
+
+--------------------------------------------------------------------------------
+8. THE PER-VIOLATION .txt and violation.json (what a reviewer sees in a folder)
+--------------------------------------------------------------------------------
+v<id>_<TYPE>.txt is a flat key=value human one-pager, e.g.:
+    vehicle_id=901
+    violation=SPEEDING
+    plate=40-418-79
+    plate_score=0.971
+    n_reads=6
+    manual_review=False
+    crossing_solid_line_confidence=None
+    tier=1
+    detector_confidence=1.0
+    est_speed_kmh=96.0
+    speed_limit_kmh=50.0
+    over_by_kmh=46.0
+    description=Vehicle 901 was speeding: ~96 km/h in a 50 km/h zone (+46 km/h over the limit).
+
+violation.json is the EXACT manifest record for that one violation (section 6). Use the .json for
+machine ingest; the .txt is for a human glancing at a single folder.
+
+
+--------------------------------------------------------------------------------
+9. WHAT IS REAL vs DEMO RIGHT NOW (please read — don't trust demo data as production)
+--------------------------------------------------------------------------------
+The local proof ran on DeNnDugXxP0.mp4, a real dashcam crossing clip. In that proof:
+  * SOLID_LINE_CROSSING violations are REAL (from a prior real analysis; 0 readable plates).
+  * SPEEDING and YELLOW_LINE_RIGHT events are SYNTHETIC, clearly flagged "_synthetic": true in
+    details. That clip has no GPS (so no real speeding) and no yellow-line event; they were injected
+    ONLY to exercise tiers 1 & 3 and the .docx so you can see the full payload shape.
+  * The speeding plate "40-418-79" (score 0.971, 6 reads) is DEMO data on the synthetic event.
+  * Because no plate was readable on this clip, the *_plate.png crops are a heuristic crop of the
+    lower-centre of the vehicle box (where a plate sits). In production the real pipeline supplies a
+    localised plate crop instead. The MEDIA SHAPE is identical either way.
+So: trust the STRUCTURE, the field names, the ordering rules, and the transport. Do NOT treat the
+demo's specific plate/speed values as real detections.
+
+
+--------------------------------------------------------------------------------
+10. WHAT YOU NEED TO IMPLEMENT ON THE BACKEND / WEB / APP  (Cloudflare model)
+--------------------------------------------------------------------------------
+Cloudflare R2 storage:
+  [ ] An R2 bucket for source videos and one (or a prefix) for evidence bundles. The Node server
+      mints PRESIGNED URLs against these; the bytes never pass through Node.
+
+MongoDB:
+  [ ] users / auth / login (unchanged).
+  [ ] a `videos` collection holding each clip's VideoMeta fingerprint (the reference for integrity)
+      + its R2 object key. The app supplies VideoMeta at capture (section 4).
+  [ ] a `violations` collection (schema in section 11) populated from the webhook's ranked index.
+
+App -> backend (capture / upload of the dashcam video):
+  [ ] App POSTs metadata (incl. VideoMeta) for a new clip; backend stores it in Mongo and returns a
+      presigned R2 PUT URL; the app uploads the video straight to Cloudflare. (App<->backend wire
+      changes only slightly — it now gets back a one-time URL instead of streaming bytes to Node.)
+
+Backend -> brain (dispatch a job — MODE B, recommended):
+  [ ] Mint a presigned GET URL for the source video (<video_url>) and a presigned PUT URL for the
+      bundle (<upload_url>), pick a <notify_url> webhook, and POST the JOB PAYLOAD
+      {job_id, video_url, video_meta, upload_url, notify_url} to the brain's POST /jobs. Mind the
+      TTL trap (section 3): give <upload_url> a generous lifetime or mint it late.
+
+Brain -> backend (completion webhook — the only inbound call you must accept):
+  [ ] POST <notify_url> handler: accept the small JSON (manifest_version, job_id, source_video,
+      bundle{object_key,object_url,bytes,sha256,...}, violation_count, ranked violations[] index).
+      Persist the violation rows from the index, then fetch the .tar.gz from R2 (object_key), verify
+      its sha256 matches `bundle.sha256`, unpack it, and store/attach each media file. Do NOT rank —
+      keep the order the index gives you (section 7).
+  [ ] (Optional, MODE A) the brain can also pull+push without /jobs if you hand it the same four
+      URLs out-of-band. The legacy multipart POST to a backend /ingest endpoint still works
+      (brain `--push-url`) if you prefer routing bytes through Node, but R2 is the target.
+
+Web dashboard:
+  [ ] Render the review queue in the order violations[] arrives (tier first). Show type, vehicle_id,
+      confidence, plate (or "UNKNOWN — manual review"), the 3 pictures + plate crops, and the clip.
+      Serve media to the browser via short-lived presigned R2 GET URLs.
+  [ ] A manual-review action for rows with manual_review=true (confirm/correct the plate).
+
+Mobile app dataset:
+  [ ] Same records; likely a lighter view (type, plate, one thumbnail, the clip, status).
+
+
+--------------------------------------------------------------------------------
+11. SUGGESTED DB / DATASET SHAPE (map straight from section 6)
+--------------------------------------------------------------------------------
+violations table (one row per violation record):
+  violation_id (PK, string)        | vehicle_id (int)      | violation (enum string)
+  tier (int 0..3)                  | key_frame (int)       | detector_confidence (float)
+  crossing_solid_line_confidence (float, nullable)
+  plate (string, nullable)         | plate_score (float)   | n_reads (int)
+  manual_review (bool)             | description (text)    | source_video (string)
+  created_utc (timestamp)          | job_id (string, nullable, MODE B)
+  details (json)                   | review_status (your column: pending/confirmed/dismissed)
+
+media table (one row per file, FK violation_id):
+  kind (clip|vehicle_pic|plate_pic|report_docx|summary_txt|record_json)
+  path/url | frame_id (nullable) | bytes | sha256
+
+Index/sort the queue on (tier ASC, detector_confidence DESC) — but yellow (tier 3) by key_frame ASC.
+
+
+--------------------------------------------------------------------------------
+12. WHERE THE CODE IS (this repo)
+--------------------------------------------------------------------------------
+The CONTRACT (brain side, portable, pure-ish stdlib — your reference for exact behaviour):
+  violations/export.py          - manifest + bundle assembly, priority/ordering, payload fields
+  violations/clip_extract.py    - the 10s (10 pre / 5 post) clip window + ffmpeg cut
+  violations/annotate_clip.py   - red box on the offending vehicle + caption burnt into the clip
+  violations/docx_report.py     - the SPEEDING .docx (stdlib OOXML, no python-docx dependency)
+  violations/video_integrity.py - VideoMeta + ffprobe fingerprint + per-hop checks
+  violations/ingest_client.py   - the brain's download + fail-fast integrity check
+  violations/event.py           - ViolationEvent / ViolationType (the violation-agnostic record)
+
+The LIVE WORKER (production entrypoint — pull -> GPU analyse -> bundle -> push/notify):
+  main.py                       - `--job-payload <json|@file>` (Cloudflare presigned pull+PUT+notify)
+                                  or `--push-url <url>` (legacy multipart). See section 14.
+
+The LOCAL DEMO (a mock of YOUR backend + the brain driver/service — read these to see the wire):
+  backend_loop_demo/mock_backend.py   - example backend: /video, /video/{name}/meta, /ingest, /dispatch
+  backend_loop_demo/run_brain.py      - brain driver (MODE A): pull -> analyse -> annotate -> push
+  backend_loop_demo/brain_server.py   - brain as a service (MODE B): POST /jobs (202) + callback
+  backend_loop_demo/README.md         - run instructions + commands
+  backend_loop_demo/test_pipeline_integration.py - opt-in end-to-end tests for BOTH modes
+
+Tests for the contract math/structure: violations/tests/  (46 fast unit tests, no GPU/ffmpeg needed).
+
+
+--------------------------------------------------------------------------------
+13. HOW TO SEE IT WORK LOCALLY (5 minutes, no GPU)
+--------------------------------------------------------------------------------
+MODE A (brain pulls + pushes):
+  Terminal 1:  python backend_loop_demo/mock_backend.py --port 8000
+  Terminal 2:  python backend_loop_demo/run_brain.py --base-url http://127.0.0.1:8000
+  Result:      a bundle + browsable *_unpacked/ folder appears in ~/Desktop/backend_received_evidence/
+
+MODE B (backend dispatches; brain calls back, async):
+  Terminal 1:  python backend_loop_demo/mock_backend.py --port 8000
+  Terminal 2:  python backend_loop_demo/brain_server.py --port 9000
+  Terminal 3:  curl -X POST http://127.0.0.1:8000/dispatch -H "Content-Type: application/json" \
+                    -d '{"brain_url":"http://127.0.0.1:9000"}'
+  Then:        poll  curl http://127.0.0.1:9000/jobs/<job_id>   ; bundle lands in the same folder.
+
+Automated proof of both modes (opt-in, heavier — needs ffmpeg + the sample video):
+  ROADGUARD_RUN_INTEGRATION=1 pytest backend_loop_demo/test_pipeline_integration.py -s
+
+
+--------------------------------------------------------------------------------
+14. OPEN ITEMS / NOT DONE YET (so you know the seams)
+--------------------------------------------------------------------------------
+  - DONE (2026-06-25): the contract is now WIRED into the live GPU pipeline. main.py runs as an
+    autonomous worker node: `python main.py --job-payload <json|@file>` where the JSON is the job
+    payload {job_id, video_url, video_meta, upload_url, notify_url}. It PULLS the clip from the
+    presigned video_url, FAIL-FAST verifies it against video_meta, runs a fresh GPU analysis, then
+    PUTs the evidence bundle to the presigned upload_url and POSTs the webhook to notify_url
+    (Option B). `--push-url <url>` instead does the legacy multipart POST. No flag => normal local
+    run, no network. (The backend_loop_demo/ MODE-B brain_server.py service path still exists too.)
+  - There is no real remote backend yet — only the local mock. Your job is to build the real one to
+    the spec in sections 4–6 and 10, plus the Cloudflare R2 buckets + presigned-URL minting.
+  - SPEEDING needs a clip WITH GPS to produce a genuine event (the demo's speeding was synthetic).
+  - AUTH/idempotency are not specified yet: /ingest currently takes no auth token. Decide on an
+    auth header + an idempotency key (e.g. job_id or violation_id) so retried uploads de-duplicate.
+  - manifest_version is "2.0"; treat it as a compatibility gate (reject/transform unknown majors).
+
+Questions about the contract? The single source of truth is violations/export.py (build_export) and
+the manifest it emits — when in doubt, build a bundle locally (section 13) and read the real JSON.
+================================================================================
