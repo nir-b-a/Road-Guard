@@ -20,8 +20,10 @@ Everything below is implemented and tested in this repo. Code pointers are in se
   the "brain" (GPU vision). For each detected violation the brain produces an EVIDENCE PACKAGE and
   ships it to YOUR backend for human review + storage + display in the web/app.
 
-- The transport is ONE gzip tarball ("the bundle", `violations.tar.gz`) POSTed to your backend as
-  multipart/form-data. Inside it: a top-level `manifest.json` (the machine-readable index, RANKED)
+- The transport is ONE gzip tarball ("the bundle", `violations.tar.gz`). In the target architecture
+  (section 3) the brain PUTs it straight to Cloudflare (R2) via a presigned URL and POSTs a small
+  webhook to your backend; a legacy multipart POST through your server is still supported. Inside the
+  tarball: a top-level `manifest.json` (the machine-readable index, RANKED)
   plus ONE FOLDER PER VIOLATION, each self-contained:
       v<vehicleId>_<TYPE>_f<frame>/
         clip.mp4                         <- 10s annotated clip (red box on the offending vehicle)
@@ -81,42 +83,79 @@ What is NOT done yet: wiring this into the live GPU pipeline (main.py), and a re
 
 
 --------------------------------------------------------------------------------
-3. THE TWO INTEGRATION MODES (pick one; both work today)
+3. INTEGRATION FLOW — CLOUDFLARE PRESIGNED URLS (updated 2026-06-25)
 --------------------------------------------------------------------------------
-MODE A — BRAIN-INITIATED (brain pulls, then pushes). Simplest.
-    brain  GET  {backend}/video/{name}/meta      -> reference VideoMeta (for integrity)
-    brain  GET  {backend}/video/{name}           -> the raw video bytes
-    brain  ...analyse...
-    brain  POST {backend}/ingest                 -> the bundle (multipart). Done.
+ARCHITECTURE CHANGE: the Node backend NO LONGER stores or serves the media bytes. Videos AND the
+evidence bundles live in Cloudflare (R2). The backend's job is to hold METADATA (in MongoDB) and to
+hand out one-time PRESIGNED URLs; the heavy bytes flow directly between the brain and Cloudflare and
+NEVER transit the Node server. Mongo still backs users / login / the violation records.
+
+There are no longer any {backend}/video/{name} or {backend}/video/{name}/meta endpoints. A presigned
+URL is a single opaque signed string — the brain uses it verbatim and never appends a path to it.
+
+MODE A — BRAIN-INITIATED (brain pulls, then uploads). Simplest.
+    brain   GET  <video_url>            (presigned R2 GET, from the backend)  -> raw video bytes
+    brain   ...analyse...
+    brain   PUT  <upload_url>           (presigned R2 PUT)  -> the bundle .tar.gz bytes (Cloudflare)
+    brain   POST <notify_url>           (backend webhook)   -> small JSON: object key + sha256 +
+                                                               ranked violation index (NOT the bytes)
+  (To start the work the brain needs <video_url> + the reference video_meta + <upload_url> +
+   <notify_url> — i.e. a JOB PAYLOAD, section 6. The backend mints these and hands them over.)
 
 MODE B — BACKEND-INITIATED (you dispatch a job; brain calls back). Realistic for production,
 because real analysis is minutes of GPU and you don't want to block. ASYNC (202 + callback):
-    backend POST {brain}/jobs {video_name, source_base_url, callback_url, job_id}  -> 202 Accepted
-    brain   GET  {source_base_url}/video/{name}/meta + /video/{name}               (pull + verify)
+    backend POST {brain}/jobs  <JOB PAYLOAD>                                   -> 202 Accepted
+            JOB PAYLOAD = {job_id, video_url, video_meta, upload_url, notify_url}
+    brain   GET  <video_url>            (presigned R2 GET)  -> pull + FAIL-FAST verify (section 4)
     brain   ...analyse...
-    brain   POST {callback_url}  (= your /ingest)  -> the bundle, tagged with job_id
+    brain   PUT  <upload_url>           (presigned R2 PUT)  -> the bundle .tar.gz to Cloudflare
+    brain   POST <notify_url>           (your webhook)      -> completion JSON, tagged with job_id
     (you can poll GET {brain}/jobs/{job_id} for status: accepted|running|done|error)
 
-In BOTH modes the bundle that lands on /ingest is byte-for-byte the same structure (sections 5–6).
+BUNDLE DESTINATION — "Option B" (this is what the brain implements):
+  The bundle (the SAME .tar.gz structure as sections 5–6) is PUT straight to Cloudflare via the
+  presigned <upload_url>; then a LIGHTWEIGHT webhook (<notify_url>) tells the backend it's there.
+  The webhook body carries: manifest_version, job_id, source_video, bundle{object_key, object_url,
+  bytes, sha256, content_type, filename}, violation_count, and a compact ranked violations[] index
+  (violation_id, violation, tier, vehicle_id, detector_confidence, plate, manual_review). The
+  backend persists rows from that index immediately and fetches/unpacks the tarball from R2 when it
+  wants the media. (The legacy multipart POST of the whole tarball to a backend /ingest endpoint is
+  still supported by the brain — `--push-url` / `post_bundle` — but is NOT the target architecture.)
+
+⚠ PRESIGNED-URL TTL TRAP: mint <upload_url> with a generous TTL, or mint it AFTER analysis. If you
+create it at job dispatch and GPU analysis takes minutes, the PUT URL can EXPIRE before the brain
+uploads. Same applies to <video_url> vs. how long the job sits queued.
 
 
 --------------------------------------------------------------------------------
-4. THE INTEGRITY HANDSHAKE (why /video/{name}/meta exists)
+4. THE INTEGRITY HANDSHAKE (reference fingerprint now travels IN THE JOB PAYLOAD)
 --------------------------------------------------------------------------------
-You (the backend) hold the ORIGINAL video, so you are the source of truth for its fingerprint.
-  * Expose GET /video/{name}/meta returning the reference VideoMeta (run ffprobe once; see schema
-    in section 6 under source_video). Include sha256 of the file.
-  * The brain re-probes its downloaded copy and compares (resolution, fps, frame_count, sha256). If
-    the transfer lost fidelity (truncation, a recompressing proxy, downscale), the brain FAILS FAST
-    before burning GPU time — and can tell you which hop broke it.
-  * A faithful transfer is byte-identical, so a sha256 mismatch == something tampered with the bytes.
-This is optional for a first integration, but if you serve /video you should also serve /meta.
+The backend no longer holds the video bytes, so it is no longer the byte source — but it IS still the
+source of truth for the reference fingerprint, which now lives in MongoDB and is handed to the brain
+INSIDE the job payload as `video_meta` (NOT fetched from a /meta endpoint, which no longer exists).
+  * Where video_meta comes from: the mobile app computes the VideoMeta (resolution / fps / frame
+    count / sha256) at capture and sends it as metadata when it requests an upload URL; the backend
+    stores it in Mongo. (Cloudflare's object etag/checksum is an acceptable secondary source.)
+  * The brain downloads from the presigned <video_url>, re-probes its local copy, and compares it to
+    `video_meta` (resolution, fps, frame_count, sha256). If the transfer lost fidelity (truncation,
+    a recompressing proxy, a downscale), the brain FAILS FAST before burning GPU time, and can tell
+    you which hop broke it. A faithful transfer is byte-identical, so a sha256 mismatch == the bytes
+    were tampered with / corrupted in transit.
+  * This is the DOWNLOAD-hop guard rail only; the backend should still verify the uploaded bundle's
+    sha256 (sent in the webhook) against the R2 object it stored.
+Include `video_meta` in every job payload. A job with no reference fingerprint cannot be verified and
+the brain treats that as a hard error (it will not silently skip the guard rail).
 
 
 --------------------------------------------------------------------------------
-5. THE BUNDLE — exactly what you receive on /ingest
+5. THE BUNDLE — exactly what is in the .tar.gz (same bytes either transport)
 --------------------------------------------------------------------------------
-Transport: HTTP POST, multipart/form-data, to your /ingest endpoint.
+Target transport (section 3): the brain PUTs the .tar.gz to Cloudflare via the presigned <upload_url>
+and POSTs the completion webhook to <notify_url>. The webhook tells you the object_key + sha256 so
+you fetch + verify the tarball from R2. The CONTENTS below are identical regardless of transport.
+
+Legacy transport (still supported, brain `--push-url`): HTTP POST, multipart/form-data, to a backend
+/ingest endpoint.
   - File part field name: "bundle"   (filename "violations.tar.gz", content-type application/gzip)
   - Sibling form fields: "manifest_version" (e.g. "2.0"), "source_video" (the video name),
     and "job_id" (present in MODE B so you can correlate the callback to the job you dispatched).
@@ -294,24 +333,43 @@ demo's specific plate/speed values as real detections.
 
 
 --------------------------------------------------------------------------------
-10. WHAT YOU NEED TO IMPLEMENT ON THE BACKEND / WEB / APP
+10. WHAT YOU NEED TO IMPLEMENT ON THE BACKEND / WEB / APP  (Cloudflare model)
 --------------------------------------------------------------------------------
-Minimum to integrate (MODE A):
-  [ ] GET  /video/{name}            -> stream the raw video bytes (so the brain can pull it)
-  [ ] GET  /video/{name}/meta       -> JSON VideoMeta (ffprobe of your stored original; section 4/6)
-  [ ] POST /ingest                  -> accept multipart (file field "bundle" + form fields
-                                       manifest_version, source_video, job_id?). Store the tarball,
-                                       unpack it, parse manifest.json, persist each violation row +
-                                       its media, verify sha256s.
+Cloudflare R2 storage:
+  [ ] An R2 bucket for source videos and one (or a prefix) for evidence bundles. The Node server
+      mints PRESIGNED URLs against these; the bytes never pass through Node.
 
-To also support MODE B (recommended for production, async):
-  [ ] A job dispatcher that POSTs {video_name, source_base_url, callback_url, job_id} to the brain's
-      POST /jobs, where source_base_url is where the brain pulls the video and callback_url is your
-      /ingest. (The brain returns 202 and calls back when done; poll GET /jobs/{id} if you want.)
+MongoDB:
+  [ ] users / auth / login (unchanged).
+  [ ] a `videos` collection holding each clip's VideoMeta fingerprint (the reference for integrity)
+      + its R2 object key. The app supplies VideoMeta at capture (section 4).
+  [ ] a `violations` collection (schema in section 11) populated from the webhook's ranked index.
+
+App -> backend (capture / upload of the dashcam video):
+  [ ] App POSTs metadata (incl. VideoMeta) for a new clip; backend stores it in Mongo and returns a
+      presigned R2 PUT URL; the app uploads the video straight to Cloudflare. (App<->backend wire
+      changes only slightly — it now gets back a one-time URL instead of streaming bytes to Node.)
+
+Backend -> brain (dispatch a job — MODE B, recommended):
+  [ ] Mint a presigned GET URL for the source video (<video_url>) and a presigned PUT URL for the
+      bundle (<upload_url>), pick a <notify_url> webhook, and POST the JOB PAYLOAD
+      {job_id, video_url, video_meta, upload_url, notify_url} to the brain's POST /jobs. Mind the
+      TTL trap (section 3): give <upload_url> a generous lifetime or mint it late.
+
+Brain -> backend (completion webhook — the only inbound call you must accept):
+  [ ] POST <notify_url> handler: accept the small JSON (manifest_version, job_id, source_video,
+      bundle{object_key,object_url,bytes,sha256,...}, violation_count, ranked violations[] index).
+      Persist the violation rows from the index, then fetch the .tar.gz from R2 (object_key), verify
+      its sha256 matches `bundle.sha256`, unpack it, and store/attach each media file. Do NOT rank —
+      keep the order the index gives you (section 7).
+  [ ] (Optional, MODE A) the brain can also pull+push without /jobs if you hand it the same four
+      URLs out-of-band. The legacy multipart POST to a backend /ingest endpoint still works
+      (brain `--push-url`) if you prefer routing bytes through Node, but R2 is the target.
 
 Web dashboard:
   [ ] Render the review queue in the order violations[] arrives (tier first). Show type, vehicle_id,
       confidence, plate (or "UNKNOWN — manual review"), the 3 pictures + plate crops, and the clip.
+      Serve media to the browser via short-lived presigned R2 GET URLs.
   [ ] A manual-review action for rows with manual_review=true (confirm/correct the plate).
 
 Mobile app dataset:
@@ -349,6 +407,10 @@ The CONTRACT (brain side, portable, pure-ish stdlib — your reference for exact
   violations/ingest_client.py   - the brain's download + fail-fast integrity check
   violations/event.py           - ViolationEvent / ViolationType (the violation-agnostic record)
 
+The LIVE WORKER (production entrypoint — pull -> GPU analyse -> bundle -> push/notify):
+  main.py                       - `--job-payload <json|@file>` (Cloudflare presigned pull+PUT+notify)
+                                  or `--push-url <url>` (legacy multipart). See section 14.
+
 The LOCAL DEMO (a mock of YOUR backend + the brain driver/service — read these to see the wire):
   backend_loop_demo/mock_backend.py   - example backend: /video, /video/{name}/meta, /ingest, /dispatch
   backend_loop_demo/run_brain.py      - brain driver (MODE A): pull -> analyse -> annotate -> push
@@ -381,11 +443,15 @@ Automated proof of both modes (opt-in, heavier — needs ffmpeg + the sample vid
 --------------------------------------------------------------------------------
 14. OPEN ITEMS / NOT DONE YET (so you know the seams)
 --------------------------------------------------------------------------------
-  - The contract is NOT yet wired into the live GPU pipeline (main.py). In production the real
-    pipeline emits ViolationEvent + EvidenceResult and feeds the SAME violations/export.py — so the
-    bundle/manifest/transport you integrate against will be identical; only the data source changes.
+  - DONE (2026-06-25): the contract is now WIRED into the live GPU pipeline. main.py runs as an
+    autonomous worker node: `python main.py --job-payload <json|@file>` where the JSON is the job
+    payload {job_id, video_url, video_meta, upload_url, notify_url}. It PULLS the clip from the
+    presigned video_url, FAIL-FAST verifies it against video_meta, runs a fresh GPU analysis, then
+    PUTs the evidence bundle to the presigned upload_url and POSTs the webhook to notify_url
+    (Option B). `--push-url <url>` instead does the legacy multipart POST. No flag => normal local
+    run, no network. (The backend_loop_demo/ MODE-B brain_server.py service path still exists too.)
   - There is no real remote backend yet — only the local mock. Your job is to build the real one to
-    the spec in sections 4–6 and 10.
+    the spec in sections 4–6 and 10, plus the Cloudflare R2 buckets + presigned-URL minting.
   - SPEEDING needs a clip WITH GPS to produce a genuine event (the demo's speeding was synthetic).
   - AUTH/idempotency are not specified yet: /ingest currently takes no auth token. Decide on an
     auth header + an idempotency key (e.g. job_id or violation_id) so retried uploads de-duplicate.

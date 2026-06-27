@@ -433,7 +433,9 @@ def evaluate_yellow_line(world: World, seg_frames: list, video_path: str, video_
                          frame_width: int, frame_height: int, total_frames: int, fps: float,
                          once_per_vehicle: bool = False):
     """Run the yellow-line (shoulder) detector over the live-built lane cache.
-    Returns (events, recs, incidents). Empty if disabled or no frames."""
+    Returns (events, recs, incidents). Empty if disabled or no frames.
+
+    once_per_vehicle: report shoulder-driving STRICTLY ONCE per vehicle (Tal's baseline rule)."""
     if not (_YELLOW_IMPORT_OK and seg_frames):
         return [], {}, []
     cache = {"prefix": video_name, "path": video_path, "fps": fps,
@@ -482,6 +484,56 @@ def overspeed_to_events(overspeed_events: list) -> list:
                      "over_by_kmh": e.over_by_kmh, "n_frames_over": e.n_frames_over},
         ))
     return out
+
+
+def speeding_to_events(speeding_events: list) -> list:
+    """Convert SpeedingEvent (fixed-limit, simulated) -> generic ViolationEvent.
+
+    key_frame is the ONSET frame (the red-box "report once" moment); details carries the episode
+    bounds + the peak speed reached inside the limit zone (max_speed_kmh)."""
+    out = []
+    for e in speeding_events:
+        out.append(ViolationEvent(
+            vehicle_id=e.vehicle_id,
+            violation_type=ViolationType.SPEEDING,
+            key_frame=e.onset_frame,
+            confidence=1.0,
+            details={"est_speed_kmh": e.est_speed_kmh, "max_speed_kmh": e.max_speed_kmh,
+                     "speed_limit_kmh": e.speed_limit_kmh, "over_by_kmh": e.over_by_kmh,
+                     "start_frame": e.start_frame, "end_frame": e.end_frame,
+                     "n_frames_over": e.n_frames_over},
+        ))
+    return out
+
+
+def evaluate_crossing(seg_frames: list, fps: float, frame_height: int, frame_width: int) -> list:
+    """Solid-line CROSSING detector, wired live off the SAME per-frame lane-seg cache the yellow
+    rule already builds (seg_frames: [{frame, vehicles, lanes, shift}, ...]).
+
+    Reuses the offline harness machinery: ghost/verdict timeline -> K-consecutive on-line runs ->
+    per-vehicle 3 s cooldown (merge_events). A new on-line stretch >3 s after the previous one
+    re-fires (the practical proxy for "crossed another distinct solid line"). Returns one
+    ViolationEvent(SOLID_LINE_CROSSING) per incident, keyed at the incident onset frame."""
+    if not (_YELLOW_IMPORT_OK and seg_frames):
+        return []
+    shifts = [fr.get("shift", [0.0, 0.0]) for fr in seg_frames]
+    timeline = compute_verdict_timeline(seg_frames, shifts, frame_height, frame_width, fps,
+                                        ttl_sec=0.5, phantom_min_sec=0.0)
+    k_consec = max(1, round(0.05 * fps))            # recall-first: ~1-2 frames on the line
+    incidents = merge_events(events_from_timeline(timeline, k_consec), fps, cooldown_sec=3.0)
+    events = []
+    for tid, s, e in incidents:
+        # confidence=1.0 (binary) here because the timeline path has no bbox depth.
+        # When Stage-2 cascade is wired in, use decision.crossing_confidence instead.
+        events.append(ViolationEvent(
+            vehicle_id=tid,
+            violation_type=ViolationType.SOLID_LINE_CROSSING,
+            key_frame=s,
+            confidence=1.0,
+            details={"start_frame": s, "end_frame": e, "n_frames_over": e - s + 1},
+        ))
+    print(f"[crossing] {len(incidents)} solid-line crossing incident(s) -> ViolationEvent(s)")
+    return events
 
 
 def run_evidence_and_report(world: World, all_events: list, out_dir: str, video_name: str):
@@ -564,12 +616,13 @@ def write_perframe_and_tracks(world: World, all_frame_vehicles: dict, recs: dict
 
 
 # --------------------------------------------------------------------------- #
-# Backend export -- bundle each violation and push to backend.
-# Behind --push-url / --job-payload; a normal run is a no-op here.
+# Backend export -- bundle each violation (annotated clip + 3 pics + plate crops + speeding .docx)
+# and push it to the backend. Behind --push-url / --job-payload; a normal run is a no-op here.
 # --------------------------------------------------------------------------- #
 def _load_job_payload():
-    """--job-payload <json|@file.json>: the backend job (Cloudflare presigned upload_url /
-    notify_url, job_id, and optional reference video_meta). Returns the parsed dict, or None."""
+    """--job-payload <json|@file.json>: the backend job (Cloudflare presigned upload_url / notify_url,
+    job_id, and optional reference video_meta). Returns the parsed dict, or None if absent/invalid."""
+
     raw = _cli_value("--job-payload", None)
     if not raw:
         return None
@@ -584,6 +637,10 @@ def _load_job_payload():
 
 
 def _video_meta_dict(job, video_path, frame_w, frame_h, fps, total_frames):
+    """Reference VideoMeta for the manifest. Prefer the fingerprint the backend put in the job
+    payload (from its DB / Cloudflare); otherwise synthesise one from what the live run already
+    knows (no ffprobe dependency on the hot path -- sha256/codec left null)."""
+
     if job and job.get("video_meta"):
         return dict(job["video_meta"])
     return {"filename": os.path.basename(video_path), "width": int(frame_w),
@@ -593,12 +650,20 @@ def _video_meta_dict(job, video_path, frame_w, frame_h, fps, total_frames):
 
 
 def pull_job_video(job: dict):
-    """Worker-node PULL+VERIFY step: download the source clip from the job's presigned
-    Cloudflare GET URL and fail-fast check it against the reference fingerprint."""
+    """Worker-node PULL+VERIFY step: download the source clip from the job's presigned Cloudflare
+    GET URL and fail-fast check it against the reference fingerprint carried in the job payload.
+
+    Returns ``(local_video_path, reference_meta_dict, work_dir)``. Raises (IntegrityError / HTTP /
+    ValueError) on a corrupt download or a job missing video_url/video_meta -- the worker SHOULD die
+    here, before burning GPU on a bad clip. The download needs ``requests`` (lazy) + ``ffprobe`` for
+    the verify; both live in violations.ingest_client / video_integrity."""
+
     import tempfile
     from violations import ingest_client
 
     job_id = str(job.get("job_id") or "job")
+    # Name the local file from the explicit job field, else the URL path (sans query string).
+
     name = job.get("video_name") \
         or os.path.basename((job.get("video_url") or "video.mp4").split("?")[0]) \
         or "video.mp4"
@@ -614,10 +679,17 @@ def pull_job_video(job: dict):
 def export_and_push_violations(world: World, results_by_event: list, *, job: dict | None,
                                video_path: str, video_name: str, fps: float, frame_w: int,
                                frame_h: int, total_frames: int, out_dir: str):
-    """Assemble the prioritised evidence bundle for every violation and upload it to the backend."""
+    """Assemble the prioritised evidence bundle for every violation and upload it to the backend.
+
+    Triggered ONLY by --push-url (legacy multipart POST through the Node server) or --job-payload
+    (Cloudflare: presigned PUT of the .tar.gz + a lightweight webhook notify). No flag -> no-op.
+    ``job`` is the already-parsed --job-payload dict (or None). Reuses the same EvidenceResult (plate
+    + crops) the evidence stage already collected, so no video re-read for the pictures. RECALL-FIRST:
+    a clip/.docx that fails to render is skipped and the violation is still shipped."""
     push_url = _cli_value("--push-url", None)
     if not push_url and not job:
-        return
+        return                                       # standard run -- no backend export
+
     if not _EXPORT_IMPORT_OK:
         print("[export] --push-url/--job-payload set but violations.export is unavailable; skipped")
         return
@@ -633,7 +705,8 @@ def export_and_push_violations(world: World, results_by_event: list, *, job: dic
         win = clip_window(event.key_frame, fps, total_frames=total_frames)
         stem = vx.violation_id(event)
         clip = None
-        try:
+        try:                                         # annotated clip: red box on the offending car + caption
+
             clip = annotate_clip(video_path, os.path.join(out_dir, f"{stem}.mp4"), win,
                                  box_for_frame=boxes.get,
                                  caption=vx.describe_violation(event), fps=fps,
@@ -661,14 +734,16 @@ def export_and_push_violations(world: World, results_by_event: list, *, job: dic
           f"{len(targz):,} bytes -> {bundle_path}\n[export] queue order: {queue}")
 
     job_id = (job or {}).get("job_id")
-    if job and job.get("upload_url"):
+    if job and job.get("upload_url"):                # Cloudflare presigned PUT + webhook notify
+
         res = vx.upload_bundle_presigned(
             job["upload_url"], bundle, notify_url=job.get("notify_url"), job_id=job_id,
             source_video=video_name, object_key=job.get("object_key"),
             object_url=job.get("object_url"))
         print(f"[export] presigned PUT -> {res.put.status_code} (ok={res.put.ok}); "
               f"notify -> {(res.notify.status_code if res.notify else 'skipped')}")
-    elif push_url:
+    elif push_url:                                   # legacy multipart POST through the Node server
+
         extra = {"source_video": video_name}
         if job_id:
             extra["job_id"] = job_id
@@ -690,7 +765,10 @@ def main():
     # ── Worker-node mode (--job-payload) ──────────────────────────────────────
     # When the backend dispatches a job carrying a presigned video_url, this process behaves as an
     # autonomous worker: PULL the clip from Cloudflare + FAIL-FAST verify it against the job's
-    # reference fingerprint BEFORE any GPU work.
+    # reference fingerprint BEFORE any GPU work. Without a video_url it falls back to the local
+    # positional path (sys.argv[1]) -- the standard/baseline invocation is unchanged. The same job
+    # dict is threaded to the export stage so the bundle is PUSHED + NOTIFIED at the end.
+
     job = _load_job_payload()
     job_work_dir = None
     if job and job.get("video_url"):
@@ -849,9 +927,28 @@ def main():
         image_width=frame_width, image_height=frame_height,
         valid_roi=valid_roi)
 
-    # ── 7.5 Overspeed (android-only; needs the ego GPS track as the limit proxy) ──
-    overspeed_events = []
-    if is_android and "--no-overspeed" not in sys.argv:
+    # ── 7.0 Simulated speeds (offline baseline; replaces the unavailable world-frame estimate) ──
+    # Deterministic per-vehicle speeds so the speeding rule + the speed report are exercised and
+    # REPRODUCIBLE for the optimization baseline diff. Assigned after gap-fill so interpolated
+    # frames are covered too. Also feeds the shoulder rule's real speed gate.
+    if sim_speed:
+        simulated_speed.assign_simulated_speeds(world, fps)
+
+    # ── 7.5 Speeding ──────────────────────────────────────────────────────────
+    # --sim-speed: fixed posted limit (100) with the 110 violation line, report-once-at-onset +
+    # 30 s per-vehicle cooldown + max-speed-in-zone. Otherwise the legacy android GPS-proxy path.
+    overspeed_events = []      # OverspeedEvent (android path)
+    speeding_events = []       # SpeedingEvent  (sim path)
+    if sim_speed:
+        speeding_events = overspeed.flag_speeding_fixed_limit(
+            world,
+            limit_kmh=simulated_speed.SIM_LIMIT_KMH,
+            threshold_kmh=simulated_speed.SIM_SPEEDING_THRESHOLD_KMH,
+            fps=fps)
+        print(f"[speeding] {len(speeding_events)} speeding episode(s) "
+              f"(limit={simulated_speed.SIM_LIMIT_KMH:.0f}, "
+              f">={simulated_speed.SIM_SPEEDING_THRESHOLD_KMH:.0f} km/h)")
+    elif is_android and "--no-overspeed" not in sys.argv:
         try:
             margin = float(_cli_value("--overspeed-margin", overspeed.OVERSPEED_MARGIN_KMH))
             ego_track = overspeed.build_ego_track(frames_csv, gps_csv)
@@ -865,20 +962,25 @@ def main():
         except Exception as e:
             print(f"[overspeed] skipped (lookup/parse failed): {e}")
 
-    # ── 7.6 Yellow-line (shoulder) violation ─────────────────────────────────
+    # ── 7.6 Yellow-line (shoulder) violation -- strictly once per vehicle in baseline mode ──
     yellow_events, recs, incidents = evaluate_yellow_line(
         world, seg_frames, video_path, video_name,
-        frame_width, frame_height, frame_id, fps)
+        frame_width, frame_height, frame_id, fps, once_per_vehicle=sim_speed)
 
-    # ── 7.65 Solid-line crossing violation ───────────────────────────────────
+    # ── 7.65 Solid-line crossing violation (wired off the same lane-seg cache) ──
     crossing_events = evaluate_crossing(seg_frames, fps, frame_height, frame_width)
 
-    # ── 7.7 Evidence stage over ALL violations ────────────────────────────────
-    all_events = crossing_events + overspeed_to_events(overspeed_events) + yellow_events
+    # ── 7.7 Evidence stage over ALL violations (crossing + speeding + yellow), one record shape ──
+    all_events = (crossing_events
+                  + speeding_to_events(speeding_events) + overspeed_to_events(overspeed_events)
+                  + yellow_events)
     results_by_event = run_evidence_and_report(world, all_events, out_dir, video_name)
     write_perframe_and_tracks(world, all_frame_vehicles, recs, incidents, out_dir, video_name, fps)
 
-    # ── 7.75 Backend export (opt-in) ─────────────────────────────────────────
+    # ── 7.75 Backend export (opt-in): bundle each violation's clip + 3 pics + .docx and push it ──
+    # --push-url (legacy multipart) or --job-payload (Cloudflare presigned PUT + webhook). No-op
+    # otherwise, so the standard/baseline run is unchanged and never touches the network.
+
     export_and_push_violations(
         world, results_by_event, job=job, video_path=video_path, video_name=video_name, fps=fps,
         frame_w=frame_width, frame_h=frame_height, total_frames=frame_id, out_dir=out_dir)

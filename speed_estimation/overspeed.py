@@ -151,6 +151,94 @@ def flag_overspeed_vehicles(world,
     return events
 
 
+@dataclass
+class SpeedingEvent:
+    """One speeding EPISODE for one vehicle against a FIXED posted limit (the offline-baseline
+    path -- no GPS limit lookup). Reported ONCE at the onset frame; carries the episode bounds and
+    the peak speed reached inside that limit zone."""
+    vehicle_id: int
+    onset_frame: int          # the frame the offence began -> the "report once" key frame
+    start_frame: int          # episode bounds (== onset_frame, kept explicit for the report)
+    end_frame: int
+    est_speed_kmh: float      # speed at the onset frame
+    max_speed_kmh: float      # PEAK speed reached during the episode (within the limit zone)
+    speed_limit_kmh: float
+    over_by_kmh: float        # max_speed - limit
+    n_frames_over: int
+
+
+def flag_speeding_fixed_limit(world,
+                              *,
+                              limit_kmh: float,
+                              threshold_kmh: float,
+                              fps: float,
+                              cooldown_sec: float = 30.0,
+                              gap_close_sec: float = 0.5,
+                              min_frames_over: int = 1) -> list[SpeedingEvent]:
+    """Flag speeding against a FIXED limit, using each vehicle's ``speed_per_frame`` (m/s).
+
+    Unlike :func:`flag_overspeed_vehicles` (which needs a per-frame GPS-derived limit), this uses
+    one posted ``limit_kmh`` for the whole clip -- the offline simulation/baseline scenario.
+
+    Logic per vehicle (Tal's spec):
+      * an "over" frame is one whose speed >= ``threshold_kmh`` (= limit * 1.1, the violation line),
+      * consecutive over-frames form an EPISODE; a gap of up to ``gap_close_sec`` is bridged so a
+        one-frame dip doesn't split one offence into two,
+      * the episode is REPORTED ONCE at its onset frame (the red-box trigger moment),
+      * ``max_speed_kmh`` is the PEAK speed over the whole episode (the value the data report keeps
+        "within that specific speed limit zone"),
+      * a 30 s per-vehicle COOLDOWN (``cooldown_sec``) suppresses a fresh report that starts within
+        that window of the previous episode's onset.
+
+    Returns one SpeedingEvent per reported episode, sorted by onset frame.
+    """
+    gap = max(0, round(gap_close_sec * fps))
+    cooldown = cooldown_sec * fps
+    events: list[SpeedingEvent] = []
+
+    for vid, vehicle in world.vehicles.items():
+        # frames where this vehicle is over the violation line, in time order
+        over_frames = sorted(f for f, sp in vehicle.speed_per_frame.items()
+                             if sp is not None and sp * MPS_TO_KMH >= threshold_kmh)
+        if not over_frames:
+            continue
+
+        # group into episodes, bridging gaps <= gap frames
+        episodes: list[list[int]] = []
+        cur = [over_frames[0]]
+        for f in over_frames[1:]:
+            if f - cur[-1] <= gap + 1:
+                cur.append(f)
+            else:
+                episodes.append(cur)
+                cur = [f]
+        episodes.append(cur)
+
+        last_onset = None
+        for ep in episodes:
+            start, end = ep[0], ep[-1]
+            if last_onset is not None and (start - last_onset) <= cooldown:
+                continue                       # within the per-vehicle cooldown -> not re-reported
+            last_onset = start
+            # peak speed across the CONTIGUOUS span of the episode (not just the over-frames),
+            # so the recorded max reflects everything the car did during the offence window.
+            span_speeds = [vehicle.speed_per_frame[f] * MPS_TO_KMH
+                           for f in range(start, end + 1)
+                           if f in vehicle.speed_per_frame and vehicle.speed_per_frame[f] is not None]
+            max_kmh = max(span_speeds) if span_speeds else threshold_kmh
+            onset_kmh = vehicle.speed_per_frame[start] * MPS_TO_KMH
+            if len(ep) < min_frames_over:
+                continue
+            events.append(SpeedingEvent(
+                vehicle_id=vid, onset_frame=start, start_frame=start, end_frame=end,
+                est_speed_kmh=round(onset_kmh, 1), max_speed_kmh=round(max_kmh, 1),
+                speed_limit_kmh=round(limit_kmh, 1),
+                over_by_kmh=round(max_kmh - limit_kmh, 1), n_frames_over=len(ep)))
+
+    events.sort(key=lambda e: e.onset_frame)
+    return events
+
+
 def format_overspeed_report(events: list[OverspeedEvent]) -> str:
     """Human-readable summary: which vehicle, where, by how much (km/h)."""
     if not events:

@@ -81,6 +81,40 @@ ground_distance/
 # --- Cloned, not-on-PyPI framework (install editable; never commit) -----------
 UnLanedet/
 
+# --- Tire training pipeline (data + training scripts, not final outcome) ------
+tyres_dataset/
+tyres_dataset_raw_backup/
+runs/
+train_tire.py
+tools/tire_pipeline/
+tools/clean_tire_dataset.py
+tools/mine_tire_crops.py
+tools/upload_tire_roboflow.py
+
+# --- Baseline run artifacts ---------------------------------------------------
+baseline_violations.json
+baseline_other_vehicles_speed.json
+
+# --- Handoff / brief docs (one-off, not final code) --------------------------
+CASCADE_STAGE2_HANDOFF.md
+GEMINI_BRIEF.md
+
+# --- Cascade dev/analysis tools (sweep/visualize/report, not final pipeline) -
+optimize_cascade_parameters.py
+tools/cascade_tp_fp_report.py
+tools/cascade_visualizer.py
+
+# --- Simulation / baseline helpers (offline-only, not final pipeline) ---------
+speed_estimation/simulated_speed.py
+violations/baseline_report.py
+organize_videos.py
+
+# --- Colab / comparison / debug tools (dev use only) -------------------------
+tools/colab_detector_ab_test.py
+tools/compare_speed_tables.py
+tools/debug_shoulder_overlay.py
+tools/test_lpr_evidence.py
+
 # --- Secrets ------------------------------------------------------------------
 .env
 *.env

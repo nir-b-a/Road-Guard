@@ -524,3 +524,150 @@ def post_bundle(url: str, bundle: ExportBundle | bytes, *,
     status = int(getattr(resp, "status_code", 0))
     text = getattr(resp, "text", "") or ""
     return IngestResponse(ok=200 <= status < 300, status_code=status, body=text)
+
+
+# --------------------------------------------------------------------------- #
+# OPTION B -- Cloudflare presigned-URL upload (the architecture we now build to).
+#
+# The backend no longer stores the bytes: it issues a one-time presigned PUT URL (R2/S3) for the
+# bundle and a lightweight webhook to be told the upload finished + the metadata. So instead of
+# POSTing the heavy tarball THROUGH the Node server (`post_bundle`), the brain PUTs the tarball
+# straight to object storage, then POSTs a small JSON notification to the backend.
+#
+#   1. put_bundle(presigned_put_url, bundle)   -> raw HTTP PUT of the .tar.gz to Cloudflare
+#   2. notify_backend(webhook_url, metadata)   -> small JSON POST to the Node server
+#   upload_bundle_presigned(...)               -> does both and returns both outcomes
+#
+# TTL trap (document for the backend): mint the upload URL AFTER analysis (or with a generous TTL).
+# If the PUT URL is created at job dispatch but GPU analysis takes minutes, the URL can expire
+# before the brain uploads. See the handoff doc section 3.
+# --------------------------------------------------------------------------- #
+def put_bundle(presigned_url: str, bundle: ExportBundle | bytes, *,
+               session: Any = None,
+               content_type: str = "application/gzip",
+               headers: Optional[dict] = None,
+               timeout: float = 120.0) -> IngestResponse:
+    """HTTP PUT the compressed bundle straight to a presigned object-storage URL (Cloudflare R2 /
+    S3). The bundle bytes are the raw request body -- NOT multipart (presigned PUT takes the object
+    bytes verbatim). ``presigned_url`` is used exactly as given (it is already signed; appending to
+    it breaks the signature). ``session`` is injectable (``requests``/``requests.Session`` in
+    production, a fake in tests). Returns an IngestResponse; a non-2xx is reported, not raised."""
+    payload = bundle if isinstance(bundle, (bytes, bytearray)) else bundle_targz(bundle)
+    payload = bytes(payload)
+    hdrs = {"Content-Type": content_type, "Content-Length": str(len(payload))}
+    if headers:
+        hdrs.update(headers)
+    if session is None:
+        import requests                       # lazy: keep module importable without requests
+        session = requests
+    resp = session.put(presigned_url, data=payload, headers=hdrs, timeout=timeout)
+    status = int(getattr(resp, "status_code", 0))
+    text = getattr(resp, "text", "") or ""
+    return IngestResponse(ok=200 <= status < 300, status_code=status, body=text)
+
+
+def build_notify_payload(bundle: ExportBundle | bytes, *,
+                         job_id: Optional[str] = None,
+                         source_video: Optional[str] = None,
+                         object_key: Optional[str] = None,
+                         object_url: Optional[str] = None,
+                         extra: Optional[dict] = None) -> dict:
+    """The small JSON the brain POSTs to the backend webhook once the bundle is in object storage.
+
+    Carries everything the backend needs to record the violation set + locate/verify the uploaded
+    object WITHOUT the heavy bytes ever transiting the Node server: the bundle sha256 + size (so the
+    backend can verify the R2 object), where it was stored (key/url), the manifest version, the
+    violation count, and the ranked violation index (ids/types/tiers/plates -> straight into Mongo).
+    """
+    if isinstance(bundle, (bytes, bytearray)):
+        raw = bytes(bundle)
+        manifest = None
+        violations = []
+    else:
+        raw = bundle_targz(bundle)
+        manifest = bundle.manifest
+        violations = bundle.violations
+    payload: dict = {
+        "manifest_version": MANIFEST_VERSION,
+        "job_id": job_id,
+        "source_video": source_video,
+        "bundle": {
+            "object_key": object_key,
+            "object_url": object_url,
+            "bytes": len(raw),
+            "sha256": _sha256_hex(raw),
+            "content_type": "application/gzip",
+            "filename": "violations.tar.gz",
+        },
+        "violation_count": len(violations),
+        # a compact, already-ranked index so the backend can persist rows before/without unpacking
+        "violations": [
+            {"violation_id": v.get("violation_id"), "violation": v.get("violation"),
+             "tier": v.get("tier"), "vehicle_id": v.get("vehicle_id"),
+             "detector_confidence": v.get("detector_confidence"),
+             "plate": v.get("plate"), "manual_review": v.get("manual_review")}
+            for v in violations
+        ],
+    }
+    if manifest is not None:
+        payload["created_utc"] = manifest.get("created_utc")
+        payload["priority_model"] = (manifest.get("priority_model") or {}).get("model")
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def notify_backend(webhook_url: str, payload: dict, *,
+                   session: Any = None,
+                   headers: Optional[dict] = None,
+                   timeout: float = 30.0) -> IngestResponse:
+    """POST the lightweight completion ``payload`` (see :func:`build_notify_payload`) as JSON to the
+    backend webhook. ``session`` is injectable. Returns an IngestResponse (non-2xx reported, not
+    raised, so the caller owns retry/queue policy)."""
+    if session is None:
+        import requests
+        session = requests
+    resp = session.post(webhook_url, json=payload, headers=headers, timeout=timeout)
+    status = int(getattr(resp, "status_code", 0))
+    text = getattr(resp, "text", "") or ""
+    return IngestResponse(ok=200 <= status < 300, status_code=status, body=text)
+
+
+@dataclass
+class PresignedUploadResult:
+    """Outcome of the two-step presigned upload: the object PUT + the backend notify."""
+    put: IngestResponse
+    notify: Optional[IngestResponse] = None
+    bundle_bytes: int = 0
+    bundle_sha256: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.put.ok and (self.notify is None or self.notify.ok)
+
+
+def upload_bundle_presigned(upload_url: str, bundle: ExportBundle | bytes, *,
+                            notify_url: Optional[str] = None,
+                            session: Any = None,
+                            job_id: Optional[str] = None,
+                            source_video: Optional[str] = None,
+                            object_key: Optional[str] = None,
+                            object_url: Optional[str] = None,
+                            put_headers: Optional[dict] = None,
+                            notify_headers: Optional[dict] = None,
+                            extra_notify: Optional[dict] = None,
+                            timeout: float = 120.0) -> PresignedUploadResult:
+    """The full Option-B upload: PUT the bundle to ``upload_url`` (Cloudflare), then (if
+    ``notify_url`` is given) POST the completion webhook to the backend. Notify is SKIPPED when the
+    PUT failed (don't tell the backend an object exists when it doesn't). Returns a
+    :class:`PresignedUploadResult` with both outcomes + the bundle's sha256/size."""
+    raw = bytes(bundle if isinstance(bundle, (bytes, bytearray)) else bundle_targz(bundle))
+    put = put_bundle(upload_url, raw, session=session, headers=put_headers, timeout=timeout)
+    result = PresignedUploadResult(put=put, bundle_bytes=len(raw), bundle_sha256=_sha256_hex(raw))
+    if notify_url and put.ok:
+        payload = build_notify_payload(bundle, job_id=job_id, source_video=source_video,
+                                       object_key=object_key, object_url=object_url,
+                                       extra=extra_notify)
+        result.notify = notify_backend(notify_url, payload, session=session,
+                                       headers=notify_headers, timeout=timeout)
+    return result

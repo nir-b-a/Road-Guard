@@ -164,11 +164,16 @@ class ShoulderEvaluator:
         return rel, res, ysurf, n_yellow
 
 
-def evaluate(c, speed_lookup=None):
+def evaluate(c, speed_lookup=None, once_per_vehicle=False):
     """Run the evaluator over a cached clip. Returns (incidents, recs, events, yellow_frames):
       incidents  -- merged (tid, start, end) per-track incidents (K-consec + cooldown)
       recs       -- recs[tid][frame] = the per-frame res dict (for the renderer / key-frame pick)
       events     -- one ViolationEvent per incident, scored at its peak-crossing key frame
+
+    once_per_vehicle: shoulder-driving is reported STRICTLY ONCE per vehicle for the whole clip
+      (Tal's baseline rule -- a car flagged on the shoulder is not re-reported). When True, only
+      the EARLIEST incident per track id survives. The default (False) keeps the legacy 3 s-cooldown
+      behaviour so the standalone sweep/render harness is unchanged.
     """
     fps = c["fps"]
     ev = ShoulderEvaluator(c["h"], c["w"], fps, speed_lookup)
@@ -185,6 +190,14 @@ def evaluate(c, speed_lookup=None):
 
     kf = max(1, round(K_SEC * fps))
     incidents = merge_events(events_from_timeline(tl, kf), fps, COOLDOWN)
+
+    if once_per_vehicle:
+        # keep only the earliest incident per vehicle -> one shoulder report per car, ever
+        earliest: dict[int, tuple] = {}
+        for tid, s, e in incidents:
+            if tid not in earliest or s < earliest[tid][1]:
+                earliest[tid] = (tid, s, e)
+        incidents = sorted(earliest.values(), key=lambda x: (x[0], x[1]))
 
     events = []
     for tid, s, e in incidents:
@@ -204,6 +217,8 @@ def evaluate(c, speed_lookup=None):
                 "seg_conf": round(r["seg_conf"], 3),
                 "margin_px": round(K_MARGIN * r["w"], 1),
                 "est_speed_kmh": round(r["speed"], 1),
+                "start_frame": s,
+                "end_frame": e,
                 "n_frames_over": e - s + 1,
                 "oncoming_p": round(r["P"], 3),
                 "line_age_s": round(r["age"] / fps, 2),

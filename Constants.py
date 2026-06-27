@@ -74,6 +74,11 @@ DEFAULT_VEHICLE_WIDTH_M = 1.8
 DEFAULT_CAMERA_HEIGHT_M = 1.4    # dashcam mount height (also the CARLA default)
 
 # ── Detection / tracking ──────────────────────────────────────────────────────
+# Vehicle detector/tracker is pinned to YOLOv11 (yolo11x). This is the live detection
+# model for vehicles + traffic lights; --model can override it for an A/B run. NOTE: the
+# yellow/solid lane-line model (weights/phase3_v3_yellowprotect.pt, loaded in main.py) is a
+# CUSTOM-TRAINED YOLOv8-seg model and is intentionally NOT bumped to v11 -- swapping it would
+# require retraining the lane-type dataset, which is out of scope for the baseline.
 YOLO_VERSION = "yolo11x.pt"
 CONFIDENCE_LVL = 0.5             # YOLO minimum detection confidence
 YOLO_IMGSZ = 1280                # YOLO inference image size (px); 1984 w/o half
