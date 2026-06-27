@@ -58,6 +58,7 @@ class HomeActivity : AppCompatActivity() {
         val request = Request.Builder()
             .url("${AppConfig.getBaseUrl(this)}/notifications/$userId")
             .addHeader("Authorization", "Bearer $token")
+            .addHeader("ngrok-skip-browser-warning", "true")
             .build()
 
         OkHttpClient().newCall(request).enqueue(object : Callback {

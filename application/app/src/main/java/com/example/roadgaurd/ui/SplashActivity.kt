@@ -96,11 +96,17 @@ class SplashActivity : AppCompatActivity() {
     }
 
     private fun makeRequest(url: String, json: JSONObject) {
+        android.util.Log.d("RoadGuard", "makeRequest: url=$url")
         val body = json.toString().toRequestBody("application/json".toMediaType())
-        val request = Request.Builder().url(url).post(body).build()
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("ngrok-skip-browser-warning", "true")
+            .post(body)
+            .build()
 
         OkHttpClient().newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                android.util.Log.e("RoadGuard", "Network failure: ${e.message}", e)
                 runOnUiThread {
                     Toast.makeText(this@SplashActivity, "Network error: ${e.message}", Toast.LENGTH_LONG).show()
                 }
@@ -108,6 +114,7 @@ class SplashActivity : AppCompatActivity() {
 
             override fun onResponse(call: Call, response: Response) {
                 val resBody = response.body?.string()
+                android.util.Log.d("RoadGuard", "onResponse: code=${response.code} body=$resBody")
                 runOnUiThread {
                     try {
                         val json = JSONObject(resBody ?: "")

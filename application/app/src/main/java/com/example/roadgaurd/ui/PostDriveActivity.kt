@@ -32,7 +32,7 @@ class PostDriveActivity : AppCompatActivity() {
     private var sessionId: String? = null
     private var sessionDirPath: String? = null
     private var videoPath: String? = null
-    private val BASE_URL = "http://10.100.102.129:5000/api"
+    private val BASE_URL get() = AppConfig.getBaseUrl(this)
 
     // Client-side sanity check before uploading (fast feedback). The server re-validates
     // authoritatively at /upload/init + /complete — keep these in sync with the server's
@@ -113,6 +113,7 @@ class PostDriveActivity : AppCompatActivity() {
                 val initReq = Request.Builder()
                     .url("$BASE_URL/driver/upload/init")
                     .addHeader("Authorization", "Bearer $token")
+                    .addHeader("ngrok-skip-browser-warning", "true")
                     .post(initBody.toRequestBody("application/json".toMediaType()))
                     .build()
                 val uploads = client.newCall(initReq).execute().use { resp ->
@@ -164,6 +165,7 @@ class PostDriveActivity : AppCompatActivity() {
                 val completeReq = Request.Builder()
                     .url("$BASE_URL/driver/upload/complete")
                     .addHeader("Authorization", "Bearer $token")
+                    .addHeader("ngrok-skip-browser-warning", "true")
                     .post(JSONObject().put("sessionId", sid).toString().toRequestBody("application/json".toMediaType()))
                     .build()
                 client.newCall(completeReq).execute().use { resp ->
