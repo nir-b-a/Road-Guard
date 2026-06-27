@@ -91,6 +91,18 @@ class PostDriveActivity : AppCompatActivity() {
             return
         }
 
+        // Verify all sensor/calibration files are present and non-empty before starting.
+        val missingFiles = DATA_FILES.filter { name ->
+            val f = File(dir, name)
+            !f.exists() || f.length() == 0L
+        }
+        if (missingFiles.isNotEmpty()) {
+            Toast.makeText(this,
+                "Session data incomplete — missing: ${missingFiles.joinToString()}",
+                Toast.LENGTH_LONG).show()
+            return
+        }
+
         val btnYes = findViewById<Button>(R.id.btnYes)
         val progressBar = findViewById<ProgressBar>(R.id.pbUpload)
         val tvProgress = findViewById<TextView>(R.id.tvProgress)
@@ -176,9 +188,13 @@ class PostDriveActivity : AppCompatActivity() {
                 runOnUiThread {
                     progressBar.visibility = View.GONE
                     tvProgress.visibility = View.GONE
-                    SessionStore.deleteSession(dir)   // it's in R2 now — reclaim device storage
-                    Toast.makeText(this, "Drive uploaded!", Toast.LENGTH_LONG).show()
-                    goHome()
+                    SessionStore.markUploaded(dir)
+                    com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+                        .setTitle("Drive Uploaded Successfully!")
+                        .setMessage("You just made the road safer — thank you for your contribution!")
+                        .setPositiveButton("Awesome!") { _, _ -> goHome() }
+                        .setCancelable(false)
+                        .show()
                 }
             } catch (e: Exception) {
                 Log.w("PostDrive", "Upload failed: ${e.message}")

@@ -10,19 +10,17 @@ import java.util.concurrent.TimeUnit
  *
  * Each drive is written by RecordingActivity to
  *     getExternalFilesDir(null)/sessions/<sessionId>/
- * A session is deleted as soon as it uploads successfully (PostDriveActivity).
- * Sessions that did NOT upload are kept so the captured data is not lost, then
- * reclaimed by a launch-time sweep once they are older than SESSION_RETENTION_HOURS.
+ * On successful upload, PostDriveActivity writes an "uploaded.flag" sentinel and returns
+ * immediately — the session stays on device for UPLOAD_GRACE_MINUTES so the user can
+ * verify or retry if something looked wrong. The launch-time sweep (HomeActivity) then
+ * deletes flagged dirs once the grace period has passed. Un-uploaded sessions are kept
+ * for SESSION_RETENTION_HOURS before being swept.
  */
 object SessionStore {
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Retention window for UNSENT sessions. A session is deleted the moment it
-    // uploads successfully; if it did NOT upload (e.g. the server rejected it, or
-    // the phone was offline) it stays on disk so the data isn't lost, and the
-    // launch-time sweep (HomeActivity) reclaims it only once it is older than this.
-    // ─────────────────────────────────────────────────────────────────────────
     const val SESSION_RETENTION_HOURS = 24L
+    const val UPLOAD_GRACE_MINUTES = 2L
+    private const val UPLOADED_FLAG = "uploaded.flag"
 
     private const val TAG = "SessionStore"
 
@@ -30,7 +28,13 @@ object SessionStore {
     fun sessionsRoot(context: Context): File =
         File(context.getExternalFilesDir(null), "sessions")
 
-    /** Delete one session folder (called after a successful upload). Returns true on success. */
+    /** Write the sentinel that marks this session as successfully uploaded. */
+    fun markUploaded(dir: File) {
+        try { File(dir, UPLOADED_FLAG).createNewFile() }
+        catch (e: Exception) { Log.w(TAG, "Could not write uploaded flag: ${e.message}") }
+    }
+
+    /** Delete one session folder. Returns true on success. */
     fun deleteSession(dir: File): Boolean {
         if (!dir.exists()) return true
         val ok = dir.deleteRecursively()
@@ -39,20 +43,25 @@ object SessionStore {
     }
 
     /**
-     * Delete UNSENT sessions older than SESSION_RETENTION_HOURS. A folder's age is
-     * its last-modified time (set when RecordingActivity wrote the session files).
-     * Successfully uploaded sessions are already gone, so anything still on disk is
-     * an un-uploaded drive.
+     * Sweep stale sessions at launch:
+     * - Uploaded (flag present): delete after UPLOAD_GRACE_MINUTES.
+     * - Not uploaded: delete after SESSION_RETENTION_HOURS.
      */
     fun sweepStaleSessions(context: Context) {
         val children = sessionsRoot(context).listFiles() ?: return
-        val maxAgeMs = TimeUnit.HOURS.toMillis(SESSION_RETENTION_HOURS)
         val now = System.currentTimeMillis()
         for (dir in children) {
             if (!dir.isDirectory) continue
-            val ageMs = now - dir.lastModified()
-            if (ageMs > maxAgeMs && deleteSession(dir)) {
-                Log.i(TAG, "Swept stale session ${dir.name} (age ${ageMs / 3_600_000}h)")
+            val flag = File(dir, UPLOADED_FLAG)
+            if (flag.exists()) {
+                val graceMs = TimeUnit.MINUTES.toMillis(UPLOAD_GRACE_MINUTES)
+                if (now - flag.lastModified() > graceMs && deleteSession(dir))
+                    Log.i(TAG, "Swept uploaded session ${dir.name}")
+            } else {
+                val maxAgeMs = TimeUnit.HOURS.toMillis(SESSION_RETENTION_HOURS)
+                val ageMs = now - dir.lastModified()
+                if (ageMs > maxAgeMs && deleteSession(dir))
+                    Log.i(TAG, "Swept stale session ${dir.name} (age ${ageMs / 3_600_000}h)")
             }
         }
     }
