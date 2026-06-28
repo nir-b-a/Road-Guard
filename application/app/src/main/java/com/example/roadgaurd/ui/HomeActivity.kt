@@ -20,8 +20,10 @@ class HomeActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_home)
 
-        // Reclaim un-uploaded sessions left on the device beyond the retention window.
+        // Reclaim un-uploaded sessions left on the device beyond the retention window,
+        // then offer to retry any that failed due to a connection drop.
         SessionStore.sweepStaleSessions(this)
+        checkPendingUploads()
 
         fetchNotifications()
 
@@ -48,6 +50,24 @@ class HomeActivity : AppCompatActivity() {
             startActivity(intent)
             finish()
         }
+    }
+
+    private fun checkPendingUploads() {
+        val pending = SessionStore.findPendingSessions(this)
+        if (pending.isEmpty()) return
+        val (sessionId, sessionDir, videoFile) = pending.first()
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle("Unfinished Upload")
+            .setMessage("A drive recording wasn't uploaded due to a connection issue. Upload it now?")
+            .setPositiveButton("Upload") { _, _ ->
+                startActivity(Intent(this, PostDriveActivity::class.java).apply {
+                    putExtra("session_id", sessionId)
+                    putExtra("session_dir", sessionDir.absolutePath)
+                    putExtra("video_path", videoFile.absolutePath)
+                })
+            }
+            .setNegativeButton("Skip") { _, _ -> SessionStore.markSkipped(sessionDir) }
+            .show()
     }
 
     private fun fetchNotifications() {

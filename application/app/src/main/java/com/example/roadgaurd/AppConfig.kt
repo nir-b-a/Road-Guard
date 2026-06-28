@@ -4,7 +4,8 @@ import android.content.Context
 
 object AppConfig {
     private const val PREF_KEY_URL = "server_url"
-    private const val DEFAULT_URL = "http://192.168.1.106:5000/api"
+    // Change this or override at runtime via Settings if the server runs on a different machine.
+    private const val DEFAULT_URL = "https://repacking-tainted-unclasp.ngrok-free.dev/api"
 
     fun getBaseUrl(context: Context): String {
         val prefs = context.getSharedPreferences("roadguard", Context.MODE_PRIVATE)

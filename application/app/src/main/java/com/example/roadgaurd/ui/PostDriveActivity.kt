@@ -54,7 +54,10 @@ class PostDriveActivity : AppCompatActivity() {
         sessionDirPath = intent.getStringExtra("session_dir")
         videoPath = intent.getStringExtra("video_path")
 
-        findViewById<Button>(R.id.btnNo).setOnClickListener { goHome() }
+        findViewById<Button>(R.id.btnNo).setOnClickListener {
+            sessionDirPath?.let { SessionStore.markSkipped(File(it)) }
+            goHome()
+        }
         findViewById<Button>(R.id.btnYes).setOnClickListener { uploadDrive() }
     }
 
@@ -130,6 +133,7 @@ class PostDriveActivity : AppCompatActivity() {
                     .build()
                 val uploads = client.newCall(initReq).execute().use { resp ->
                     val text = resp.body?.string() ?: ""
+                    if (resp.code == 401) { runOnUiThread { handleSessionExpired() }; return@thread }
                     if (!resp.isSuccessful) throw IOException("init failed (${resp.code}): $text")
                     JSONObject(text).getJSONObject("data").getJSONObject("uploads")
                 }
@@ -182,6 +186,7 @@ class PostDriveActivity : AppCompatActivity() {
                     .build()
                 client.newCall(completeReq).execute().use { resp ->
                     val text = resp.body?.string() ?: ""
+                    if (resp.code == 401) { runOnUiThread { handleSessionExpired() }; return@thread }
                     if (!resp.isSuccessful) throw IOException("complete failed (${resp.code}): $text")
                 }
 
@@ -251,6 +256,15 @@ class PostDriveActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun handleSessionExpired() {
+        getSharedPreferences("roadguard", MODE_PRIVATE).edit().clear().apply()
+        Toast.makeText(this, "Session expired. Please log in again.", Toast.LENGTH_LONG).show()
+        startActivity(Intent(this, SplashActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        })
+        finish()
     }
 
     private fun goHome() {
