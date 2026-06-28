@@ -1,3 +1,5 @@
+const { spawn } = require('child_process');
+const path = require('path');
 const Drive = require('../models/Drive');
 const Notification = require('../models/Notification');
 const r2 = require('../services/r2');
@@ -58,8 +60,15 @@ const initUpload = async (req, res) => {
     }
 
     const safeSession = safeName(sessionId);
-    if (await Drive.findOne({ sessionId: safeSession })) {
-        return res.status(409).json({ success: false, message: 'sessionId already used', data: null });
+    const existing = await Drive.findOne({ sessionId: safeSession });
+    if (existing) {
+        if (existing.status !== 'created') {
+            return res.status(409).json({ success: false, message: 'sessionId already used', data: null });
+        }
+        // Stale incomplete upload (init was called but complete never was) — clean up so
+        // the retry can start fresh without a sessionId conflict.
+        if (r2.isConfigured()) await r2.deletePrefix(safeSession + '/');
+        await existing.deleteOne();
     }
 
     // Admission guard: don't let a burst of big uploads overflow the free-tier bucket.

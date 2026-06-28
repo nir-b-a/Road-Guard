@@ -9,6 +9,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.example.roadgaurd.AppConfig
 import com.example.roadgaurd.R
 import com.example.roadgaurd.storage.SessionStore
 import okhttp3.MediaType
@@ -31,7 +32,7 @@ class PostDriveActivity : AppCompatActivity() {
     private var sessionId: String? = null
     private var sessionDirPath: String? = null
     private var videoPath: String? = null
-    private val BASE_URL = "http://10.100.102.129:5000/api"
+    private val BASE_URL get() = AppConfig.getBaseUrl(this)
 
     // Client-side sanity check before uploading (fast feedback). The server re-validates
     // authoritatively at /upload/init + /complete — keep these in sync with the server's
@@ -53,7 +54,10 @@ class PostDriveActivity : AppCompatActivity() {
         sessionDirPath = intent.getStringExtra("session_dir")
         videoPath = intent.getStringExtra("video_path")
 
-        findViewById<Button>(R.id.btnNo).setOnClickListener { goHome() }
+        findViewById<Button>(R.id.btnNo).setOnClickListener {
+            sessionDirPath?.let { SessionStore.markSkipped(File(it)) }
+            goHome()
+        }
         findViewById<Button>(R.id.btnYes).setOnClickListener { uploadDrive() }
     }
 
@@ -90,6 +94,18 @@ class PostDriveActivity : AppCompatActivity() {
             return
         }
 
+        // Verify all sensor/calibration files are present and non-empty before starting.
+        val missingFiles = DATA_FILES.filter { name ->
+            val f = File(dir, name)
+            !f.exists() || f.length() == 0L
+        }
+        if (missingFiles.isNotEmpty()) {
+            Toast.makeText(this,
+                "Session data incomplete — missing: ${missingFiles.joinToString()}",
+                Toast.LENGTH_LONG).show()
+            return
+        }
+
         val btnYes = findViewById<Button>(R.id.btnYes)
         val progressBar = findViewById<ProgressBar>(R.id.pbUpload)
         val tvProgress = findViewById<TextView>(R.id.tvProgress)
@@ -112,10 +128,12 @@ class PostDriveActivity : AppCompatActivity() {
                 val initReq = Request.Builder()
                     .url("$BASE_URL/driver/upload/init")
                     .addHeader("Authorization", "Bearer $token")
+                    .addHeader("ngrok-skip-browser-warning", "true")
                     .post(initBody.toRequestBody("application/json".toMediaType()))
                     .build()
                 val uploads = client.newCall(initReq).execute().use { resp ->
                     val text = resp.body?.string() ?: ""
+                    if (resp.code == 401) { runOnUiThread { handleSessionExpired() }; return@thread }
                     if (!resp.isSuccessful) throw IOException("init failed (${resp.code}): $text")
                     JSONObject(text).getJSONObject("data").getJSONObject("uploads")
                 }
@@ -163,19 +181,25 @@ class PostDriveActivity : AppCompatActivity() {
                 val completeReq = Request.Builder()
                     .url("$BASE_URL/driver/upload/complete")
                     .addHeader("Authorization", "Bearer $token")
+                    .addHeader("ngrok-skip-browser-warning", "true")
                     .post(JSONObject().put("sessionId", sid).toString().toRequestBody("application/json".toMediaType()))
                     .build()
                 client.newCall(completeReq).execute().use { resp ->
                     val text = resp.body?.string() ?: ""
+                    if (resp.code == 401) { runOnUiThread { handleSessionExpired() }; return@thread }
                     if (!resp.isSuccessful) throw IOException("complete failed (${resp.code}): $text")
                 }
 
                 runOnUiThread {
                     progressBar.visibility = View.GONE
                     tvProgress.visibility = View.GONE
-                    SessionStore.deleteSession(dir)   // it's in R2 now — reclaim device storage
-                    Toast.makeText(this, "Drive uploaded!", Toast.LENGTH_LONG).show()
-                    goHome()
+                    SessionStore.markUploaded(dir)
+                    com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+                        .setTitle("Drive Uploaded Successfully!")
+                        .setMessage("You just made the road safer — thank you for your contribution!")
+                        .setPositiveButton("Awesome!") { _, _ -> goHome() }
+                        .setCancelable(false)
+                        .show()
                 }
             } catch (e: Exception) {
                 Log.w("PostDrive", "Upload failed: ${e.message}")
@@ -232,6 +256,15 @@ class PostDriveActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun handleSessionExpired() {
+        getSharedPreferences("roadguard", MODE_PRIVATE).edit().clear().apply()
+        Toast.makeText(this, "Session expired. Please log in again.", Toast.LENGTH_LONG).show()
+        startActivity(Intent(this, SplashActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        })
+        finish()
     }
 
     private fun goHome() {

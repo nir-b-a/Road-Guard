@@ -32,7 +32,7 @@
             </intent-filter>
         </activity>
 
-        <activity android:name=".ui.HomeActivity" android:exported="false" />
+        <activity android:name=".ui.HomeActivity" android:theme="@style/Theme.RoadGuard.NoActionBar" android:exported="false" />
 
         <activity
             android:name=".ui.RecordingActivity"
@@ -40,9 +40,11 @@
             android:screenOrientation="landscape"
             android:exported="false" />
 
-        <activity android:name=".ui.PostDriveActivity" android:exported="false" />
+        <activity android:name=".ui.PostDriveActivity" android:theme="@style/Theme.RoadGuard.NoActionBar" android:exported="false" />
 
-        <activity android:name=".ui.NotificationsActivity" android:exported="false" />
+        <activity android:name=".ui.NotificationsActivity" android:theme="@style/Theme.RoadGuard.NoActionBar" android:exported="false" />
+
+        <activity android:name=".ui.SettingsActivity" android:theme="@style/Theme.RoadGuard.NoActionBar" android:exported="false" />
 
     </application>
 </manifest>

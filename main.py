@@ -1023,6 +1023,28 @@ def main():
             world, video_path, render_path, fps=fps,
             violation_events=all_events)
 
+    # ── Return a violations list for worker.py to post to the backend ─────────
+    # lat/lon are not carried on ViolationEvent; 0.0 is a known placeholder until
+    # GPS-track interpolation at key_frame is wired up.
+    violations = []
+    for e, result in results_by_event:
+        vehicle = world.getVehicle(e.vehicle_id)
+        plate = (result.plate if result is not None else None) or (vehicle.license_plate if vehicle else None)
+        violations.append({
+            "vehicle_id":     e.vehicle_id,
+            "carId":          plate or f"vehicle-{e.vehicle_id}",
+            "calculatedSpeed": e.details.get("est_speed_kmh", 0),
+            "lat":            0.0,
+            "lon":            0.0,
+            "violation_type": e.violation_type,
+        })
+
+    return {
+        "annotated_video": annotated_final,
+        "vehicles_csv":    os.path.join(out_dir, f"{video_name}_vehicles.csv"),
+        "violations":      violations,
+    }
+
 
 # the main function of the program
 if __name__ == "__main__":

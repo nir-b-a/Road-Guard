@@ -9,6 +9,7 @@ const authorityRoutes = require('./routes/authorityRoutes');
 
 const app = express();
 
+app.set('trust proxy', 1);
 app.use(cors({ origin: '*', credentials: false }));
 // Endpoints now carry only small JSON (presign requests, completion, results) — never the
 // big files — so a tight body cap is safe and stops oversized payloads.

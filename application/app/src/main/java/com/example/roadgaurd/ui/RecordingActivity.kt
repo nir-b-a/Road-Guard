@@ -164,16 +164,6 @@ class RecordingActivity : AppCompatActivity() {
         if (allPermissionsGranted()) { startCamera(); startLocationUpdates() }
         else permissionLauncher.launch(permissions)
 
-        findViewById<Button>(R.id.btnTag).setOnClickListener {
-            val loc = lastLocation
-            if (loc != null) {
-                session.tagEvent(loc.latitude, loc.longitude)
-                Toast.makeText(this, "Tag saved! (${session.getTags().size} total)", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "Waiting for GPS...", Toast.LENGTH_SHORT).show()
-            }
-        }
-
         findViewById<Button>(R.id.btnStop).setOnClickListener { stopRecordingAndProceed() }
     }
 

@@ -9,6 +9,7 @@ import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.example.roadgaurd.AppConfig
 import com.example.roadgaurd.R
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -18,7 +19,6 @@ import java.io.IOException
 
 class SplashActivity : AppCompatActivity() {
 
-    private val BASE_URL = "http://10.100.102.129:5000/api"
     private lateinit var prefs: SharedPreferences
     private var isRegisterMode = false
 
@@ -42,6 +42,10 @@ class SplashActivity : AppCompatActivity() {
         val etName = findViewById<EditText>(R.id.etName)
         val btnLogin = findViewById<Button>(R.id.btnLogin)
         val tvToggle = findViewById<TextView>(R.id.tvToggle)
+
+        findViewById<TextView>(R.id.tvSettings).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
 
         tvToggle.setOnClickListener {
             isRegisterMode = !isRegisterMode
@@ -78,7 +82,7 @@ class SplashActivity : AppCompatActivity() {
             put("email", email)
             put("password", password)
         }
-        makeRequest("$BASE_URL/auth/login", json)
+        makeRequest("${AppConfig.getBaseUrl(this)}/auth/login", json)
     }
 
     private fun register(name: String, email: String, password: String) {
@@ -88,15 +92,21 @@ class SplashActivity : AppCompatActivity() {
             put("password", password)
             put("role", "driver")
         }
-        makeRequest("$BASE_URL/auth/register", json)
+        makeRequest("${AppConfig.getBaseUrl(this)}/auth/register", json)
     }
 
     private fun makeRequest(url: String, json: JSONObject) {
+        android.util.Log.d("RoadGuard", "makeRequest: url=$url")
         val body = json.toString().toRequestBody("application/json".toMediaType())
-        val request = Request.Builder().url(url).post(body).build()
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("ngrok-skip-browser-warning", "true")
+            .post(body)
+            .build()
 
         OkHttpClient().newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                android.util.Log.e("RoadGuard", "Network failure: ${e.message}", e)
                 runOnUiThread {
                     Toast.makeText(this@SplashActivity, "Network error: ${e.message}", Toast.LENGTH_LONG).show()
                 }
@@ -104,6 +114,7 @@ class SplashActivity : AppCompatActivity() {
 
             override fun onResponse(call: Call, response: Response) {
                 val resBody = response.body?.string()
+                android.util.Log.d("RoadGuard", "onResponse: code=${response.code} body=$resBody")
                 runOnUiThread {
                     try {
                         val json = JSONObject(resBody ?: "")

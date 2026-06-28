@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.view.View
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.example.roadgaurd.AppConfig
 import com.example.roadgaurd.R
 import com.example.roadgaurd.storage.SessionStore
 import okhttp3.*
@@ -13,15 +14,16 @@ import java.io.IOException
 
 class HomeActivity : AppCompatActivity() {
 
-    private val BASE_URL = "http://10.100.102.129:5000/api"
     private var unreadCount = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_home)
 
-        // Reclaim un-uploaded sessions left on the device beyond the retention window.
+        // Reclaim un-uploaded sessions left on the device beyond the retention window,
+        // then offer to retry any that failed due to a connection drop.
         SessionStore.sweepStaleSessions(this)
+        checkPendingUploads()
 
         fetchNotifications()
 
@@ -35,6 +37,10 @@ class HomeActivity : AppCompatActivity() {
             startActivity(Intent(this, NotificationsActivity::class.java))
         }
 
+        findViewById<android.widget.Button>(R.id.btnSettings).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
         findViewById<android.widget.Button>(R.id.btnLogout).setOnClickListener {
             val prefs = getSharedPreferences("roadguard", MODE_PRIVATE)
             prefs.edit().clear().apply()
@@ -46,14 +52,33 @@ class HomeActivity : AppCompatActivity() {
         }
     }
 
+    private fun checkPendingUploads() {
+        val pending = SessionStore.findPendingSessions(this)
+        if (pending.isEmpty()) return
+        val (sessionId, sessionDir, videoFile) = pending.first()
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle("Unfinished Upload")
+            .setMessage("A drive recording wasn't uploaded due to a connection issue. Upload it now?")
+            .setPositiveButton("Upload") { _, _ ->
+                startActivity(Intent(this, PostDriveActivity::class.java).apply {
+                    putExtra("session_id", sessionId)
+                    putExtra("session_dir", sessionDir.absolutePath)
+                    putExtra("video_path", videoFile.absolutePath)
+                })
+            }
+            .setNegativeButton("Skip") { _, _ -> SessionStore.markSkipped(sessionDir) }
+            .show()
+    }
+
     private fun fetchNotifications() {
         val prefs = getSharedPreferences("roadguard", MODE_PRIVATE)
         val token = prefs.getString("token", null) ?: return
         val userId = prefs.getString("userId", null) ?: return
 
         val request = Request.Builder()
-            .url("$BASE_URL/notifications/$userId")
+            .url("${AppConfig.getBaseUrl(this)}/notifications/$userId")
             .addHeader("Authorization", "Bearer $token")
+            .addHeader("ngrok-skip-browser-warning", "true")
             .build()
 
         OkHttpClient().newCall(request).enqueue(object : Callback {
