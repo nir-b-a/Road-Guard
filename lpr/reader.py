@@ -55,6 +55,13 @@ class LPRReader(ABC):
         localiser available -> None (callers fall back to the whole vehicle crop)."""
         return None
 
+    def locate_plate(self, vehicle_crop: np.ndarray):
+        """Return the plate bounding box as ((cx, cy), w, h, conf) in `vehicle_crop` pixel
+        coords, or None if no plate is localised. Used by the Stage-2 cascade's LPR fallback to
+        build a ground-projected axle-proxy (the geometry only needs the box, not the OCR text).
+        Default: no localiser available -> None."""
+        return None
+
 
 def _ocr_confidence(conf: float | list[float]) -> float:
     return float(np.mean(conf)) if isinstance(conf, list) else conf
@@ -95,6 +102,21 @@ class FastALPRReader(LPRReader):
             return None
         plate_crop = vehicle_crop[y1:y2, x1:x2]
         return plate_crop if plate_crop.size else None
+
+    def locate_plate(self, vehicle_crop: np.ndarray):
+        """Highest-confidence plate detection box as ((cx, cy), w, h, conf) in crop coords."""
+        results = self._alpr.predict(vehicle_crop)
+        if not results:
+            return None
+        best = max(results, key=lambda r: r.detection.confidence if r.detection else 0.0)
+        if best.detection is None:
+            return None
+        bb = best.detection.bounding_box
+        x1, y1, x2, y2 = float(bb.x1), float(bb.y1), float(bb.x2), float(bb.y2)
+        w, h = x2 - x1, y2 - y1
+        if w <= 0 or h <= 0:
+            return None
+        return (((x1 + x2) / 2.0, (y1 + y2) / 2.0), w, h, float(best.detection.confidence))
 
 
 class PaddleOCRDetectorReader(LPRReader):

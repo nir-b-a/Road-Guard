@@ -7,6 +7,7 @@ const ViolationSchema = new mongoose.Schema({
     calculatedSpeed: { type: Number, required: true },
     location: { lat: { type: Number, required: true }, lon: { type: Number, required: true } },
     detectedAt: { type: Date, default: Date.now },
+    violationType: { type: String, enum: ['speeding', 'lane_crossing'], default: 'speeding' },
     status: { type: String, enum: ['pending', 'verified', 'dismissed'], default: 'pending' },
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
 });
