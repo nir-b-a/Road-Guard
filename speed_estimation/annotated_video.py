@@ -3,7 +3,9 @@ Annotated output video.
 
 After estimation, re-read the source footage and write a SECOND video in which
 every tracked vehicle is drawn with its bounding box, track id, resolved class,
-and the estimated speed (km/h) and distance (m) for that frame.
+and the estimated speed (km/h) and distance (m) for that frame. The ego (camera
+vehicle) speed is drawn as a banner centred at the top of every frame, so the
+own-speed reference rides along next to the per-vehicle estimates.
 
 This is the qualitative companion to the per-vehicle PNG plots: instead of one
 graph per vehicle you watch the numbers ride along with each box in the video.
@@ -33,6 +35,15 @@ _FONT_SCALE = 0.5
 _FONT_THICKNESS = 1
 _BOX_THICKNESS = 2
 _PAD = 4
+
+# Ego banner: bigger than the per-vehicle labels so the own-speed reference reads
+# at a glance, with bright text on a solid dark plate for contrast over any scene.
+_EGO_FONT_SCALE = 0.8
+_EGO_FONT_THICKNESS = 2
+_EGO_BG_COLOR = (0, 0, 0)        # black plate (BGR)
+_EGO_TEXT_COLOR = (0, 255, 255)  # yellow text (BGR)
+
+_ALERT_HOLD_FRAMES = 12          # how long the red "VIOLATION" flash stays up after the onset frame
 
 
 def _color_for_id(vid: int) -> tuple[int, int, int]:
@@ -97,20 +108,59 @@ def _draw_frame(frame, world: World, frame_id: int) -> None:
         _draw_label(frame, lines, x1, y1, color)
 
 
+def _build_alerts(violation_events) -> dict:
+    """frame -> list of (vehicle_id, label) for the red-box trigger.
+
+    The alert fires ONCE at each event's onset/key frame and is held for a short
+    window so it is actually visible at video speed.
+    """
+    label_for = {"SPEEDING": "SPEEDING", "SOLID_LINE_CROSSING": "SOLID LINE",
+                 "YELLOW_LINE_RIGHT": "SHOULDER"}
+    alerts: dict[int, list] = {}
+    for e in violation_events or []:
+        onset = int(getattr(e, "key_frame", 0) or 0)
+        label = label_for.get(getattr(e, "violation_type", ""), getattr(e, "violation_type", "VIOLATION"))
+        for f in range(onset, onset + _ALERT_HOLD_FRAMES):
+            alerts.setdefault(f, []).append((getattr(e, "vehicle_id", None), label))
+    return alerts
+
+
+def _draw_alert(frame, world: World, alerts_here: list, frame_id: int) -> None:
+    """Red full-frame border + banner, and a red box on the offending vehicle(s)."""
+    h_img, w_img = frame.shape[:2]
+    cv2.rectangle(frame, (0, 0), (w_img - 1, h_img - 1), (0, 0, 255), 12)
+    labels = sorted({lbl for _, lbl in alerts_here})
+    cv2.putText(frame, "VIOLATION: " + ", ".join(labels), (24, 44),
+                _FONT, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+    for vid, lbl in alerts_here:
+        vehicle = world.vehicles.get(vid)
+        if vehicle is None:
+            continue
+        bbox = vehicle.bounding_box.get(frame_id)
+        if bbox and bbox != (0, 0, 0, 0):
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            cv2.putText(frame, f"{lbl} #{vid}", (x1, max(y1 - 26, 28)),
+                        _FONT, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
+
 def render_annotated_video(world: World, video_path: str, output_path: str,
-                           fps: float | None = None) -> None:
+                           fps: float | None = None,
+                           violation_events=None) -> None:
     """
     Write {output_path}: the source footage with every tracked vehicle's bbox,
     id, class, and estimated speed/distance overlaid per frame.
 
     Args:
-        world:        the populated World (its .vehicles hold the per-frame bboxes,
-                      speeds and distances).
-        video_path:   the ORIGINAL source video (re-read from frame 0).
-        output_path:  destination .mp4.
-        fps:          output frame rate; falls back to the source's CAP_PROP_FPS
-                      (then 30) when None/0. Pass the same fps the pipeline used so
-                      the annotated clip plays at real time.
+        world:            the populated World (its .vehicles hold the per-frame bboxes,
+                          speeds and distances).
+        video_path:       the ORIGINAL source video (re-read from frame 0).
+        output_path:      destination .mp4.
+        fps:              output frame rate; falls back to the source's CAP_PROP_FPS
+                          (then 30) when None/0. Pass the same fps the pipeline used so
+                          the annotated clip plays at real time.
+        violation_events: optional ViolationEvents -> a red flash fires ONCE at each event's
+                          onset/key frame (held briefly so it is visible at video speed).
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -129,12 +179,15 @@ def render_annotated_video(world: World, video_path: str, output_path: str,
         cap.release()
         return
 
+    alerts = _build_alerts(violation_events)
     frame_id = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         _draw_frame(frame, world, frame_id)
+        if frame_id in alerts:
+            _draw_alert(frame, world, alerts[frame_id], frame_id)
         writer.write(frame)
         frame_id += 1
 
