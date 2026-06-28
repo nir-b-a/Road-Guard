@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import api from '../api/axios';
-import Navbar from '../components/Navbar';
+import PageLayout from '../components/PageLayout';
 import StatusBadge from '../components/StatusBadge';
 const ViolationDetailPage = () => {
   const { id } = useParams();
@@ -22,8 +22,7 @@ const ViolationDetailPage = () => {
     } catch { setError('Action failed.'); }
   };
   return (
-    <div className="min-h-screen bg-gray-900">
-      <Navbar />
+    <PageLayout>
       <div className="max-w-4xl mx-auto px-6 py-8">
         <button onClick={() => navigate('/violations')} className="text-gray-400 hover:text-white text-sm mb-6 flex items-center gap-1 transition">← Back to Violations</button>
         <h1 className="text-2xl font-bold text-white mb-6">Violation Details</h1>
@@ -55,7 +54,7 @@ const ViolationDetailPage = () => {
           )}
         </div>}
       </div>
-    </div>
+    </PageLayout>
   );
 };
 export default ViolationDetailPage;

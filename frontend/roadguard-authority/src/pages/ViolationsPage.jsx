@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/axios';
-import Navbar from '../components/Navbar';
+import PageLayout from '../components/PageLayout';
 import StatusBadge from '../components/StatusBadge';
 import FilterBar from '../components/FilterBar';
 const PER_PAGE = 10;
@@ -9,7 +9,7 @@ const ViolationsPage = () => {
   const [violations, setViolations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [filters, setFilters] = useState({ status: '', date: '' });
+  const [filters, setFilters] = useState({ status: '', date: '', plate: '' });
   const [page, setPage] = useState(1);
   const navigate = useNavigate();
   useEffect(() => {
@@ -17,13 +17,13 @@ const ViolationsPage = () => {
     const params = {};
     if (filters.status) params.status = filters.status;
     if (filters.date) params.date = filters.date;
+    if (filters.plate) params.license_plate = filters.plate;
     api.get('/authority/violations', { params }).then(res => { setViolations(res.data.data); setPage(1); }).catch(() => setError('Failed to load.')).finally(() => setLoading(false));
   }, [filters]);
   const totalPages = Math.ceil(violations.length / PER_PAGE);
   const paginated = violations.slice((page-1)*PER_PAGE, page*PER_PAGE);
   return (
-    <div className="min-h-screen bg-gray-900">
-      <Navbar />
+    <PageLayout>
       <div className="max-w-6xl mx-auto px-6 py-8">
         <h1 className="text-2xl font-bold text-white mb-6">All Violations</h1>
         <FilterBar filters={filters} onChange={setFilters} />
@@ -37,7 +37,7 @@ const ViolationsPage = () => {
               </tr></thead>
               <tbody>
                 {paginated.map(v => (
-                  <tr key={v._id} className="border-b border-gray-700/50 hover:bg-gray-700/30 transition">
+                  <tr key={v._id} onClick={() => navigate('/violations/' + v._id)} className="border-b border-gray-700/50 hover:bg-gray-700/30 cursor-pointer transition">
                     <td className="px-6 py-3 font-mono text-white font-semibold">{v.carId}</td>
                     <td className="px-6 py-3 text-white">{v.calculatedSpeed} km/h</td>
                     <td className="px-6 py-3 text-gray-400">{v.location?.lat?.toFixed(3)}, {v.location?.lon?.toFixed(3)}</td>
@@ -53,13 +53,13 @@ const ViolationsPage = () => {
           {totalPages > 1 && (
             <div className="flex justify-center gap-2 mt-4">
               {Array.from({ length: totalPages }, (_, i) => i+1).map(p => (
-                <button key={p} onClick={() => setPage(p)} className={"px-3 py-1 rounded text-sm " + (p===page ? 'bg-red-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600')}>{p}</button>
+                <button key={p} onClick={() => setPage(p)} className={"px-3 py-1 rounded text-sm " + (p===page ? 'bg-cyan-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600')}>{p}</button>
               ))}
             </div>
           )}
         </>}
       </div>
-    </div>
+    </PageLayout>
   );
 };
 export default ViolationsPage;
