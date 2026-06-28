@@ -1,177 +1,130 @@
 package com.example.roadgaurd.ui
 
-import android.app.ProgressDialog
 import android.content.Intent
-import android.database.Cursor
 import android.os.Bundle
-import android.provider.MediaStore
 import android.util.Log
 import android.widget.Button
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.example.roadgaurd.R
-import okhttp3.*
+import com.example.roadgaurd.storage.SessionStore
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
-import org.json.JSONArray
+import okhttp3.Response
 import java.io.File
 import java.io.IOException
 
 class PostDriveActivity : AppCompatActivity() {
 
-    private var recordingName: String? = null
     private var sessionId: String? = null
+    private var sessionDirPath: String? = null
+    private var videoPath: String? = null
     private var tagsJson: String = "[]"
-    private var speedJson: String = "[]"
     private val BASE_URL = "http://10.0.2.2:5000/api"
+
+    // Every file the collector writes into the per-session folder. These are the parts
+    // the server WOULD receive once it is back up.
+    private val DATA_FILES = listOf(
+        "frames.csv", "gyro.csv", "gravity.csv", "gps.csv", "linacc.csv", "intrinsics.json", "tags.json"
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_post_drive)
 
-        recordingName = intent.getStringExtra("recording_name")
         sessionId = intent.getStringExtra("session_id") ?: "session_${System.currentTimeMillis()}"
+        sessionDirPath = intent.getStringExtra("session_dir")
+        videoPath = intent.getStringExtra("video_path")
         tagsJson = intent.getStringExtra("tags_json") ?: "[]"
-        speedJson = intent.getStringExtra("speed_json") ?: "[]"
 
         findViewById<Button>(R.id.btnNo).setOnClickListener { goHome() }
         findViewById<Button>(R.id.btnYes).setOnClickListener { uploadDrive() }
     }
 
-    private fun generateSpeedReport(speedJson: String, fps: Int = 30) {
-        try {
-            val samples = JSONArray(speedJson)
-            if (samples.length() == 0) {
-                Log.w("PostDrive", "No speed samples — skipping report")
-                return
-            }
-
-            val lastTimestampMs = samples.getJSONObject(samples.length() - 1).getLong("timestampMs")
-            val totalFrames = ((lastTimestampMs / 1000.0) * fps).toInt()
-            val msPerFrame = 1000.0 / fps
-
-            val sb = StringBuilder()
-            sb.appendLine("RoadGuard Speed Report")
-            sb.appendLine("Session: $sessionId")
-            sb.appendLine("FPS: $fps  |  Total Frames: $totalFrames")
-            sb.appendLine("=".repeat(65))
-            sb.appendLine(String.format("%-12s | %-15s | %-12s | %s", "Frame", "Timestamp", "Speed", "Location"))
-            sb.appendLine("-".repeat(65))
-
-            for (frameIndex in 0..totalFrames) {
-                val frameTimeMs = (frameIndex * msPerFrame).toLong()
-
-                var lower = samples.getJSONObject(0)
-                var upper = samples.getJSONObject(0)
-                for (i in 0 until samples.length()) {
-                    val s = samples.getJSONObject(i)
-                    if (s.getLong("timestampMs") <= frameTimeMs) lower = s
-                    if (s.getLong("timestampMs") >= frameTimeMs) { upper = s; break }
-                }
-
-                val lowerT = lower.getLong("timestampMs")
-                val upperT = upper.getLong("timestampMs")
-                val lowerSpeed = lower.getDouble("speedKmh").toFloat()
-                val upperSpeed = upper.getDouble("speedKmh").toFloat()
-                val lowerLat = lower.getDouble("lat")
-                val lowerLon = lower.getDouble("lon")
-
-                val interpolatedSpeed = if (upperT == lowerT) lowerSpeed
-                else lowerSpeed + (upperSpeed - lowerSpeed) * ((frameTimeMs - lowerT).toFloat() / (upperT - lowerT))
-
-                val totalSec = frameTimeMs / 1000
-                val ms = frameTimeMs % 1000
-                val h = totalSec / 3600
-                val m = (totalSec % 3600) / 60
-                val s = totalSec % 60
-                val timestamp = String.format("%02d:%02d:%02d.%03d", h, m, s, ms)
-
-                sb.appendLine(String.format(
-                    "%-12d | %-15s | %6.1f km/h | lat=%.4f lon=%.4f",
-                    frameIndex, timestamp, interpolatedSpeed, lowerLat, lowerLon
-                ))
-            }
-
-            val outFile = File(getExternalFilesDir(null), "speed_report_${sessionId}.txt")
-            outFile.writeText(sb.toString())
-            Log.i("PostDrive", "Speed report saved: ${outFile.absolutePath}")
-
-        } catch (e: Exception) {
-            Log.e("PostDrive", "Speed report generation failed: ${e.message}")
-        }
-    }
-
-    @Suppress("DEPRECATION")
+    /**
+     * Builds the FULL multipart upload — the video plus every captured data file plus the
+     * tags — and sends it to the backend. On a successful response the session folder is
+     * deleted from the device (the server now has the data). On any failure the folder is
+     * kept so nothing is lost; a later launch-time sweep reclaims it once it is older than
+     * SessionStore.SESSION_RETENTION_HOURS.
+     */
     private fun uploadDrive() {
-        val name = recordingName ?: run {
-            Toast.makeText(this, "No recording found", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val file = getFileFromMediaStore(name) ?: run {
-            Toast.makeText(this, "Could not find video file", Toast.LENGTH_SHORT).show()
+        val dir = sessionDirPath?.let { File(it) }
+        if (dir == null || !dir.exists()) {
+            Toast.makeText(this, "Session folder missing", Toast.LENGTH_LONG).show()
             return
         }
 
-        generateSpeedReport(speedJson)
+        val builder = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("sessionId", sessionId ?: "")
+            .addFormDataPart("tags", tagsJson)
 
+        // video
+        videoPath?.let { vp ->
+            val vf = File(vp)
+            if (vf.exists()) {
+                builder.addFormDataPart("video", vf.name, vf.asRequestBody("video/mp4".toMediaType()))
+            }
+        }
+
+        // all captured sensor/frame/intrinsics files
+        for (name in DATA_FILES) {
+            val f = File(dir, name)
+            if (f.exists()) {
+                val mime = if (name.endsWith(".json")) "application/json" else "text/csv"
+                builder.addFormDataPart(name, name, f.asRequestBody(mime.toMediaType()))
+            }
+        }
+
+        val requestBody = builder.build()
         val prefs = getSharedPreferences("roadguard", MODE_PRIVATE)
         val token = prefs.getString("token", "") ?: ""
-
-        val dialog = ProgressDialog(this).apply {
-            setMessage("Uploading drive...")
-            isIndeterminate = true
-            setCancelable(false)
-            show()
-        }
-
-        val requestBody = MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart("sessionId", sessionId!!)
-            .addFormDataPart("tags", tagsJson)
-            .addFormDataPart("video", file.name, file.asRequestBody("video/mp4".toMediaType()))
-            .build()
-
         val request = Request.Builder()
             .url("$BASE_URL/driver/upload")
             .addHeader("Authorization", "Bearer $token")
             .post(requestBody)
             .build()
 
+        // Block a second submit while this one is in flight.
+        val btnYes = findViewById<Button>(R.id.btnYes)
+        btnYes.isEnabled = false
+        Toast.makeText(this, "Uploading drive…", Toast.LENGTH_SHORT).show()
+
         OkHttpClient().newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                Log.w("PostDrive", "Upload failed: ${e.message}")
                 runOnUiThread {
-                    dialog.dismiss()
-                    Toast.makeText(this@PostDriveActivity, "Upload failed: ${e.message}", Toast.LENGTH_LONG).show()
-                    Log.e("PostDrive", "Upload error: ${e.message}")
+                    btnYes.isEnabled = true
+                    // Keep the session on disk; the launch-time sweep removes it after X hours.
+                    Toast.makeText(this@PostDriveActivity,
+                        "Upload failed: ${e.message}. Saved on device — will retry/clean up later.",
+                        Toast.LENGTH_LONG).show()
                 }
             }
+
             override fun onResponse(call: Call, response: Response) {
+                val ok = response.use { it.isSuccessful }
                 runOnUiThread {
-                    dialog.dismiss()
-                    if (response.isSuccessful) {
+                    if (ok) {
+                        // Server has the full session now — reclaim the device storage.
+                        SessionStore.deleteSession(dir)
                         Toast.makeText(this@PostDriveActivity, "Drive uploaded!", Toast.LENGTH_LONG).show()
                         goHome()
                     } else {
-                        Toast.makeText(this@PostDriveActivity, "Server error: ${response.code}", Toast.LENGTH_LONG).show()
-                        Log.e("PostDrive", response.body?.string() ?: "")
+                        btnYes.isEnabled = true
+                        Toast.makeText(this@PostDriveActivity,
+                            "Server error: ${response.code}. Saved on device — will clean up later.",
+                            Toast.LENGTH_LONG).show()
                     }
                 }
             }
         })
-    }
-
-    private fun getFileFromMediaStore(displayName: String): File? {
-        val projection = arrayOf(MediaStore.Video.Media.DATA)
-        val selection = "${MediaStore.Video.Media.DISPLAY_NAME} = ?"
-        val cursor: Cursor? = contentResolver.query(
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI, projection, selection, arrayOf(displayName), null)
-        cursor?.use {
-            if (it.moveToFirst()) {
-                val path = it.getString(it.getColumnIndexOrThrow(MediaStore.Video.Media.DATA))
-                return File(path)
-            }
-        }
-        return null
     }
 
     private fun goHome() {
