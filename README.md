@@ -76,7 +76,7 @@ Web dashboard where authority reviewers watch violation clips (streamed directly
 ## Violation Types
 
 ### Solid-Line Crossing
-Detected when a vehicle's tracked bounding box crosses a solid lane marking. Uses a ghost-mask tracker to handle occlusion, a motion-direction filter to suppress false positives from oncoming traffic, and a K-of-M temporal gate before a crossing is confirmed.
+Detected when a vehicle's tracked bounding box crosses a solid lane marking. Uses a ghost-mask tracker to handle occlusion, a motion direction filter to suppress false positives from oncoming traffic, and a K-of-M temporal gate before a crossing is confirmed.
 
 ### Speeding
 Reconstructed from pinhole camera geometry combined with ego-motion estimates from the Android sensor streams (gyroscope + GPS + gravity). A Kalman smoother filters the velocity estimate, which is then compared against the speed limit retrieved from the OpenStreetMap Overpass API.
