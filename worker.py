@@ -26,6 +26,8 @@ Config (env vars, see backend/.env.example for the shared R2_* names):
 
 Run:  python worker.py
 """
+import csv as _csv
+import datetime as _dt
 import os
 import sys
 import time
@@ -79,6 +81,55 @@ def _headers():
     return h
 
 
+# Real GPS data from an Android device has timestamp_ms as absolute Unix milliseconds
+# (e.g. 1_752_000_000_000 ≈ year 2025). Stub/synthetic data uses relative ms starting
+# near 0. This threshold separates them so we only emit a recording date for real clips.
+_UNIX_EPOCH_THRESHOLD_MS = 1_000_000_000_000   # 2001-09-09 00:00:00 UTC
+
+# Mock ego speed used when no real GPS data is available (stub runs, demos).
+# Chosen to be above the mock limit so speeding confidence is non-trivial.
+_MOCK_SPEED_KMH   = 95.0
+_MOCK_LIMIT_KMH   = 80.0   # informational; actual limit enforcement is in the CV pipeline
+
+
+def _gps_at_frame(gps_path, key_frame, fps):
+    """Return (lat, lon, speed_kmh, recorded_iso) from gps.csv at the frame's timestamp.
+
+    Finds the row whose timestamp_ms is closest to key_frame/fps seconds into the clip.
+    recorded_iso is an ISO-8601 UTC string when timestamp_ms is a real Unix epoch
+    (friends will populate this from the Android GPS stream); None for synthetic stubs.
+    Falls back to _MOCK_SPEED_KMH when no GPS file is present or all speed rows are zero,
+    so the authority dashboard always shows a meaningful speed until real GPS is wired up.
+    """
+    if not os.path.isfile(gps_path):
+        return 0.0, 0.0, _MOCK_SPEED_KMH, None
+    rows = []
+    try:
+        with open(gps_path, newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                try:
+                    rows.append({
+                        "ts":  float(row["timestamp_ms"]),
+                        "lat": float(row.get("lat", 0) or 0),
+                        "lon": float(row.get("lon", 0) or 0),
+                        "spd": float(row.get("speed_kmh", 0) or 0),
+                    })
+                except (ValueError, KeyError):
+                    pass
+    except Exception as e:
+        print(f"[worker] gps.csv read error: {e}")
+        return 0.0, 0.0, 0.0, None
+    if not rows:
+        return 0.0, 0.0, _MOCK_SPEED_KMH, None
+    target_ms = key_frame * 1000.0 / max(fps, 1)
+    best = min(rows, key=lambda r: abs(r["ts"] - target_ms))
+    recorded_iso = None
+    if best["ts"] > _UNIX_EPOCH_THRESHOLD_MS:
+        recorded_iso = _dt.datetime.utcfromtimestamp(best["ts"] / 1000.0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    speed = best["spd"] if best["spd"] != 0.0 else _MOCK_SPEED_KMH
+    return best["lat"], best["lon"], speed, recorded_iso
+
+
 def make_s3():
     missing = [v for v in ("R2_BUCKET", "R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
                if not os.environ.get(v)]
@@ -104,14 +155,27 @@ def claim_job():
         return None
 
 
-def report_violation(s3, drive_id, evidence_key, v):
+def report_violation(drive_id, clip_key, plate_key, v_rec,
+                     lat=0.0, lon=0.0, speed=None, recorded_at=None):
+    """POST one violation record to the backend. v_rec is a manifest violation dict.
+
+    lat/lon/speed come from gps.csv at the violation's key frame (real values when the
+    Android clip includes absolute GPS timestamps; zeros for synthetic stubs).
+    recorded_at is an ISO-8601 UTC string derived from the GPS timestamp, or None.
+    """
+    details_speed = (v_rec.get("details") or {}).get("est_speed_kmh")
     body = {
-        "driveId": drive_id,
-        "videoClipPath": evidence_key,
-        "carId": v["carId"],
-        "calculatedSpeed": v["calculatedSpeed"],
-        "lat": v["lat"],
-        "lon": v["lon"],
+        "driveId":        drive_id,
+        "videoClipPath":  clip_key,
+        "plateClipPath":  plate_key,
+        "carId":          v_rec.get("plate") or f"vehicle_{v_rec.get('vehicle_id', '?')}",
+        "calculatedSpeed": speed if speed is not None else (details_speed or 0),
+        "lat":            lat,
+        "lon":            lon,
+        "recordedAt":     recorded_at,
+        "violationType":  v_rec.get("violation"),
+        "tier":           v_rec.get("tier"),
+        "confidence":     v_rec.get("detector_confidence"),
     }
     r = requests.post(SERVER_URL + "/api/internal/violation", json=body, headers=_headers(), timeout=30)
     if not r.ok:
@@ -129,44 +193,46 @@ def complete(drive_id, status, error=None):
         print(f"[worker] complete POST failed: {e}")
 
 
-def clip_first_seconds(src_path, dst_path, seconds=5):
-    """TEMPORARY evidence stand-in: write the first `seconds` of `src_path` to `dst_path`
-    with OpenCV (already a pipeline dependency -> no new install, no ffmpeg-on-PATH
-    requirement). Real per-violation clips are produced upstream later; this only exists
-    to exercise the upload -> serve path end to end. Returns the frame count written."""
-    import cv2
-    cap = cv2.VideoCapture(src_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"cannot open video to clip: {src_path}")
-    fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    max_frames = max(1, int(round(fps * seconds)))
-    writer = cv2.VideoWriter(dst_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    written = 0
+def _extract_clip_h264(src_path, dst_path, start_sec, end_sec):
+    """Cut [start_sec, end_sec] from src_path and write an H.264/faststart MP4 to dst_path.
+    Uses fast keyframe seek (-ss before -i). Returns True on success, False if ffmpeg is absent."""
+    if shutil.which("ffmpeg") is None:
+        print("[worker] WARNING: ffmpeg not on PATH — clip skipped; install ffmpeg for evidence clips.")
+        return False
+    import subprocess
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", f"{start_sec:.3f}", "-to", f"{end_sec:.3f}", "-i", src_path,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an",
+        dst_path,
+    ]
     try:
-        while written < max_frames:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            writer.write(frame)
-            written += 1
-    finally:
-        cap.release()
-        writer.release()
-    if written == 0:
-        raise RuntimeError(f"no frames read from {src_path}")
-    return written
+        subprocess.run(cmd, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[worker] ffmpeg clip failed: {e}")
+        return False
 
 
 def process(s3, job, yolo_model):
-    drive_id  = job["driveId"]
-    session   = job["sessionId"]
-    files     = job["files"] or {}
-    job_dir   = os.path.join(WORK_DIR, session)
+    """
+    Full pipeline for one drive job:
+      1. Download raw inputs from incoming/<session>/ in R2.
+      2. Run the CV pipeline (run_pipeline from main.py).
+      3. For each ViolationEvent: cut a 15s H.264/faststart clip (10s pre + 5s post key_frame).
+      4. Call violations.export.build_export to get the ranked manifest + per-violation file tree.
+      5. Upload every file from the bundle to output/<session>/<violation_id>/ in R2.
+      6. POST one /api/internal/violation per violation to the backend.
+    """
+    import subprocess
+    drive_id = job["driveId"]
+    session  = job["sessionId"]
+    files    = job["files"] or {}
+    job_dir  = os.path.join(WORK_DIR, session)
     os.makedirs(job_dir, exist_ok=True)
 
-    # 2. Download every artifact to its expected local filename.
+    # ── 1. Download raw inputs from incoming/<session>/ ──────────────────────
     video_key = files.get("video")
     if not video_key:
         raise RuntimeError("drive has no video key")
@@ -177,37 +243,123 @@ def process(s3, job, yolo_model):
         if key:
             s3.download_file(R2_BUCKET, key, os.path.join(job_dir, fname))
 
-    # 3. Run the pipeline (Android clip: ego pose reconstructed from the sensor CSVs).
-    from main import run_pipeline   # imported lazily so a missing GPU stack fails per-job, not at startup
-    result = run_pipeline(video_local, is_simulation=False, yolo_model=yolo_model)
+    # ── 2. Run the CV pipeline ────────────────────────────────────────────────
+    from main import run_pipeline   # lazy: GPU stack failures are per-job, not at startup
+    result = run_pipeline(
+        video_local, is_simulation=False, yolo_model=yolo_model, out_dir=job_dir)
 
-    violations = result.get("violations", [])
+    results_by_event = result["results_by_event"]   # [(ViolationEvent, EvidenceResult|None)]
+    fps              = result["fps"]
+    total_frames     = result["total_frames"]
 
-    # 4. Evidence clip. TEMPORARY: real per-violation clips will be produced upstream
-    # later (a teammate owns that). For now upload a single 5-second clip cut from the
-    # START of the raw video, so the full download -> process -> upload -> serve path is
-    # exercised end to end. It's uploaded unconditionally (even with zero violations) so
-    # the R2 .../out/ path can be verified; every violation references this one key.
-    clip_local = os.path.join(job_dir, "evidence_5s.mp4")
-    clip_first_seconds(video_local, clip_local, seconds=5)
-    evidence_key = f"{session}/out/{os.path.basename(clip_local)}"
-    s3.upload_file(clip_local, R2_BUCKET, evidence_key, ExtraArgs={"ContentType": "video/mp4"})
+    # ── 3. Cut a per-violation H.264/faststart clip (10s pre + 5s post) ──────
+    try:
+        from violations.clip_extract import clip_window, ClipAsset
+        _CLIP_IMPORT_OK = True
+    except Exception as _e:
+        print(f"[worker] clip_extract unavailable ({_e}); clips will be skipped")
+        _CLIP_IMPORT_OK = False
 
-    # 5. Report each violation (all referencing the temporary evidence clip above).
-    for v in violations:
-        report_violation(s3, drive_id, evidence_key, v)
+    records = []
+    for event, evidence in results_by_event:
+        clip = None
+        if _CLIP_IMPORT_OK:
+            try:
+                win  = clip_window(event.key_frame, fps, total_frames=total_frames)
+                clip_path = os.path.join(
+                    job_dir, f"v{event.vehicle_id}_{event.violation_type}_f{event.key_frame}.mp4")
+                ok = _extract_clip_h264(video_local, clip_path, win.start_sec, win.end_sec)
+                if ok:
+                    clip = ClipAsset(path=clip_path, window=win, container="mp4", recompressed=True)
+                    # Annotate: draw a green bbox around the violating vehicle on every frame.
+                    bbox = event.details.get("bbox")
+                    if bbox:
+                        try:
+                            from violations.clip_extract import annotate_clip_inplace
+                            from violations.export import describe_violation as _desc_v
+                            annotate_clip_inplace(clip_path, bbox, _desc_v(event)[:70])
+                        except Exception as ann_err:
+                            print(f"[worker] clip annotation skipped: {ann_err}")
+            except Exception as e:
+                print(f"[worker] clip extraction failed for {event.vehicle_id}/{event.violation_type}: {e}")
+        records.append((event, evidence, clip))
 
-    print(f"[worker] drive {drive_id}: {len(violations)} violation(s)")
+    # ── 4. Assemble ranked manifest + file tree via export.py ────────────────
+    try:
+        from violations import export as vx
+        bundle = vx.build_export(records)
+    except Exception as e:
+        print(f"[worker] build_export failed ({e}); no violations uploaded")
+        print(f"[worker] drive {drive_id}: {len(results_by_event)} violation(s) (export failed)")
+        return
+
+    # ── 5. Upload per-violation folder tree to output/<date>_<name>/ ─────────
+    # Use a human-readable date + video filename so R2 is easy to navigate.
+    import re as _re
+    _date_str   = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+    _vid_stem   = os.path.splitext(os.path.basename(video_local))[0]
+    _safe_stem  = _re.sub(r"[^a-zA-Z0-9_-]", "_", _vid_stem)[:50]
+    out_prefix  = f"output/{_date_str}_{_safe_stem}/"
+
+    # manifest.json at the session root
+    manifest_bytes = __import__("json").dumps(bundle.manifest, ensure_ascii=False, indent=2).encode()
+    s3.put_object(Bucket=R2_BUCKET, Key=out_prefix + "manifest.json",
+                  Body=manifest_bytes, ContentType="application/json")
+
+    # each file from bundle.files (e.g. v5_SOLID_LINE_CROSSING_f200/clip.mp4)
+    for rel_path, data in bundle.files.items():
+        r2_key = out_prefix + rel_path
+        content_type = ("video/mp4"    if rel_path.endswith(".mp4")
+                        else "image/png" if rel_path.endswith(".png")
+                        else "application/json" if rel_path.endswith(".json")
+                        else "application/octet-stream")
+        try:
+            s3.put_object(Bucket=R2_BUCKET, Key=r2_key, Body=bytes(data), ContentType=content_type)
+        except Exception as e:
+            print(f"[worker] R2 upload failed for {r2_key}: {e}")
+
+    # ── 6. POST each violation to the backend ────────────────────────────────
+    # Build a GPS lookup keyed by violation_id so we can attach real lat/lon/speed/date.
+    from violations.export import violation_id as _viol_id_str
+    gps_path = os.path.join(job_dir, "gps.csv")
+    gps_cache = {}
+    for event, _ev in results_by_event:
+        key = _viol_id_str(event)
+        gps_cache[key] = _gps_at_frame(gps_path, event.key_frame, fps or 30)
+
+    for v_rec in bundle.violations:
+        vid      = v_rec["violation_id"]          # e.g. v5_SOLID_LINE_CROSSING_f200
+        clip_key  = out_prefix + vid + "/clip.mp4"
+
+        # plate.png is in the evidence block if it was collected
+        plate_entry = (v_rec.get("evidence") or {}).get("plate_crop")
+        plate_key   = (out_prefix + plate_entry["file"]) if plate_entry else None
+
+        lat, lon, speed, recorded_at = gps_cache.get(vid, (0.0, 0.0, 0.0, None))
+        report_violation(drive_id, clip_key, plate_key, v_rec,
+                         lat=lat, lon=lon, speed=speed, recorded_at=recorded_at)
+
+    print(f"[worker] drive {drive_id}: {len(bundle.violations)} violation(s) uploaded to {out_prefix}")
 
 
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
     s3 = make_s3()
 
-    # Load the detector once, reuse for every job.
-    from main import loadYoloModel
+    # Load the vehicle detector + lane-seg model once; reuse for every job.
+    import main as _main
+    from main import loadYoloModel, loadLaneModel
     print("[worker] loading YOLO model ...")
     yolo_model = loadYoloModel()
+
+    # Lane-seg model is required for solid-line crossing detection (LANE_MODEL global in main.py).
+    _lane_weights = os.path.join(_main.REPO_ROOT, "weights", "phase3_v3_yellowprotect.pt")
+    if os.path.isfile(_lane_weights):
+        _main.LANE_MODEL = loadLaneModel(_lane_weights)
+        print(f"[worker] lane-seg model loaded ({os.path.basename(_lane_weights)})")
+    else:
+        print(f"[worker] WARNING: lane weights not found at {_lane_weights}; crossing detection disabled")
+
     print(f"[worker] ready -- polling {SERVER_URL} every {POLL_SECONDS}s as '{WORKER_ID}'")
 
     while True:

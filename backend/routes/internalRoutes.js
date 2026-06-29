@@ -73,13 +73,24 @@ router.post('/drive/:id/complete', async (req, res) => {
  * processed — the worker does that via /drive/:id/complete after all violations are in.
  */
 router.post('/violation', async (req, res) => {
-    const { driveId, videoClipPath, carId, calculatedSpeed, lat, lon } = req.body;
-    if (!driveId || !videoClipPath || !carId || calculatedSpeed == null || lat == null || lon == null) {
+    const { driveId, videoClipPath, plateClipPath, carId, calculatedSpeed, lat, lon,
+            violationType, tier, confidence, recordedAt } = req.body;
+    if (!driveId || !videoClipPath || !carId) {
         return res.status(400).json({ success: false, message: 'Missing required fields', data: null });
     }
     const drive = await Drive.findById(driveId);
     if (!drive) return res.status(404).json({ success: false, message: 'Drive not found', data: null });
-    const violation = await Violation.create({ driveId, driverId: drive.driverId, videoClipPath, carId, calculatedSpeed, location: { lat, lon } });
+    const violation = await Violation.create({
+        driveId, driverId: drive.driverId,
+        videoClipPath, plateClipPath: plateClipPath || null,
+        carId,
+        calculatedSpeed: calculatedSpeed ?? 0,
+        location: { lat: lat ?? 0, lon: lon ?? 0 },
+        violationType: violationType || null,
+        tier: tier != null ? tier : 2,
+        confidence: confidence != null ? confidence : null,
+        recordedAt: recordedAt ? new Date(recordedAt) : null,
+    });
     res.status(201).json({ success: true, message: 'Violation recorded', data: { violationId: violation._id } });
 });
 

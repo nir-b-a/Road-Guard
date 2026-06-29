@@ -133,6 +133,49 @@ def extract_clip(src: str, dest: str, window: ClipWindow, *,
                      recompressed=recompress)
 
 
+def annotate_clip_inplace(clip_path: str, bbox, label: str = "") -> bool:
+    """Burn a green bounding box (+ optional label) onto every frame of clip_path via ffmpeg.
+
+    Re-encodes in place (libx264 faststart). Returns True on success, False when ffmpeg is
+    unavailable or the bbox is degenerate. Never raises -- a failed annotation leaves the
+    original clip untouched so the evidence is still deliverable.
+    """
+    import shutil
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+    except (TypeError, ValueError):
+        return False
+    w, h = max(1, x2 - x1), max(1, y2 - y1)
+    if w < 2 or h < 2:
+        return False
+
+    vf_parts = [f"drawbox=x={x1}:y={y1}:w={w}:h={h}:color=green@0.9:t=3"]
+    if label:
+        safe = label.replace("'", "").replace("\\", "").replace(":", " -")[:60]
+        vf_parts.append(
+            f"drawtext=text='{safe}':x={x1}:y=max({y1}-22\\,4)"
+            f":fontsize=15:fontcolor=white:box=1:boxcolor=green@0.6:boxborderw=3"
+        )
+    vf = ",".join(vf_parts)
+
+    tmp = clip_path + ".ann_tmp.mp4"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", clip_path,
+             "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+             "-movflags", "+faststart", "-an", tmp],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        os.replace(tmp, clip_path)
+        return True
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return False
+
+
 def extract_violation_clips(src: str, events, fps: float, out_dir: str, *,
                             total_frames: Optional[int] = None,
                             runner: FfmpegRunner = _default_ffmpeg_runner,

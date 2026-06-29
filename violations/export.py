@@ -264,6 +264,14 @@ def _crop_entries(event: ViolationEvent, evidence, png_encoder: PngEncoder,
         path = f"{stem}/plate.png"
         files[path] = png
         plate_entry = {"file": path, "bytes": len(png), "sha256": _sha256_hex(png)}
+    # Unconditional fallback: when no dedicated plate crop exists (FastALPR found nothing),
+    # export the sharpest vehicle crop as vehicle_crop.png so the authority dashboard always
+    # has an image for manual plate review instead of a blank card.
+    if plate_entry is None and crop_imgs:
+        png = png_encoder(crop_imgs[0])
+        path = f"{stem}/vehicle_crop.png"
+        files[path] = png
+        plate_entry = {"file": path, "bytes": len(png), "sha256": _sha256_hex(png)}
     return crops, plate_entry
 
 

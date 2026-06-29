@@ -523,14 +523,16 @@ def evaluate_crossing(seg_frames: list, fps: float, frame_height: int, frame_wid
     incidents = merge_events(events_from_timeline(timeline, k_consec), fps, cooldown_sec=3.0)
     events = []
     for tid, s, e in incidents:
-        # confidence=1.0 (binary) here because the timeline path has no bbox depth.
-        # When Stage-2 cascade is wired in, use decision.crossing_confidence instead.
+        n_frames = e - s + 1
+        # Confidence from crossing duration: ~1 frame → 0.30, ≥0.3 s → 1.0.
+        # Replace with decision.crossing_confidence when Stage-2 cascade is wired in.
+        conf = min(1.0, max(0.30, n_frames / max(1.0, 0.3 * fps)))
         events.append(ViolationEvent(
             vehicle_id=tid,
             violation_type=ViolationType.SOLID_LINE_CROSSING,
             key_frame=s,
-            confidence=1.0,
-            details={"start_frame": s, "end_frame": e, "n_frames_over": e - s + 1},
+            confidence=round(conf, 4),
+            details={"start_frame": s, "end_frame": e, "n_frames_over": n_frames},
         ))
     print(f"[crossing] {len(incidents)} solid-line crossing incident(s) -> ViolationEvent(s)")
     return events
@@ -546,6 +548,11 @@ def run_evidence_and_report(world: World, all_events: list, out_dir: str, video_
     for e in all_events:
         v = world.getVehicle(e.vehicle_id)
         known = v.license_plate if v is not None else None
+        # Store the vehicle's bounding box so the worker can annotate the evidence clip.
+        if v is not None:
+            bbox = v.bounding_box.get(e.key_frame) or v.bounding_box.get(v.end_frame)
+            if bbox and bbox != (0, 0, 0, 0):
+                e.details["bbox"] = list(bbox)
         result = None
         if EVIDENCE_COLLECTOR is not None:
             result = EVIDENCE_COLLECTOR.collect_evidence(e, known_plate=known)
@@ -753,6 +760,177 @@ def export_and_push_violations(world: World, results_by_event: list, *, job: dic
         print(f"[export] job payload had no upload_url and no --push-url; bundle saved locally only")
 
 
+def run_pipeline(video_path: str, *, is_simulation: bool = False, yolo_model,
+                 out_dir: str | None = None, max_frames: int = 0,
+                 lane_conf: float = 0.25, undistorter=None) -> dict:
+    """Run the CV pipeline on one clip and return its results.
+
+    Workers import and call this directly; ``main()`` calls it then does rendering + backend export.
+    Globals LANE_MODEL and EVIDENCE_COLLECTOR are read from the module level — set them before
+    calling if yellow-line or LPR support is needed (main() handles that; worker leaves them None).
+
+    Returns a dict: results_by_event, world, fps, total_frames, frame_w, frame_h,
+    video_name, out_dir, all_frame_vehicles, recs, incidents, all_events, is_android.
+    """
+    video_dir  = os.path.dirname(os.path.abspath(video_path))
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    _out_dir   = out_dir if out_dir is not None else video_dir
+    os.makedirs(_out_dir, exist_ok=True)
+
+    vh = VideoHandler(video_path)
+    frame_height, frame_width = vh.get_frame().shape[:2]
+    world = World(vh.get_frame_count())
+    print(f"number of frames in the video is {vh.get_frame_count()}")
+
+    frame_id = 0
+    read_times, yolo_times, postprocess_times = [], [], []
+    all_frame_vehicles: dict[int, list] = {}
+    seg_frames: list = []
+    prev_gray = None
+    yellow_enabled = LANE_MODEL is not None     # set by caller before run_pipeline
+
+    start_time = time.time()
+    while True:
+        t_read = time.time()
+        frame = vh.get_frame()
+        if undistorter is not None:        # UNDISTORT (removable)
+            frame = undistorter(frame)
+        read_times.append(time.time() - t_read)
+        if frame is None:
+            read_times.pop()
+            break
+
+        yolo_time, postprocess_time, frame_vehicles = processFrame(yolo_model, world, frame, frame_id)
+        yolo_times.append(yolo_time)
+        postprocess_times.append(postprocess_time)
+        all_frame_vehicles[frame_id] = frame_vehicles
+
+        if yellow_enabled:
+            cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            shift = estimate_ego_shift(prev_gray, cur_gray) if prev_gray is not None else (0.0, 0.0)
+            prev_gray = cur_gray
+            seg_frames.append({"frame": frame_id, "vehicles": frame_vehicles,
+                               "lanes": seg_lanes(LANE_MODEL, frame, lane_conf),
+                               "shift": [round(shift[0], 2), round(shift[1], 2)]})
+
+        frame_id += 1
+        if max_frames and frame_id >= max_frames:
+            break
+        t_read = time.time()
+        vh.read_next()
+        read_times[-1] += time.time() - t_read
+
+    vh.release()
+    total_frames = frame_id
+    print_time(start_time, read_times, yolo_times, postprocess_times, frame_id)
+
+    for v in world.vehicles.values():
+        if v._plate_candidates:
+            counts = Counter(v._plate_candidates)
+            max_count = max(counts.values())
+            v.license_plate = next(p for p in reversed(v._plate_candidates) if counts[p] == max_count)
+
+    # ── 1. Input mode ────────────────────────────────────────────────────────
+    telemetry_csv   = os.path.join(video_dir, "telemetry.csv")
+    frames_csv      = os.path.join(video_dir, "frames.csv")
+    gyro_csv        = os.path.join(video_dir, "gyro.csv")
+    gravity_csv     = os.path.join(video_dir, "gravity.csv")
+    gps_csv         = os.path.join(video_dir, "gps.csv")
+    linacc_csv      = os.path.join(video_dir, "linacc.csv")
+    intrinsics_json = os.path.join(video_dir, "intrinsics.json")
+    is_android = (not is_simulation) and all(
+        os.path.exists(p) for p in (frames_csv, gyro_csv, gravity_csv, gps_csv))
+
+    # ── 3. Finalize tracks ───────────────────────────────────────────────────
+    for vehicle in world.vehicles.values():
+        vehicle.resolve_vehicle_type()
+
+    # ── 4. Timebase & bbox gap-fill ──────────────────────────────────────────
+    fps = vh.get_fps()
+    if is_android:
+        fps = ego_yaw.fps_from_frame_timestamps(frames_csv) or fps
+    interpolate_bbox_gaps(world, fps, max_gap_seconds=Constants.MAX_GAP_SECONDS)
+
+    # ── 5. Camera intrinsics ─────────────────────────────────────────────────
+    if is_android:
+        fx, fy, cx, cy = ego_yaw.load_intrinsics(intrinsics_json, frame_width, frame_height)
+    else:
+        fl = focal_length_from_fov(frame_width, fov_horizontal_deg=Constants.FOV_HORIZONTAL_DEG)
+        fx = fy = fl
+        cx = frame_width / 2
+        cy = frame_height / 2
+
+    # ── UNDISTORT (removable): match pipeline geometry to the rectified frames ──
+    if undistorter is not None and undistorter.K_used is not None:
+        K = undistorter.K_used
+        fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+        print(f"[undistort] intrinsics overridden to rectified K: "
+              f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
+    # ── end UNDISTORT block (inside run_pipeline) ──
+
+    # ── 6. Distance ──────────────────────────────────────────────────────────
+    estimateDistance(world, fx, fy, cx, cy, Constants.DEFAULT_CAMERA_HEIGHT_M)
+    smooth_distances(world, Constants.SMOOTH_WINDOW, Constants.POLYORDER)
+
+    # ── 7. Speed (world-frame reconstruction + Kalman) ───────────────────────
+    valid_roi = undistorter.valid_roi if undistorter is not None else None
+    run_speed_estimation(
+        world, fps, fx, fy, cx, cy,
+        is_simulation=is_simulation, is_android=is_android,
+        telemetry_csv=telemetry_csv, frames_csv=frames_csv,
+        gyro_csv=gyro_csv, gravity_csv=gravity_csv, gps_csv=gps_csv,
+        linacc_csv=linacc_csv,
+        image_width=frame_width, image_height=frame_height,
+        valid_roi=valid_roi)
+
+    # ── 7.5 Speeding ──────────────────────────────────────────────────────────
+    overspeed_events = []
+    speeding_events = []
+    if is_android and "--no-overspeed" not in sys.argv:
+        try:
+            margin = float(_cli_value("--overspeed-margin", overspeed.OVERSPEED_MARGIN_KMH))
+            ego_track = overspeed.build_ego_track(frames_csv, gps_csv)
+            overspeed_events = overspeed.flag_overspeed_vehicles(world, ego_track, margin_kmh=margin)
+            report = overspeed.format_overspeed_report(overspeed_events)
+            print("\n[overspeed] " + report)
+            with open(os.path.join(_out_dir, f"{video_name}_overspeed.txt"), "w", encoding="utf-8") as fh:
+                fh.write(report + "\n")
+            overspeed.write_overspeed_csv(overspeed_events,
+                                          os.path.join(_out_dir, f"{video_name}_overspeed.csv"))
+        except Exception as e:
+            print(f"[overspeed] skipped (lookup/parse failed): {e}")
+
+    # ── 7.6 Yellow-line (shoulder) violation ──────────────────────────────────
+    yellow_events, recs, incidents = evaluate_yellow_line(
+        world, seg_frames, video_path, video_name,
+        frame_width, frame_height, frame_id, fps, once_per_vehicle=False)
+
+    # ── 7.65 Solid-line crossing violation ────────────────────────────────────
+    crossing_events = evaluate_crossing(seg_frames, fps, frame_height, frame_width)
+
+    # ── 7.7 Evidence stage over ALL violations ────────────────────────────────
+    all_events = (crossing_events
+                  + speeding_to_events(speeding_events) + overspeed_to_events(overspeed_events)
+                  + yellow_events)
+    results_by_event = run_evidence_and_report(world, all_events, _out_dir, video_name)
+
+    return {
+        "results_by_event":   results_by_event,
+        "world":              world,
+        "fps":                fps,
+        "total_frames":       total_frames,
+        "frame_w":            frame_width,
+        "frame_h":            frame_height,
+        "video_name":         video_name,
+        "out_dir":            _out_dir,
+        "all_frame_vehicles": all_frame_vehicles,
+        "recs":               recs,
+        "incidents":          incidents,
+        "all_events":         all_events,
+        "is_android":         is_android,
+    }
+
+
 def main():
     global EVIDENCE_COLLECTOR, LANE_MODEL
 
@@ -822,176 +1000,43 @@ def main():
             print("[undistort] --undistort set but no calibration report found; running raw")
     # ── end UNDISTORT block ──
 
-    vh = VideoHandler(video_path)
-    frame_height, frame_width = vh.get_frame().shape[:2]
-    world = World(vh.get_frame_count())
-    print(f"number of frames in the video is {vh.get_frame_count()}")
+    result = run_pipeline(
+        video_path, is_simulation=is_simulation, yolo_model=yolo_model,
+        out_dir=out_dir, max_frames=max_frames, lane_conf=lane_conf, undistorter=undistorter)
 
-    frame_id = 0
-    read_times, yolo_times, postprocess_times = [], [], []
-    all_frame_vehicles: dict[int, list] = {}            # frame -> [{track_id, bbox}]
-    seg_frames: list = []                               # per-frame lane-seg cache (yellow rule)
-    prev_gray = None
+    results_by_event   = result["results_by_event"]
+    world              = result["world"]
+    fps                = result["fps"]
+    total_frames       = result["total_frames"]
+    frame_width        = result["frame_w"]
+    frame_height       = result["frame_h"]
+    video_name         = result["video_name"]
+    all_frame_vehicles = result["all_frame_vehicles"]
+    recs               = result["recs"]
+    incidents          = result["incidents"]
+    all_events         = result["all_events"]
+    is_android         = result["is_android"]
 
-    start_time = time.time()
-    while True:
-        t_read = time.time()
-        frame = vh.get_frame()
-        if undistorter is not None:        # UNDISTORT (removable)
-            frame = undistorter(frame)
-        read_times.append(time.time() - t_read)
-        if frame is None:
-            read_times.pop()
-            break
-
-        yolo_time, postprocess_time, frame_vehicles = processFrame(yolo_model, world, frame, frame_id)
-        yolo_times.append(yolo_time)
-        postprocess_times.append(postprocess_time)
-        all_frame_vehicles[frame_id] = frame_vehicles
-
-        # Build the yellow-line cache live: lane segmentation + optical-flow ego shift.
-        if yellow_enabled:
-            cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            shift = estimate_ego_shift(prev_gray, cur_gray) if prev_gray is not None else (0.0, 0.0)
-            prev_gray = cur_gray
-            seg_frames.append({"frame": frame_id, "vehicles": frame_vehicles,
-                               "lanes": seg_lanes(LANE_MODEL, frame, lane_conf),
-                               "shift": [round(shift[0], 2), round(shift[1], 2)]})
-
-        frame_id += 1
-        if max_frames and frame_id >= max_frames:
-            break
-        t_read = time.time()
-        vh.read_next()
-        read_times[-1] += time.time() - t_read
-
-    vh.release()
-    print_time(start_time, read_times, yolo_times, postprocess_times, frame_id)
-
-    for v in world.vehicles.values():
-        if v._plate_candidates:
-            counts = Counter(v._plate_candidates)
-            max_count = max(counts.values())
-            v.license_plate = next(p for p in reversed(v._plate_candidates) if counts[p] == max_count)
-
-    # ── 1. Input mode ────────────────────────────────────────────────────────
-    telemetry_csv   = os.path.join(video_dir, "telemetry.csv")
-    frames_csv      = os.path.join(video_dir, "frames.csv")
-    gyro_csv        = os.path.join(video_dir, "gyro.csv")
-    gravity_csv     = os.path.join(video_dir, "gravity.csv")
-    gps_csv         = os.path.join(video_dir, "gps.csv")
-    linacc_csv      = os.path.join(video_dir, "linacc.csv")
-    intrinsics_json = os.path.join(video_dir, "intrinsics.json")
-    is_android = (not is_simulation) and all(
-        os.path.exists(p) for p in (frames_csv, gyro_csv, gravity_csv, gps_csv))
-
-    # ── 3. Finalize tracks ───────────────────────────────────────────────────
-    for vehicle in world.vehicles.values():
-        vehicle.resolve_vehicle_type()
-
-    # ── 4. Timebase & bbox gap-fill ──────────────────────────────────────────
-    fps = vh.get_fps()
-    if is_android:
-        fps = ego_yaw.fps_from_frame_timestamps(frames_csv) or fps
-    interpolate_bbox_gaps(world, fps, max_gap_seconds=Constants.MAX_GAP_SECONDS)
-
-    # ── 5. Camera intrinsics ─────────────────────────────────────────────────
-    if is_android:
-        fx, fy, cx, cy = ego_yaw.load_intrinsics(intrinsics_json, frame_width, frame_height)
-    else:
-        fl = focal_length_from_fov(frame_width, fov_horizontal_deg=Constants.FOV_HORIZONTAL_DEG)
-        fx = fy = fl
-        cx = frame_width / 2
-        cy = frame_height / 2
-
-    # ── UNDISTORT (removable): match pipeline geometry to the rectified frames ──
-    if undistorter is not None and undistorter.K_used is not None:
-        K = undistorter.K_used
-        fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
-        print(f"[undistort] intrinsics overridden to rectified K: "
-              f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
-    # ── end UNDISTORT block ──
-
-    # ── 6. Distance ──────────────────────────────────────────────────────────
-    estimateDistance(world, fx, fy, cx, cy, Constants.DEFAULT_CAMERA_HEIGHT_M)
-    smooth_distances(world, Constants.SMOOTH_WINDOW, Constants.POLYORDER)
-
-    # ── 7. Speed (world-frame reconstruction + Kalman) ───────────────────────
-    valid_roi = undistorter.valid_roi if undistorter is not None else None
-    run_speed_estimation(
-        world, fps, fx, fy, cx, cy,
-        is_simulation=is_simulation, is_android=is_android,
-        telemetry_csv=telemetry_csv, frames_csv=frames_csv,
-        gyro_csv=gyro_csv, gravity_csv=gravity_csv, gps_csv=gps_csv,
-        linacc_csv=linacc_csv,
-        image_width=frame_width, image_height=frame_height,
-        valid_roi=valid_roi)
-
-    # ── 7.0 Simulated speeds (offline baseline; replaces the unavailable world-frame estimate) ──
-    # Deterministic per-vehicle speeds so the speeding rule + the speed report are exercised and
-    # REPRODUCIBLE for the optimization baseline diff. Assigned after gap-fill so interpolated
-    # frames are covered too. Also feeds the shoulder rule's real speed gate.
-    if sim_speed:
-        simulated_speed.assign_simulated_speeds(world, fps)
-
-    # ── 7.5 Speeding ──────────────────────────────────────────────────────────
-    # --sim-speed: fixed posted limit (100) with the 110 violation line, report-once-at-onset +
-    # 30 s per-vehicle cooldown + max-speed-in-zone. Otherwise the legacy android GPS-proxy path.
-    overspeed_events = []      # OverspeedEvent (android path)
-    speeding_events = []       # SpeedingEvent  (sim path)
-    if sim_speed:
-        speeding_events = overspeed.flag_speeding_fixed_limit(
-            world,
-            limit_kmh=simulated_speed.SIM_LIMIT_KMH,
-            threshold_kmh=simulated_speed.SIM_SPEEDING_THRESHOLD_KMH,
-            fps=fps)
-        print(f"[speeding] {len(speeding_events)} speeding episode(s) "
-              f"(limit={simulated_speed.SIM_LIMIT_KMH:.0f}, "
-              f">={simulated_speed.SIM_SPEEDING_THRESHOLD_KMH:.0f} km/h)")
-    elif is_android and "--no-overspeed" not in sys.argv:
-        try:
-            margin = float(_cli_value("--overspeed-margin", overspeed.OVERSPEED_MARGIN_KMH))
-            ego_track = overspeed.build_ego_track(frames_csv, gps_csv)
-            overspeed_events = overspeed.flag_overspeed_vehicles(world, ego_track, margin_kmh=margin)
-            report = overspeed.format_overspeed_report(overspeed_events)
-            print("\n[overspeed] " + report)
-            with open(os.path.join(out_dir, f"{video_name}_overspeed.txt"), "w", encoding="utf-8") as fh:
-                fh.write(report + "\n")
-            overspeed.write_overspeed_csv(overspeed_events,
-                                          os.path.join(out_dir, f"{video_name}_overspeed.csv"))
-        except Exception as e:
-            print(f"[overspeed] skipped (lookup/parse failed): {e}")
-
-    # ── 7.6 Yellow-line (shoulder) violation -- strictly once per vehicle in baseline mode ──
-    yellow_events, recs, incidents = evaluate_yellow_line(
-        world, seg_frames, video_path, video_name,
-        frame_width, frame_height, frame_id, fps, once_per_vehicle=sim_speed)
-
-    # ── 7.65 Solid-line crossing violation (wired off the same lane-seg cache) ──
-    crossing_events = evaluate_crossing(seg_frames, fps, frame_height, frame_width)
-
-    # ── 7.7 Evidence stage over ALL violations (crossing + speeding + yellow), one record shape ──
-    all_events = (crossing_events
-                  + speeding_to_events(speeding_events) + overspeed_to_events(overspeed_events)
-                  + yellow_events)
-    results_by_event = run_evidence_and_report(world, all_events, out_dir, video_name)
     write_perframe_and_tracks(world, all_frame_vehicles, recs, incidents, out_dir, video_name, fps)
-
-    # ── 7.75 Backend export (opt-in): bundle each violation's clip + 3 pics + .docx and push it ──
-    # --push-url (legacy multipart) or --job-payload (Cloudflare presigned PUT + webhook). No-op
-    # otherwise, so the standard/baseline run is unchanged and never touches the network.
-
-    export_and_push_violations(
-        world, results_by_event, job=job, video_path=video_path, video_name=video_name, fps=fps,
-        frame_w=frame_width, frame_h=frame_height, total_frames=frame_id, out_dir=out_dir)
 
     # ── 8. Outputs ───────────────────────────────────────────────────────────
     distanceLogger.export_vehicle_summary(
         world, os.path.join(out_dir, f"{video_name}_vehicles.csv"))
 
+    # ── 7.75 Backend export (opt-in) ──────────────────────────────────────────
+    export_and_push_violations(
+        world, results_by_event, job=job, video_path=video_path, video_name=video_name, fps=fps,
+        frame_w=frame_width, frame_h=frame_height, total_frames=total_frames, out_dir=out_dir)
+
     if benchmark:
         print("[benchmark] done -- CSV/text data written; skipped plots + annotated video render")
         return
+
+    telemetry_csv = os.path.join(video_dir, "telemetry.csv")
+    frames_csv    = os.path.join(video_dir, "frames.csv")
+    gps_csv       = os.path.join(video_dir, "gps.csv")
+    linacc_csv    = os.path.join(video_dir, "linacc.csv")
+    gravity_csv   = os.path.join(video_dir, "gravity.csv")
 
     draw_vehicle_plots.plot_all_vehicles(
         world, out_dir, video_name,

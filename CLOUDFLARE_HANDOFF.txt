@@ -1,0 +1,205 @@
+ROAD GUARD — CLOUDFLARE / DASHBOARD HANDOFF
+===========================================
+Branch: cloudflare
+Date:   2026-06-29
+Author: Tal (+ Claude Code session)
+
+This file documents everything that was implemented in this session so the next
+developer (Nir / anyone picking up the cloudflare branch) can understand the
+current state without re-deriving anything.
+
+─────────────────────────────────────────────────────────────────────────────
+WHAT WORKS RIGHT NOW
+─────────────────────────────────────────────────────────────────────────────
+
+✓ Video plays in the authority dashboard
+  → The backend (authorityController.getEvidence) now mints a presigned R2
+    GET URL (15-min TTL) via r2.presignGet(). The <video src> points directly
+    at Cloudflare R2 — no Authorization header needed, no proxy.
+  → CORS is configured on the R2 bucket automatically on server startup
+    (r2.configureCors() in server.js → PutBucketCorsCommand).
+
+✓ GPS timestamp / date shows correctly
+  → worker._gps_at_frame() reads gps.csv, finds the row closest to the
+    violation's key frame (by timestamp_ms), and extracts lat, lon, speed,
+    and a recordedAt ISO string.
+  → If timestamp_ms > 1_000_000_000_000 (real Unix epoch, year > 2001),
+    recordedAt is set; otherwise it's null and the UI falls back to detectedAt.
+  → Violation.js now has a recordedAt: { type: Date, default: null } field.
+  → internalRoutes.js accepts recordedAt from the worker POST.
+  → The frontend prefers recorded_at (GPS) over detected_at (server time).
+
+✓ Speed displayed in the dashboard
+  → worker._gps_at_frame() returns speed_kmh from GPS.
+  → _MOCK_SPEED_KMH = 95.0 is used as fallback when no gps.csv exists OR
+    when the GPS row has speed_kmh = 0 (stub data). Remove this mock once
+    real Android GPS is wired up in the capture app.
+
+✓ License plate UI
+  → getEvidence returns plate_text (null when carId starts with "vehicle_",
+    meaning FastALPR didn't read a plate) and plate_url (presigned R2 URL to
+    plate.png / vehicle_crop.png).
+  → ViolationDetailPage shows a plate image card. When plate_text is null,
+    it shows "OCR could not read — manual review required" in yellow.
+
+✓ Dismiss removes evidence from R2
+  → dismissViolation() calls r2.deletePrefix(folder) after saving status.
+    The entire output/<session>/<violation_id>/ folder is deleted from R2.
+
+─────────────────────────────────────────────────────────────────────────────
+WHAT NEEDS ATTENTION / KNOWN GAPS
+─────────────────────────────────────────────────────────────────────────────
+
+1. CONFIDENCE SCORE — NEEDS ONE FIX IN THE PIPELINE
+   ─────────────────────────────────────────────────
+   Current state:
+   - SOLID_LINE_CROSSING: evaluate_crossing() in main.py now computes a
+     real confidence from crossing duration:
+       conf = clamp(n_frames_crossing / (0.3 * fps), 0.30, 1.0)
+     This flows through normalize_confidence() in export.py → detector_confidence
+     in the manifest → confidence column in the DB.
+     (was always 1.0 before)
+
+   - SPEEDING: _speeding_confidence() in export.py already computes a ramp
+     from the speed margin: ((observed - limit) / 40) * 0.70 + 0.30.
+     This fires correctly as long as the event has est_speed_kmh and
+     speed_limit_kmh in its details dict.
+
+   What still needs fixing:
+   - YELLOW_LINE_RIGHT: still defaults to 1.0. The yellow evaluator computes
+     a score internally but doesn't set event.confidence on the ViolationEvent
+     object. Same one-line fix as was done for crossing.
+
+   How to fix yellow confidence:
+     In whatever function creates YELLOW_LINE_RIGHT ViolationEvents, set:
+       event.confidence = <computed_score>
+     The normalize_confidence() function in export.py will then pick it up
+     automatically.
+
+2. ANNOTATED EVIDENCE CLIPS
+   ─────────────────────────
+   Implemented (violations/clip_extract.py: annotate_clip_inplace):
+   - After ffmpeg cuts the 15s evidence clip, a second ffmpeg pass draws
+     a green bounding box + violation label on every frame (drawbox + drawtext).
+   - The bbox comes from vehicle.bounding_box[key_frame] stored in
+     event.details["bbox"] during run_evidence_and_report() in main.py.
+   - Re-encodes with libx264 + faststart (browser-compatible).
+   - Falls back silently if ffmpeg is unavailable or bbox is missing.
+
+   Requires a fresh worker run to see annotated clips in R2.
+
+3. VEHICLE CROP FALLBACK (plate.png always present)
+   ─────────────────────────────────────────────────
+   Implemented (violations/export.py: _crop_entries):
+   - When FastALPR doesn't find a plate, the sharpest vehicle crop from the
+     evidence buffer is saved as vehicle_crop.png in the violation folder.
+   - This becomes plateClipPath in the DB, so the dashboard always shows
+     an image for manual review even when OCR fails.
+
+4. GPS MOCK — REMOVE WHEN REAL GPS ARRIVES
+   ─────────────────────────────────────────
+   In worker.py, _MOCK_SPEED_KMH = 95.0 is returned when gps.csv is absent
+   or has speed = 0. This is intentional for demo/test runs.
+   When the Android capture app wires real GPS timestamps (absolute Unix ms),
+   the real speed from gps.csv will flow through automatically.
+   To remove the mock: delete the _MOCK_SPEED_KMH lines and change the
+   two return statements back to returning 0.0 for speed.
+
+─────────────────────────────────────────────────────────────────────────────
+R2 STORAGE STRUCTURE — CURRENT FORMAT
+─────────────────────────────────────────────────────────────────────────────
+
+INCOMING (raw inputs uploaded by the capture device):
+  incoming/<sessionId>/
+    video.mp4
+    gps.csv
+    gyro.csv
+    gravity.csv
+    linacc.csv
+    frames.csv
+    intrinsics.json
+
+  NOTE: The incoming key is currently a UUID sessionId set by the backend.
+  A date-based format (incoming/YYYY-MM-DD_<name>/) was discussed but not
+  implemented on the upload side (would require changes to the mobile app
+  and the backend Drive creation route). The OUTPUT side is now date-based.
+
+OUTPUT (evidence produced by the worker):
+  output/<YYYY-MM-DD>_<video_name>/
+    manifest.json                        ← full ranked violation list
+    <violation_id>/                      ← e.g. v12_solid_line_crossing_f480/
+      clip.mp4                           ← 15s annotated evidence clip
+      plate.png  OR  vehicle_crop.png    ← best plate crop / vehicle crop
+      violation.json                     ← per-violation metadata
+      v12_SOLID_LINE_CROSSING.txt        ← human-readable summary
+
+VIOLATION PRIORITY ORDER (already implemented in backend sort + export.py):
+  Tier 0 → SOLID_LINE_CROSSING   (sorted by confidence DESC)
+  Tier 1 → SPEEDING               (sorted by speed-margin confidence DESC)
+  Tier 2 → other
+  Tier 3 → YELLOW_LINE_RIGHT      (sorted chronologically by key_frame)
+
+─────────────────────────────────────────────────────────────────────────────
+FILES CHANGED IN THIS SESSION
+─────────────────────────────────────────────────────────────────────────────
+
+backend/controllers/authorityController.js
+  - getEvidence: mints presigned R2 URLs for video + plate; returns plate_text,
+    recorded_at.
+  - dismissViolation: calls r2.deletePrefix() to wipe evidence from R2.
+
+backend/services/r2.js
+  - Added PutBucketCorsCommand + configureCors() exported function.
+
+backend/server.js
+  - Calls r2.configureCors() on startup.
+
+backend/models/Violation.js
+  - Added recordedAt: { type: Date, default: null } field.
+
+backend/routes/internalRoutes.js
+  - Accepts recordedAt from worker POST body.
+
+frontend/roadguard-authority/src/pages/ViolationDetailPage.jsx
+  - Full rewrite: presigned video URL, plate crop card, speed from GPS,
+    date prefers recorded_at, confidence display, GPS coordinates.
+
+worker.py
+  - _gps_at_frame(): reads gps.csv, returns (lat, lon, speed, recorded_iso).
+    Falls back to _MOCK_SPEED_KMH = 95.0 when no real GPS.
+  - report_violation(): posts lat, lon, speed, recorded_at to backend.
+  - process(): builds GPS cache per violation; calls annotate_clip_inplace
+    after cutting each clip; uses date-based R2 output prefix.
+
+main.py
+  - evaluate_crossing(): confidence from frame count (not hardcoded 1.0).
+  - run_evidence_and_report(): stores vehicle bbox in event.details["bbox"].
+
+violations/clip_extract.py
+  - annotate_clip_inplace(): ffmpeg drawbox + drawtext pass, re-encodes
+    in place as libx264 faststart.
+
+violations/export.py
+  - _crop_entries(): fallback: exports sharpest vehicle crop as vehicle_crop.png
+    when no plate crop exists, so plateClipPath is always set.
+
+─────────────────────────────────────────────────────────────────────────────
+HOW TO RUN LOCALLY
+─────────────────────────────────────────────────────────────────────────────
+
+Backend:
+  cd backend
+  node server.js          (uses .env — R2 creds already in there)
+
+Frontend (authority dashboard):
+  cd frontend/roadguard-authority
+  npm run dev             → http://localhost:5173
+
+Test account:
+  email:    tal2@roadguard.com
+  password: test1234
+  role:     authority
+
+─────────────────────────────────────────────────────────────────────────────
+END OF HANDOFF
+─────────────────────────────────────────────────────────────────────────────

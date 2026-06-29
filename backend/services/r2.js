@@ -13,7 +13,8 @@
  */
 const {
     S3Client, HeadObjectCommand, GetObjectCommand, PutObjectCommand,
-    DeleteObjectCommand, DeleteObjectsCommand, ListObjectsV2Command
+    DeleteObjectCommand, DeleteObjectsCommand, ListObjectsV2Command,
+    PutBucketCorsCommand
 } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
@@ -53,6 +54,32 @@ const presignGet = async (key, { expiresIn = PRESIGN_EXPIRY } = {}) => {
     if (!configured) return null;
     const cmd = new GetObjectCommand({ Bucket: BUCKET, Key: key });
     return getSignedUrl(client, cmd, { expiresIn });
+};
+
+/**
+ * Stream an object from R2 directly to an HTTP response, forwarding a Range header when present.
+ * Returns { body, contentType, contentLength, contentRange, statusCode } on success, or null when
+ * the object is missing. Throws on unexpected R2 errors.
+ * The caller must pipe body (a Node.js Readable) to the response before it goes idle.
+ */
+const getObjectStream = async (key, rangeHeader) => {
+    if (!configured) return null;
+    const params = { Bucket: BUCKET, Key: key };
+    if (rangeHeader) params.Range = rangeHeader;
+    try {
+        const out = await client.send(new GetObjectCommand(params));
+        return {
+            body:          out.Body,
+            contentType:   out.ContentType || 'video/mp4',
+            contentLength: out.ContentLength,
+            contentRange:  out.ContentRange || null,
+            statusCode:    rangeHeader ? 206 : 200,
+        };
+    } catch (err) {
+        const code = err.$metadata && err.$metadata.httpStatusCode;
+        if (code === 404 || err.name === 'NotFound' || err.name === 'NoSuchKey') return null;
+        throw err;
+    }
 };
 
 /** HEAD an object: returns { size } if it exists, or null if it doesn't / R2 is off. */
@@ -114,7 +141,30 @@ const bucketUsageBytes = async () => {
     }
 };
 
+/** Configure CORS on the R2 bucket so browsers can fetch presigned URLs directly.
+ *  Called once at server startup. Fire-and-forget — a failure is logged but never fatal. */
+const configureCors = async () => {
+    if (!configured) return;
+    try {
+        await client.send(new PutBucketCorsCommand({
+            Bucket: BUCKET,
+            CORSConfiguration: {
+                CORSRules: [{
+                    AllowedHeaders: ['*'],
+                    AllowedMethods: ['GET', 'HEAD'],
+                    AllowedOrigins: ['*'],
+                    ExposeHeaders: ['Content-Length', 'Content-Type', 'ETag'],
+                    MaxAgeSeconds: 3000,
+                }]
+            }
+        }));
+        console.log('[r2] CORS configured (GET/HEAD from any origin)');
+    } catch (e) {
+        console.warn('[r2] CORS setup failed:', e.message);
+    }
+};
+
 module.exports = {
-    isConfigured, presignPut, presignGet, headObject,
-    deleteObject, deletePrefix, bucketUsageBytes
+    isConfigured, presignPut, presignGet, headObject, getObjectStream,
+    deleteObject, deletePrefix, bucketUsageBytes, configureCors
 };
