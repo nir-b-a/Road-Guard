@@ -47,8 +47,8 @@ class CascadeParams:
     side_switch_deadband: float = 4.0
     corner_arm_margin: float = 4.0
     # dynamic curve distance gate (SWEPT)
-    straight_horizon_frac: float = 0.45
-    curve_horizon_frac: float = 0.65
+    straight_horizon_frac: float = 0.0   # disabled — real-world distance gate used instead
+    curve_horizon_frac: float = 0.0      # disabled — real-world distance gate used instead
     # curve hysteresis (fixed)
     curve_hi: float = 0.18
     curve_lo: float = 0.12
@@ -59,7 +59,7 @@ class CascadeParams:
     require_axle_band: bool = False
     same_vehicle_axle: bool = False
     # real-world distance gate (replaces pixel-horizon heuristic)
-    max_dist_m: float = 0.0         # 0 = disabled; set to e.g. 15.0 to gate by depth
+    max_dist_m: float = 25.0        # 0 = disabled; gate vehicles farther than this
     distance_fy_px: float = 640.0   # focal length in pixels (W/2 / tan(FOV/2), FOV=90°, W=1280)
     distance_vehicle_h_m: float = 1.5  # assumed vehicle height for HeightBasedDistance formula
     # fixed knobs

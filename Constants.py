@@ -80,7 +80,7 @@ DEFAULT_CAMERA_HEIGHT_M = 1.4    # dashcam mount height (also the CARLA default)
 # CUSTOM-TRAINED YOLOv8-seg model and is intentionally NOT bumped to v11 -- swapping it would
 # require retraining the lane-type dataset, which is out of scope for the baseline.
 YOLO_VERSION = "yolo11x.pt"
-CONFIDENCE_LVL = 0.5             # YOLO minimum detection confidence
+CONFIDENCE_LVL = 0.25            # YOLO minimum detection confidence
 YOLO_IMGSZ = 1280                # YOLO inference image size (px); 1984 w/o half
 YOLO_TRACKER = "botsort.yaml"    # ultralytics tracker config
 
