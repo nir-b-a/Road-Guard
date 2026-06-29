@@ -87,6 +87,8 @@ SMOOTHER = Constants.DEFAULT_SMOOTHER
 EVIDENCE_COLLECTOR = None
 # YOLOv8-seg lane model (yellow line). Created in main() if the yellow rule is enabled.
 LANE_MODEL = None
+# Stage-2 tire detector (solid-line crossing confirmation). Created in main() if weights exist.
+TIRE_MODEL = None
 
 
 def print_time(start_time, read_times, yolo_times, postprocess_times, frame_id):
@@ -448,29 +450,6 @@ def evaluate_yellow_line(world: World, seg_frames: list, video_path: str, video_
     return events, recs, incidents
 
 
-def evaluate_crossing(seg_frames: list, fps: float, frame_height: int, frame_width: int) -> list:
-    """Solid-line CROSSING detector, wired live off the SAME per-frame lane-seg cache the yellow
-    rule already builds. Returns one ViolationEvent(SOLID_LINE_CROSSING) per incident."""
-    if not (_YELLOW_IMPORT_OK and seg_frames):
-        return []
-    shifts = [fr.get("shift", [0.0, 0.0]) for fr in seg_frames]
-    timeline = compute_verdict_timeline(seg_frames, shifts, frame_height, frame_width, fps,
-                                        ttl_sec=0.5, phantom_min_sec=0.0)
-    k_consec = max(1, round(0.05 * fps))
-    incidents = merge_events(events_from_timeline(timeline, k_consec), fps, cooldown_sec=3.0)
-    events = []
-    for tid, s, e in incidents:
-        events.append(ViolationEvent(
-            vehicle_id=tid,
-            violation_type=ViolationType.SOLID_LINE_CROSSING,
-            key_frame=s,
-            confidence=1.0,
-            details={"start_frame": s, "end_frame": e, "n_frames_over": e - s + 1},
-        ))
-    print(f"[crossing] {len(incidents)} solid-line crossing incident(s) -> ViolationEvent(s)")
-    return events
-
-
 def overspeed_to_events(overspeed_events: list) -> list:
     """Convert OverspeedEvent -> the generic ViolationEvent the evidence stage consumes."""
     out = []
@@ -506,33 +485,121 @@ def speeding_to_events(speeding_events: list) -> list:
     return out
 
 
-def evaluate_crossing(seg_frames: list, fps: float, frame_height: int, frame_width: int) -> list:
-    """Solid-line CROSSING detector, wired live off the SAME per-frame lane-seg cache the yellow
-    rule already builds (seg_frames: [{frame, vehicles, lanes, shift}, ...]).
+def _stage2_confirm(incidents: list, timeline: dict, seg_frames: list,
+                     frame_height: int, video_path: str, tire_model) -> list:
+    """Second-pass tire-model filter over Stage-1 crossing incidents.
 
-    Reuses the offline harness machinery: ghost/verdict timeline -> K-consecutive on-line runs ->
-    per-vehicle 3 s cooldown (merge_events). A new on-line stretch >3 s after the previous one
-    re-fires (the practical proxy for "crossed another distinct solid line"). Returns one
-    ViolationEvent(SOLID_LINE_CROSSING) per incident, keyed at the incident onset frame."""
+    Re-reads the video once sequentially (grab() on non-candidate frames for speed), runs
+    Stage2Cascade with live TireModel inference for each Stage-1 candidate frame, and returns
+    only the incidents confirmed by Stage-2.  Incidents where Stage-2 never fires are dropped
+    (FP killer).  Falls back to the full Stage-1 list if the video can't be opened."""
+    import cv2 as _cv2
+    from collections import defaultdict as _dd
+    from violations.cascade.stage2 import CascadeParams, Stage2Cascade
+
+    _SOLID_CLS = {"solid_white_lane", "traffic_island"}
+
+    rec_by_f   = {fr["frame"]: fr for fr in seg_frames}
+    inc_tids   = {inc[0] for inc in incidents}
+
+    # Build per-frame candidate list (only Stage-1-hit frames for incident tracks).
+    candidates_by_frame: dict = _dd(list)
+    for tid, frame_hits in timeline.items():
+        if tid not in inc_tids:
+            continue
+        for fi, hit in frame_hits.items():
+            if not hit:
+                continue
+            rec = rec_by_f.get(fi)
+            if rec is None:
+                continue
+            for v in rec.get("vehicles", []):
+                if v.get("track_id") == tid:
+                    candidates_by_frame[fi].append((tid, v["bbox"]))
+                    break
+
+    if not candidates_by_frame:
+        return incidents  # no candidate frames found; keep all
+
+    cap = _cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("[crossing/stage2] cannot open video for second pass; keeping Stage-1 results")
+        return incidents
+
+    params   = CascadeParams()
+    cascades = {tid: Stage2Cascade(params,
+                                   tire_detect=lambda f, b, _tm=tire_model: _tm.detect_in_crop(f, b))
+                for tid in inc_tids}
+    stage2_fired: set = set()
+    fi = 0
+    max_fi = max(candidates_by_frame.keys())
+
+    while fi <= max_fi:
+        if fi in candidates_by_frame:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            rec = rec_by_f.get(fi, {})
+            solid_contours = [ln["contour"] for ln in rec.get("lanes", [])
+                               if ln.get("cls") in _SOLID_CLS]
+            for tid, bbox in candidates_by_frame[fi]:
+                fired, _ = cascades[tid].step(frame, tid, bbox, solid_contours, frame_height)
+                if fired:
+                    stage2_fired.add(tid)
+        else:
+            if not cap.grab():
+                break
+        fi += 1
+
+    cap.release()
+
+    confirmed = [(tid, s, e) for tid, s, e in incidents if tid in stage2_fired]
+    dropped   = len(incidents) - len(confirmed)
+    print(f"[crossing/stage2] confirmed {len(confirmed)}/{len(incidents)} "
+          f"(dropped {dropped} FP candidates)")
+    return confirmed
+
+
+def evaluate_crossing(seg_frames: list, fps: float, frame_height: int, frame_width: int,
+                       video_path: str | None = None, tire_model=None) -> list:
+    """Solid-line CROSSING detector (Stage-1 + optional Stage-2 tire confirmation).
+
+    Stage-1: ghost/verdict timeline off the lane-seg cache -> K-consecutive hit frames ->
+    per-vehicle 3 s cooldown.
+    Stage-2 (when video_path + tire_model provided): re-reads the video for candidate frames,
+    runs Stage2Cascade (TireModel + geometry) to confirm each Stage-1 incident, and drops
+    incidents where no tire evidence is found.  Falls back to Stage-1 only if either is absent."""
     if not (_YELLOW_IMPORT_OK and seg_frames):
         return []
-    shifts = [fr.get("shift", [0.0, 0.0]) for fr in seg_frames]
-    timeline = compute_verdict_timeline(seg_frames, shifts, frame_height, frame_width, fps,
-                                        ttl_sec=0.5, phantom_min_sec=0.0)
-    k_consec = max(1, round(0.05 * fps))            # recall-first: ~1-2 frames on the line
+
+    shifts    = [fr.get("shift", [0.0, 0.0]) for fr in seg_frames]
+    timeline  = compute_verdict_timeline(seg_frames, shifts, frame_height, frame_width, fps,
+                                         ttl_sec=0.5, phantom_min_sec=0.0)
+    k_consec  = max(1, round(0.05 * fps))
     incidents = merge_events(events_from_timeline(timeline, k_consec), fps, cooldown_sec=3.0)
+
+    print(f"[crossing] Stage-1: {len(incidents)} incident(s)")
+    if not incidents:
+        return []
+
+    if tire_model is not None and video_path is not None:
+        incidents = _stage2_confirm(incidents, timeline, seg_frames,
+                                    frame_height, video_path, tire_model)
+    else:
+        print("[crossing] Stage-2 skipped (no tire model or no video path)")
+
     events = []
     for tid, s, e in incidents:
-        # confidence=1.0 (binary) here because the timeline path has no bbox depth.
-        # When Stage-2 cascade is wired in, use decision.crossing_confidence instead.
+        n_frames = e - s + 1
+        conf     = min(1.0, max(0.30, n_frames / max(1.0, 0.3 * fps)))
         events.append(ViolationEvent(
             vehicle_id=tid,
             violation_type=ViolationType.SOLID_LINE_CROSSING,
             key_frame=s,
-            confidence=1.0,
-            details={"start_frame": s, "end_frame": e, "n_frames_over": e - s + 1},
+            confidence=round(conf, 4),
+            details={"start_frame": s, "end_frame": e, "n_frames_over": n_frames},
         ))
-    print(f"[crossing] {len(incidents)} solid-line crossing incident(s) -> ViolationEvent(s)")
+    print(f"[crossing] {len(events)} crossing event(s) after Stage-2")
     return events
 
 
@@ -754,7 +821,7 @@ def export_and_push_violations(world: World, results_by_event: list, *, job: dic
 
 
 def main():
-    global EVIDENCE_COLLECTOR, LANE_MODEL
+    global EVIDENCE_COLLECTOR, LANE_MODEL, TIRE_MODEL
 
     # Cloud awareness FIRST: detect Colab/headless (auto, or via --colab) and neutralize the
     # cv2 GUI calls so nothing crashes without a display. Everything below stays env-agnostic.
@@ -807,6 +874,20 @@ def main():
         yellow_enabled = LANE_MODEL is not None
     lane_conf = float(_cli_value("--lane-conf", 0.25))
     max_frames = int(_cli_value("--max-frames", 0))     # 0 = whole video (quick-test knob)
+
+    # Stage-2 tire model (solid-line crossing FP killer). Skipped with --no-stage2 or missing weights.
+    if "--no-stage2" not in sys.argv:
+        _tire_weights = _cli_value("--tire-weights",
+                                   os.path.join(REPO_ROOT, "models", "tire_yolo11n.pt"))
+        if os.path.isfile(_tire_weights):
+            try:
+                from violations.cascade.tire_model import TireModel as _TireModel
+                TIRE_MODEL = _TireModel(_tire_weights)
+                print(f"[stage2] tire model loaded: {_tire_weights}")
+            except Exception as _te:
+                print(f"[stage2] tire model failed to load ({_te}); Stage-2 disabled")
+        else:
+            print(f"[stage2] tire weights not found ({_tire_weights}); Stage-2 disabled")
 
     # ── UNDISTORT (removable): rectify frames so the pinhole pipeline is valid off-axis ──
     # Only for clips recorded WITHOUT on-device distortion correction. Delete this block
@@ -967,8 +1048,9 @@ def main():
         world, seg_frames, video_path, video_name,
         frame_width, frame_height, frame_id, fps, once_per_vehicle=sim_speed)
 
-    # ── 7.65 Solid-line crossing violation (wired off the same lane-seg cache) ──
-    crossing_events = evaluate_crossing(seg_frames, fps, frame_height, frame_width)
+    # ── 7.65 Solid-line crossing violation (Stage-1 lane-seg + Stage-2 tire confirmation) ──
+    crossing_events = evaluate_crossing(seg_frames, fps, frame_height, frame_width,
+                                        video_path=video_path, tire_model=TIRE_MODEL)
 
     # ── 7.7 Evidence stage over ALL violations (crossing + speeding + yellow), one record shape ──
     all_events = (crossing_events
