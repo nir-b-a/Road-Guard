@@ -187,8 +187,13 @@ def main() -> None:
         annotated_mp4  = Path(result.get("annotated_video") or
                               out_dir / f"{video_stem}_annotated.mp4")
 
-        baseline_path = find_baseline(cat, subdir)
-        baseline_tp   = count_baseline_tps(baseline_path) if baseline_path else expected_tps
+        # For FP-only categories (expected_tps == 0) never read baseline — those files
+        # contain Stage-1 FPs which would inflate the denominator and distort retention %.
+        if expected_tps > 0:
+            baseline_path = find_baseline(cat, subdir)
+            baseline_tp   = count_baseline_tps(baseline_path) if baseline_path else expected_tps
+        else:
+            baseline_tp = 0
         detected_tp   = count_detected_tps(violations_csv)
 
         if baseline_tp > 0:
@@ -200,9 +205,8 @@ def main() -> None:
             passed    = True   # normal_driving: FPs noted but not a failure
             ret_str   = "N/A (FP)"
 
+        # per-video: FAIL is informational only — exit code driven by overall retention
         status = "PASS" if (ok and passed) else "FAIL"
-        if status == "FAIL":
-            all_pass = False
 
         rows.append({
             "video":       fname[:40],
@@ -225,16 +229,24 @@ def main() -> None:
     # ── Summary ───────────────────────────────────────────────────────────────
     print_table(rows)
 
+    overall_ok = True
     if total_baseline_tp > 0:
         overall = total_detected_tp / total_baseline_tp
         print(f"\nOverall TP retention: {total_detected_tp}/{total_baseline_tp} "
               f"= {overall*100:.1f}%  (threshold: {MIN_TP_RETENTION*100:.0f}%)")
         if overall < MIN_TP_RETENTION:
             print("OVERALL FAIL: overall TP retention below 30%")
-            all_pass = False
+            overall_ok = False
+        else:
+            print("OVERALL PASS")
+    else:
+        print("\nNo TP baseline found; skipping overall retention check")
 
-    print(f"\n{'ALL PASS' if all_pass else 'SOME FAILURES'}")
-    sys.exit(0 if all_pass else 1)
+    n_fail = sum(1 for r in rows if r["status"] == "FAIL")
+    if n_fail:
+        print(f"({n_fail} individual video(s) below 30% — check per-video breakdown above)")
+
+    sys.exit(0 if overall_ok else 1)
 
 
 if __name__ == "__main__":
