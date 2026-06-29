@@ -820,88 +820,39 @@ def export_and_push_violations(world: World, results_by_event: list, *, job: dic
         print(f"[export] job payload had no upload_url and no --push-url; bundle saved locally only")
 
 
-def main():
-    global EVIDENCE_COLLECTOR, LANE_MODEL, TIRE_MODEL
+def process_video_with_models(
+    video_path: str,
+    yolo_model,
+    lane_model,
+    tire_model,
+    *,
+    out_dir: str | None = None,
+    max_frames: int = 0,
+    is_simulation: bool = True,
+    lane_conf: float = 0.25,
+    benchmark: bool = False,
+    sim_speed: bool = False,
+    job: dict | None = None,
+    undistorter=None,
+) -> dict:
+    """Process a single video with pre-loaded models.
 
-    # Cloud awareness FIRST: detect Colab/headless (auto, or via --colab) and neutralize the
-    # cv2 GUI calls so nothing crashes without a display. Everything below stays env-agnostic.
-    cloud_env.init()
+    Called by main() (CLI) and by the in-process validation harness so models load
+    once for N videos instead of once per subprocess.  The BoT-SORT tracker is reset
+    at the start of each call so track IDs are always fresh.
 
-    yolo_model = loadYoloModel()
-
-    # ── Worker-node mode (--job-payload) ──────────────────────────────────────
-    # When the backend dispatches a job carrying a presigned video_url, this process behaves as an
-    # autonomous worker: PULL the clip from Cloudflare + FAIL-FAST verify it against the job's
-    # reference fingerprint BEFORE any GPU work. Without a video_url it falls back to the local
-    # positional path (sys.argv[1]) -- the standard/baseline invocation is unchanged. The same job
-    # dict is threaded to the export stage so the bundle is PUSHED + NOTIFIED at the end.
-
-    job = _load_job_payload()
-    job_work_dir = None
-    if job and job.get("video_url"):
-        video_path, _job_ref_meta, job_work_dir = pull_job_video(job)
-    else:
-        video_path = sys.argv[1]
-    is_simulation = "--simulation" in sys.argv
-    benchmark = "--benchmark" in sys.argv
-    if benchmark:
-        print("[benchmark] fast-data mode: CSV/text outputs only (no plots, no annotated video)")
+    Returns {"annotated_video", "vehicles_csv", "violations"} matching main()."""
+    # Reset BoT-SORT tracker state so each video starts with fresh track IDs.
+    if getattr(yolo_model, "predictor", None) is not None:
+        yolo_model.predictor = None
 
     video_dir  = os.path.dirname(os.path.abspath(video_path))
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    out_dir = _cli_value("--out-dir", video_dir)
+    if out_dir is None:
+        out_dir = video_dir
     os.makedirs(out_dir, exist_ok=True)
 
-    # Evidence collector (one OCR reader for the whole run).
-    if _EVIDENCE_IMPORT_OK and "--no-evidence" not in sys.argv:
-        try:
-            EVIDENCE_COLLECTOR = EvidenceCollector(FastALPRReader().read_plate_with_conf,
-                                                   min_area=LPR.MIN_VEHICLE_AREA)
-            print("[evidence] EvidenceCollector ready (FastALPR)")
-        except Exception as e:
-            print(f"[evidence] disabled (reader init failed: {e})")
-            EVIDENCE_COLLECTOR = None
-
-    # Yellow-line lane-seg model (a SECOND model run per frame). --no-yellow disables it.
-    yellow_enabled = _YELLOW_IMPORT_OK and "--no-yellow" not in sys.argv
-    if yellow_enabled:
-        lane_weights = _cli_value("--lane-weights",
-                                  os.path.join(REPO_ROOT, "weights", "phase3_v3_yellowprotect.pt"))
-        if os.path.isfile(lane_weights):
-            LANE_MODEL = loadLaneModel(lane_weights)
-        else:
-            print(f"[yellow] lane weights not found ({lane_weights}); yellow-line disabled")
-        yellow_enabled = LANE_MODEL is not None
-    lane_conf = float(_cli_value("--lane-conf", 0.25))
-    max_frames = int(_cli_value("--max-frames", 0))     # 0 = whole video (quick-test knob)
-
-    # Stage-2 tire model (solid-line crossing FP killer). Skipped with --no-stage2 or missing weights.
-    if "--no-stage2" not in sys.argv:
-        _tire_weights = _cli_value("--tire-weights",
-                                   os.path.join(REPO_ROOT, "models", "tire_yolo11n.pt"))
-        if os.path.isfile(_tire_weights):
-            try:
-                from violations.cascade.tire_model import TireModel as _TireModel
-                TIRE_MODEL = _TireModel(_tire_weights)
-                print(f"[stage2] tire model loaded: {_tire_weights}")
-            except Exception as _te:
-                print(f"[stage2] tire model failed to load ({_te}); Stage-2 disabled")
-        else:
-            print(f"[stage2] tire weights not found ({_tire_weights}); Stage-2 disabled")
-
-    # ── UNDISTORT (removable): rectify frames so the pinhole pipeline is valid off-axis ──
-    # Only for clips recorded WITHOUT on-device distortion correction. Delete this block
-    # + the two below (and undistort.py) to remove the experiment entirely.
-    undistorter = None
-    if "--undistort" in sys.argv:
-        import undistort as _undistort
-        _report = _undistort.find_report(os.path.dirname(os.path.abspath(video_path)))
-        if _report:
-            undistorter = _undistort.FrameUndistorter.from_report(_report)
-            print(f"[undistort] using calibration report: {_report}")
-        else:
-            print("[undistort] --undistort set but no calibration report found; running raw")
-    # ── end UNDISTORT block ──
+    yellow_enabled = (lane_model is not None) and _YELLOW_IMPORT_OK
 
     vh = VideoHandler(video_path)
     frame_height, frame_width = vh.get_frame().shape[:2]
@@ -910,15 +861,15 @@ def main():
 
     frame_id = 0
     read_times, yolo_times, postprocess_times = [], [], []
-    all_frame_vehicles: dict[int, list] = {}            # frame -> [{track_id, bbox}]
-    seg_frames: list = []                               # per-frame lane-seg cache (yellow rule)
+    all_frame_vehicles: dict[int, list] = {}
+    seg_frames: list = []
     prev_gray = None
 
     start_time = time.time()
     while True:
         t_read = time.time()
         frame = vh.get_frame()
-        if undistorter is not None:        # UNDISTORT (removable)
+        if undistorter is not None:
             frame = undistorter(frame)
         read_times.append(time.time() - t_read)
         if frame is None:
@@ -930,14 +881,15 @@ def main():
         postprocess_times.append(postprocess_time)
         all_frame_vehicles[frame_id] = frame_vehicles
 
-        # Build the yellow-line cache live: lane segmentation + optical-flow ego shift.
         if yellow_enabled:
             cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             shift = estimate_ego_shift(prev_gray, cur_gray) if prev_gray is not None else (0.0, 0.0)
             prev_gray = cur_gray
-            seg_frames.append({"frame": frame_id, "vehicles": frame_vehicles,
-                               "lanes": seg_lanes(LANE_MODEL, frame, lane_conf),
-                               "shift": [round(shift[0], 2), round(shift[1], 2)]})
+            seg_frames.append({
+                "frame": frame_id, "vehicles": frame_vehicles,
+                "lanes": seg_lanes(lane_model, frame, lane_conf),
+                "shift": [round(shift[0], 2), round(shift[1], 2)],
+            })
 
         frame_id += 1
         if max_frames and frame_id >= max_frames:
@@ -953,7 +905,8 @@ def main():
         if v._plate_candidates:
             counts = Counter(v._plate_candidates)
             max_count = max(counts.values())
-            v.license_plate = next(p for p in reversed(v._plate_candidates) if counts[p] == max_count)
+            v.license_plate = next(
+                p for p in reversed(v._plate_candidates) if counts[p] == max_count)
 
     # ── 1. Input mode ────────────────────────────────────────────────────────
     telemetry_csv   = os.path.join(video_dir, "telemetry.csv")
@@ -985,19 +938,17 @@ def main():
         cx = frame_width / 2
         cy = frame_height / 2
 
-    # ── UNDISTORT (removable): match pipeline geometry to the rectified frames ──
     if undistorter is not None and undistorter.K_used is not None:
         K = undistorter.K_used
         fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
         print(f"[undistort] intrinsics overridden to rectified K: "
               f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
-    # ── end UNDISTORT block ──
 
     # ── 6. Distance ──────────────────────────────────────────────────────────
     estimateDistance(world, fx, fy, cx, cy, Constants.DEFAULT_CAMERA_HEIGHT_M)
     smooth_distances(world, Constants.SMOOTH_WINDOW, Constants.POLYORDER)
 
-    # ── 7. Speed (world-frame reconstruction + Kalman) ───────────────────────
+    # ── 7. Speed ─────────────────────────────────────────────────────────────
     valid_roi = undistorter.valid_roi if undistorter is not None else None
     run_speed_estimation(
         world, fps, fx, fy, cx, cy,
@@ -1008,27 +959,20 @@ def main():
         image_width=frame_width, image_height=frame_height,
         valid_roi=valid_roi)
 
-    # ── 7.0 Simulated speeds (offline baseline; replaces the unavailable world-frame estimate) ──
-    # Deterministic per-vehicle speeds so the speeding rule + the speed report are exercised and
-    # REPRODUCIBLE for the optimization baseline diff. Assigned after gap-fill so interpolated
-    # frames are covered too. Also feeds the shoulder rule's real speed gate.
+    # ── 7.0 Simulated speeds (--sim-speed mode) ───────────────────────────────
+    overspeed_events = []
+    speeding_events = []
     if sim_speed:
-        simulated_speed.assign_simulated_speeds(world, fps)
-
-    # ── 7.5 Speeding ──────────────────────────────────────────────────────────
-    # --sim-speed: fixed posted limit (100) with the 110 violation line, report-once-at-onset +
-    # 30 s per-vehicle cooldown + max-speed-in-zone. Otherwise the legacy android GPS-proxy path.
-    overspeed_events = []      # OverspeedEvent (android path)
-    speeding_events = []       # SpeedingEvent  (sim path)
-    if sim_speed:
+        from speed_estimation import simulated_speed as _sim_spd
+        _sim_spd.assign_simulated_speeds(world, fps)
         speeding_events = overspeed.flag_speeding_fixed_limit(
             world,
-            limit_kmh=simulated_speed.SIM_LIMIT_KMH,
-            threshold_kmh=simulated_speed.SIM_SPEEDING_THRESHOLD_KMH,
+            limit_kmh=_sim_spd.SIM_LIMIT_KMH,
+            threshold_kmh=_sim_spd.SIM_SPEEDING_THRESHOLD_KMH,
             fps=fps)
         print(f"[speeding] {len(speeding_events)} speeding episode(s) "
-              f"(limit={simulated_speed.SIM_LIMIT_KMH:.0f}, "
-              f">={simulated_speed.SIM_SPEEDING_THRESHOLD_KMH:.0f} km/h)")
+              f"(limit={_sim_spd.SIM_LIMIT_KMH:.0f}, "
+              f">={_sim_spd.SIM_SPEEDING_THRESHOLD_KMH:.0f} km/h)")
     elif is_android and "--no-overspeed" not in sys.argv:
         try:
             margin = float(_cli_value("--overspeed-margin", overspeed.OVERSPEED_MARGIN_KMH))
@@ -1043,37 +987,38 @@ def main():
         except Exception as e:
             print(f"[overspeed] skipped (lookup/parse failed): {e}")
 
-    # ── 7.6 Yellow-line (shoulder) violation -- strictly once per vehicle in baseline mode ──
+    # ── 7.6 Yellow-line (shoulder) violation ──────────────────────────────────
     yellow_events, recs, incidents = evaluate_yellow_line(
         world, seg_frames, video_path, video_name,
         frame_width, frame_height, frame_id, fps, once_per_vehicle=sim_speed)
 
-    # ── 7.65 Solid-line crossing violation (Stage-1 lane-seg + Stage-2 tire confirmation) ──
+    # ── 7.65 Solid-line crossing violation (Stage-1 + Stage-2 tire confirmation) ──
     crossing_events = evaluate_crossing(seg_frames, fps, frame_height, frame_width,
-                                        video_path=video_path, tire_model=TIRE_MODEL)
+                                        video_path=video_path, tire_model=tire_model)
 
-    # ── 7.7 Evidence stage over ALL violations (crossing + speeding + yellow), one record shape ──
+    # ── 7.7 Evidence stage ────────────────────────────────────────────────────
     all_events = (crossing_events
                   + speeding_to_events(speeding_events) + overspeed_to_events(overspeed_events)
                   + yellow_events)
     results_by_event = run_evidence_and_report(world, all_events, out_dir, video_name)
     write_perframe_and_tracks(world, all_frame_vehicles, recs, incidents, out_dir, video_name, fps)
 
-    # ── 7.75 Backend export (opt-in): bundle each violation's clip + 3 pics + .docx and push it ──
-    # --push-url (legacy multipart) or --job-payload (Cloudflare presigned PUT + webhook). No-op
-    # otherwise, so the standard/baseline run is unchanged and never touches the network.
-
+    # ── 7.75 Backend export (opt-in) ──────────────────────────────────────────
     export_and_push_violations(
         world, results_by_event, job=job, video_path=video_path, video_name=video_name, fps=fps,
         frame_w=frame_width, frame_h=frame_height, total_frames=frame_id, out_dir=out_dir)
 
-    # ── 8. Outputs ───────────────────────────────────────────────────────────
+    # ── 8. Outputs ────────────────────────────────────────────────────────────
     distanceLogger.export_vehicle_summary(
         world, os.path.join(out_dir, f"{video_name}_vehicles.csv"))
 
     if benchmark:
         print("[benchmark] done -- CSV/text data written; skipped plots + annotated video render")
-        return
+        return {
+            "annotated_video": None,
+            "vehicles_csv":    os.path.join(out_dir, f"{video_name}_vehicles.csv"),
+            "violations":      [],
+        }
 
     draw_vehicle_plots.plot_all_vehicles(
         world, out_dir, video_name,
@@ -1096,29 +1041,24 @@ def main():
     draw_vehicle_plots.plot_ego_speed(ego_speed, out_dir, video_name, source=ego_source,
                                       ego_speed_raw=ego_speed_raw, raw_source=raw_source)
 
-    # Smart cloud I/O: on Colab the annotated video is rendered to local NVMe and copied to
-    # Drive once at the end (staged_output), instead of writing every frame to the slow Drive
-    # FUSE mount. Off Colab this is a transparent no-op writing straight to out_dir.
     annotated_final = os.path.join(out_dir, f"{video_name}_annotated.mp4")
     with cloud_env.staged_output(annotated_final) as render_path:
         annotated_video.render_annotated_video(
             world, video_path, render_path, fps=fps,
             violation_events=all_events)
 
-    # ── Return a violations list for worker.py to post to the backend ─────────
-    # lat/lon are not carried on ViolationEvent; 0.0 is a known placeholder until
-    # GPS-track interpolation at key_frame is wired up.
     violations = []
     for e, result in results_by_event:
         vehicle = world.getVehicle(e.vehicle_id)
-        plate = (result.plate if result is not None else None) or (vehicle.license_plate if vehicle else None)
+        plate = ((result.plate if result is not None else None)
+                 or (vehicle.license_plate if vehicle else None))
         violations.append({
-            "vehicle_id":     e.vehicle_id,
-            "carId":          plate or f"vehicle-{e.vehicle_id}",
+            "vehicle_id":      e.vehicle_id,
+            "carId":           plate or f"vehicle-{e.vehicle_id}",
             "calculatedSpeed": e.details.get("est_speed_kmh", 0),
-            "lat":            0.0,
-            "lon":            0.0,
-            "violation_type": e.violation_type,
+            "lat":             0.0,
+            "lon":             0.0,
+            "violation_type":  e.violation_type,
         })
 
     return {
@@ -1126,6 +1066,89 @@ def main():
         "vehicles_csv":    os.path.join(out_dir, f"{video_name}_vehicles.csv"),
         "violations":      violations,
     }
+
+
+def main():
+    global EVIDENCE_COLLECTOR, LANE_MODEL, TIRE_MODEL
+
+    # Cloud awareness FIRST: detect Colab/headless (auto, or via --colab) and neutralize the
+    # cv2 GUI calls so nothing crashes without a display. Everything below stays env-agnostic.
+    cloud_env.init()
+
+    yolo_model = loadYoloModel()
+
+    # ── Worker-node mode (--job-payload) ──────────────────────────────────────
+    job = _load_job_payload()
+    job_work_dir = None
+    if job and job.get("video_url"):
+        video_path, _job_ref_meta, job_work_dir = pull_job_video(job)
+    else:
+        video_path = sys.argv[1]
+    is_simulation = "--simulation" in sys.argv
+    sim_speed     = "--sim-speed"  in sys.argv
+    benchmark     = "--benchmark"  in sys.argv
+    if benchmark:
+        print("[benchmark] fast-data mode: CSV/text outputs only (no plots, no annotated video)")
+
+    video_dir  = os.path.dirname(os.path.abspath(video_path))
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    out_dir = _cli_value("--out-dir", video_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Evidence collector (one OCR reader for the whole run).
+    if _EVIDENCE_IMPORT_OK and "--no-evidence" not in sys.argv:
+        try:
+            EVIDENCE_COLLECTOR = EvidenceCollector(FastALPRReader().read_plate_with_conf,
+                                                   min_area=LPR.MIN_VEHICLE_AREA)
+            print("[evidence] EvidenceCollector ready (FastALPR)")
+        except Exception as e:
+            print(f"[evidence] disabled (reader init failed: {e})")
+            EVIDENCE_COLLECTOR = None
+
+    # Yellow-line lane-seg model (a SECOND model run per frame). --no-yellow disables it.
+    yellow_enabled = _YELLOW_IMPORT_OK and "--no-yellow" not in sys.argv
+    if yellow_enabled:
+        lane_weights = _cli_value("--lane-weights",
+                                  os.path.join(REPO_ROOT, "weights", "phase3_v3_yellowprotect.pt"))
+        if os.path.isfile(lane_weights):
+            LANE_MODEL = loadLaneModel(lane_weights)
+        else:
+            print(f"[yellow] lane weights not found ({lane_weights}); yellow-line disabled")
+        yellow_enabled = LANE_MODEL is not None
+    lane_conf = float(_cli_value("--lane-conf", 0.25))
+    max_frames = int(_cli_value("--max-frames", 0))
+
+    # Stage-2 tire model (solid-line crossing FP killer). Skipped with --no-stage2 or missing weights.
+    if "--no-stage2" not in sys.argv:
+        _tire_weights = _cli_value("--tire-weights",
+                                   os.path.join(REPO_ROOT, "models", "tire_yolo11n.pt"))
+        if os.path.isfile(_tire_weights):
+            try:
+                from violations.cascade.tire_model import TireModel as _TireModel
+                TIRE_MODEL = _TireModel(_tire_weights)
+                print(f"[stage2] tire model loaded: {_tire_weights}")
+            except Exception as _te:
+                print(f"[stage2] tire model failed to load ({_te}); Stage-2 disabled")
+        else:
+            print(f"[stage2] tire weights not found ({_tire_weights}); Stage-2 disabled")
+
+    # ── UNDISTORT (removable) ─────────────────────────────────────────────────
+    undistorter = None
+    if "--undistort" in sys.argv:
+        import undistort as _undistort
+        _report = _undistort.find_report(os.path.dirname(os.path.abspath(video_path)))
+        if _report:
+            undistorter = _undistort.FrameUndistorter.from_report(_report)
+            print(f"[undistort] using calibration report: {_report}")
+        else:
+            print("[undistort] --undistort set but no calibration report found; running raw")
+
+    return process_video_with_models(
+        video_path, yolo_model, LANE_MODEL, TIRE_MODEL,
+        out_dir=out_dir, max_frames=max_frames, is_simulation=is_simulation,
+        lane_conf=lane_conf, benchmark=benchmark, sim_speed=sim_speed,
+        job=job, undistorter=undistorter,
+    )
 
 
 # the main function of the program
