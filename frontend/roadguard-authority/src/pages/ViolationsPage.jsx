@@ -43,7 +43,7 @@ const ViolationsPage = () => {
                     <td className="px-6 py-3 text-gray-400">{v.location?.lat?.toFixed(3)}, {v.location?.lon?.toFixed(3)}</td>
                     <td className="px-6 py-3 text-gray-400">{new Date(v.detectedAt).toLocaleDateString()}</td>
                     <td className="px-6 py-3"><StatusBadge status={v.status} /></td>
-                    <td className="px-6 py-3"><button onClick={() => navigate('/violations/' + v._id)} className="text-xs bg-gray-700 hover:bg-gray-600 text-white px-3 py-1.5 rounded transition">View Details</button></td>
+                    <td className="px-6 py-3"><button className="text-xs bg-gray-700 hover:bg-gray-600 text-white px-3 py-1.5 rounded transition">View Details</button></td>
                   </tr>
                 ))}
                 {paginated.length === 0 && <tr><td colSpan={6} className="px-6 py-8 text-center text-gray-500">No violations found</td></tr>}
