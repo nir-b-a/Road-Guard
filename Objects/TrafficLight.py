@@ -29,5 +29,3 @@ class TrafficLight:
         return((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
     
 
-    # we need a way to set the color/state of the traffic light in each frame.
-    #def setColorStateInFrame(self, color):

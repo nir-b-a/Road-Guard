@@ -7,7 +7,6 @@ import cv2
 import numpy as np
 import speed_estimation.botsort_patch
 import cloud_env                          # headless/Colab detection + smart Drive I/O
-from collections import Counter
 from video_handler import VideoHandler
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
@@ -900,13 +899,6 @@ def process_video_with_models(
 
     vh.release()
     print_time(start_time, read_times, yolo_times, postprocess_times, frame_id)
-
-    for v in world.vehicles.values():
-        if v._plate_candidates:
-            counts = Counter(v._plate_candidates)
-            max_count = max(counts.values())
-            v.license_plate = next(
-                p for p in reversed(v._plate_candidates) if counts[p] == max_count)
 
     # ── 1. Input mode ────────────────────────────────────────────────────────
     telemetry_csv   = os.path.join(video_dir, "telemetry.csv")

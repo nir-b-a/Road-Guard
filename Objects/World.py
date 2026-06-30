@@ -13,10 +13,6 @@ class FrameData:
 
 class World:
     def __init__(self, frame_count):
-        # we dont need these
-        #self.vehicle_ids: list[int] = []
-        #self.traffic_light_ids: list[int] = []
-
         self.frame_count = frame_count
 
         self.vehicles: dict[int, Vehicle] = {}
@@ -26,9 +22,6 @@ class World:
         self.detected_lines: dict[int, dict[str, tuple]] = {}  # frame_id -> {"solid_separator_line": (x1,y1,x2,y2), ...}
 
 
-    """def addVehicle(self, vehicle: Vehicle):
-        self.vehicles[vehicle.id] = vehicle"""
-    
     def addVehicle(self, id, vehicle_type, start_frame):
         veh = Vehicle(id, vehicle_type, start_frame, start_frame)
         self.vehicles[veh.id] = veh
@@ -41,10 +34,6 @@ class World:
 
     def registerFrame(self, frame_id: int, vehicle_ids: list[int], traffic_light_ids: list[int]):
         self.objects_in_frame[frame_id] = FrameData(vehicle_ids, traffic_light_ids)
-
-    # Updates the bounding box of the objects and their end_frame. (we may need to add a code that checks if yolo "forgot" some object and by that set his end_frame)
-    #def updateObjectsData(self, ):
-
 
     def getVehiclesInFrame(self, frame_id: int) -> list[Vehicle]:
         frame = self.objects_in_frame.get(frame_id)
