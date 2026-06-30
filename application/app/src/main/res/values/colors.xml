@@ -14,7 +14,6 @@
     <color name="bg_gradient_top">#FF141C2B</color>
     <color name="bg_gradient_bottom">#FF0B0F16</color>
     <color name="surface">#FF161D27</color>
-    <color name="surface_2">#FF1E2733</color>
     <color name="stroke">#FF2A3441</color>
 
     <!-- Text -->
@@ -24,27 +23,14 @@
 
     <!-- Status colors -->
     <color name="red_record">#FFFF5A5A</color>
-    <color name="green_verified">#FF34D399</color>
 
     <!-- Scrims -->
     <color name="scrim_60">#99000000</color>
     <color name="ripple_light">#33FFFFFF</color>
 
-    <!-- Legacy names kept for compatibility -->
-    <color name="gray_text">#FF9BA8BA</color>
-    <color name="card_dark">#FF161D27</color>
-
-    <color name="purple_200">#FFBB86FC</color>
-    <color name="purple_500">#FF6200EE</color>
-    <color name="purple_700">#FF3700B3</color>
-    <color name="teal_200">#FF03DAC5</color>
-    <color name="teal_700">#FF018786</color>
-
     <!-- Cyan palette (used by stash UI screens) -->
     <color name="cyan_400">#FF22D3EE</color>
-    <color name="cyan_500">#FF06B6D4</color>
     <color name="cyan_600">#FF0891B2</color>
-    <color name="cyan_700">#FF0E7490</color>
 
     <!-- Stash UI colors -->
     <color name="surface_dark">#FF1E293B</color>

@@ -12,7 +12,6 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
-import android.location.Location
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
@@ -87,7 +86,6 @@ class RecordingActivity : AppCompatActivity() {
     private var savedVideoPath: String? = null
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
-    private var lastLocation: Location? = null
 
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var sensorManager: SensorManager
@@ -304,7 +302,6 @@ class RecordingActivity : AppCompatActivity() {
         fusedLocationClient.requestLocationUpdates(request, object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
                 val location = result.lastLocation ?: return
-                lastLocation = location
                 if (isCapturing) {
                     session.addGps(
                         timestampNs = location.elapsedRealtimeNanos, // already on the shared clock
