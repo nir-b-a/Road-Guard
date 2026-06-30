@@ -67,7 +67,7 @@ class EvidenceResult:
     plate_score: float               # vote agreement x mean OCR confidence, in [0,1]
     n_reads: int                     # how many crops yielded a plate string for the vote
     n_buffered: int                  # crops available in the buffer at collect time
-    evidence_crops: list             # top-N sharpest vehicle crops (BGR ndarrays)
+    evidence_crops: list             # top-N sharpest vehicle crops (BGR nd-arrays)
     evidence_frame_ids: list         # frame ids those crops came from
 
     @property
@@ -168,7 +168,7 @@ class EvidenceCollector:
         in-memory buffer (no video re-read).
 
         READ-ONCE: if the vehicle's plate is already known -- either passed in via
-        ``known_plate`` (e.g. ``vehicle.license_plate``) or memoised from an earlier
+        ``known_plate`` (e.g. ``vehicle.license_plate``) or memorized from an earlier
         violation by this same collector -- we reuse it and skip OCR entirely. So a car that
         speeds AND crosses a line is OCR'd once; every violation it commits resolves to the
         same plate.
@@ -195,7 +195,7 @@ class EvidenceCollector:
                     reads.append((p, conf))
             plate, score = vote_characters(reads)
             n_reads = len(reads)
-        # Memoise even a failed read so a later, better-framed violation can retry (recall),
+        # Memorize even a failed read so a later, better-framed violation can retry (recall),
         # while a successful read short-circuits all future events for this vehicle.
         self._plates[event.vehicle_id] = (plate, score, n_reads)
 

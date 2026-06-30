@@ -49,7 +49,6 @@ dataset_extraction/
 dataset_curation/
 tests_videos/
 tests_videos/raw_videos/        # downloaded via tests_videos/download_videos.py
-test_videos/
 
 # --- Pipeline outputs ---------------------------------------------------------
 # Artifacts written next to the input video by main.py / the violation harness.

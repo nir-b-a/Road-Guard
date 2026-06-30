@@ -2,11 +2,6 @@ import re
 import cv2
 import numpy as np
 from abc import ABC, abstractmethod
-from collections import Counter
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from Objects.Vehicle import Vehicle
 
 
 def _preprocess_plate(crop: np.ndarray) -> np.ndarray:
@@ -150,18 +145,3 @@ class PaddleOCRDetectorReader(LPRReader):
         return _validate_israeli_plate(text)
 
 
-def try_read_plate(vehicle: 'Vehicle', frame: np.ndarray, reader: LPRReader, min_area: int, frame_id: int) -> None:
-    if not vehicle.needs_lpr(min_area, frame_id):
-        return
-    x1, y1, x2, y2 = vehicle.bounding_box[vehicle.end_frame]
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return
-    vehicle._lpr_last_read_frame = frame_id
-    plate = reader.read_plate(crop)
-    if plate:
-        vehicle._plate_candidates.append(plate)
-        counts = Counter(vehicle._plate_candidates)
-        max_count = max(counts.values())
-        vehicle.license_plate = next(p for p in reversed(vehicle._plate_candidates) if counts[p] == max_count)
-        print(f"[LPR] Vehicle {vehicle.id} → {plate} ({len(vehicle._plate_candidates)} reads)")
