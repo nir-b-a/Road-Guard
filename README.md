@@ -109,6 +109,36 @@ The general vehicle tracker (`yolo11x.pt`) is an off-the-shelf Ultralytics model
 
 ## Setup & Running
 
+### Quick start (Docker)
+
+Brings up MongoDB, the REST API and the authority dashboard in one command:
+
+```bash
+cp backend/.env.example backend/.env   # fill in JWT_SECRET and the R2_* values
+docker compose up --build
+```
+
+- Dashboard → <http://localhost:4173>
+- API → <http://localhost:5000/api>
+
+The **GPU worker is deliberately not containerised** — it needs `torch+cu118` and a
+passed-through NVIDIA device. Run it natively (see *Python Pipeline* below).
+
+### Model weights
+
+Every model is either committed to the repo or auto-downloaded. One command fetches
+what is missing and verifies the rest against a known SHA-256:
+
+```bash
+python tools/fetch_models.py           # fetch anything missing, then verify
+python tools/fetch_models.py --check   # verify only, no network (pre-demo check)
+python tools/fetch_models.py --list    # inventory: which models, and where each comes from
+```
+
+Exits non-zero if a required model is missing or corrupt. See
+[docs/EXTERNAL_COMPONENTS.md](docs/EXTERNAL_COMPONENTS.md) for what each model is and
+who trained it.
+
 ### Python Pipeline
 
 **Prerequisites:** Python 3.10, CUDA-capable GPU.
@@ -163,3 +193,4 @@ Open `application/` in Android Studio. Update `BASE_URL` in `PostDriveActivity.k
 | [`docs/ROADGUARD_OVERVIEW.md`](docs/ROADGUARD_OVERVIEW.md) | Full design document: philosophy, building blocks, lessons learned, results, roadmap |
 | [`BRAIN_BACKEND_INTEGRATION_HANDOFF.txt`](BRAIN_BACKEND_INTEGRATION_HANDOFF.txt) | Integration contract: bundle structure, API contract, DB schema, upload flow |
 | [`WEIGHTS.md`](WEIGHTS.md) | Model weight download guide |
+| [`docs/EXTERNAL_COMPONENTS.md`](docs/EXTERNAL_COMPONENTS.md) | Full disclosure of every external library, open-source project, pretrained model, dataset and service — with licences, and what we built ourselves |
