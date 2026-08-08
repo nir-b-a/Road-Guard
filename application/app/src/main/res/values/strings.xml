@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">RoadGuard</string>
+    <string name="notifications">Notifications</string>
 </resources>
