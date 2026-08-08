@@ -23,7 +23,9 @@ build/
 venv/
 env/
 roadguard-dl/
-/models/
+# /models/ holds training outputs, but the Stage-2 tire weight is re-included below
+# (git cannot re-include a file inside a fully excluded directory, hence /models/*).
+/models/*
 
 # --- Model weights ------------------------------------------------------------
 # Large + auto-downloadable: ultralytics fetches yolo11x.pt / yolov8*.pt on first
@@ -34,10 +36,13 @@ roadguard-dl/
 *.pth
 *.onnx
 *.engine
-# re-include the two small weights we intentionally commit (custom LPR detector ~6MB;
-# validated lane model used by the violation pipeline ~6.5MB):
+# re-include the three small weights we intentionally commit (custom LPR detector ~6MB;
+# validated lane model used by the violation pipeline ~6.5MB; Stage-2 tire detector ~5.3MB).
+# All three are OURS (fine-tuned in-house) and small enough for git, so a fresh clone can
+# run the full pipeline without any private Roboflow key -- see tools/fetch_models.py.
 !israeli_plates.pt
 !weights/phase3_v3_yellowprotect.pt
+!models/tire_yolo11n.pt
 yolo11x.pt
 
 # --- Large local-only data / media -------------------------------------------

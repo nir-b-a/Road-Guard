@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+.env.*
+# A stray 109 MB yolo11x.pt sits in this folder on some machines - never ship it
+# into the image (it has nothing to do with the frontend).
+*.pt
+Dockerfile
+.dockerignore

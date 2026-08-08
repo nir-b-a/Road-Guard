@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+# Secrets are injected at run time by docker-compose (env_file), never baked in.
+.env
+.env.*
+!.env.example
+tests
+coverage
+Dockerfile
+.dockerignore

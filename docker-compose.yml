@@ -1,0 +1,66 @@
+# Road Guard - local stack: MongoDB + Node/Express API + React authority dashboard.
+#
+#   cp backend/.env.example backend/.env   # fill in JWT_SECRET and the R2_* values
+#   docker compose up --build
+#
+#   dashboard -> http://localhost:4173
+#   API       -> http://localhost:5000/api
+#
+# NOT included: the Python GPU worker. It needs torch+cu118 and a passed-through
+# NVIDIA device, which is a different (and much heavier) setup - run it natively:
+#   python tools/fetch_models.py && python worker.py
+services:
+  mongo:
+    image: mongo:7
+    container_name: roadguard-mongo
+    restart: unless-stopped
+    ports:
+      # Published so you can point Compass/mongosh at it, and so a natively-run
+      # worker or backend can share the same database as the containers.
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # The API exits(1) on a failed connect, so wait for a real ping - not just
+      # for the container to exist - before starting it.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  backend:
+    build: ./backend
+    container_name: roadguard-api
+    restart: unless-stopped
+    # Secrets (JWT_SECRET, R2_*) come from the untracked backend/.env.
+    env_file:
+      - ./backend/.env
+    environment:
+      # Overrides .env: inside the compose network Mongo answers to its service
+      # name, not localhost. dotenv does not overwrite existing process.env vars,
+      # so this value wins over whatever backend/.env says.
+      MONGO_URI: mongodb://mongo:27017/roadguard
+      PORT: "5000"
+    ports:
+      - "5000:5000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend/roadguard-authority
+      args:
+        # The browser runs on the HOST, so it reaches the API through the
+        # published port - not through the compose network name.
+        VITE_API_BASE: http://localhost:5000/api
+    container_name: roadguard-dashboard
+    restart: unless-stopped
+    ports:
+      - "4173:4173"
+    depends_on:
+      - backend
+
+volumes:
+  mongo-data:
