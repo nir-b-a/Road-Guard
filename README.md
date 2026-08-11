@@ -12,8 +12,7 @@ Road Guard is a dashcam-based traffic violation detection system for Israeli roa
 4. [Violation Types](#violation-types)
 5. [Custom-Trained Models](#custom-trained-models)
 6. [Setup & Running](#setup--running)
-7. [Tests](#tests)
-8. [Further Reading](#further-reading)
+7. [Further Reading](#further-reading)
 
 ---
 
