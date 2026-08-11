@@ -1,0 +1,69 @@
+# =============================================================================
+# Road Guard - build context for the Python worker image (context = repo root).
+#
+# This is an ALLOWLIST, not a denylist: the first line excludes everything and
+# the `!` lines add back only what worker.py -> main.run_pipeline actually needs.
+#
+# Why an allowlist. The repo root carries ~500 MB of things a container must
+# never receive: yolo11x.pt (114 MB) and yolov8m.pt (52 MB) at the root,
+# weights/clrernet_model_best_culane.pth (264 MB), models/v3_boxes_detector.pt
+# (52 MB), plus UnLanedet/, datasets/, tests_videos/ and every run's
+# validation_output/ + demo_out/. A denylist would have to name each of those,
+# and would silently start shipping the next output directory someone adds.
+# Docker does not read .gitignore, so none of that is excluded by default.
+#
+# `**` (not `*`) is required to exclude nested paths: `*` never matches a `/`,
+# so a bare `*` would exclude the `weights` entry but still ship
+# `weights/clrernet_model_best_culane.pth`. Last matching pattern wins.
+#
+# backend/ and frontend/ build from their own contexts and keep their own
+# .dockerignore files; they are excluded here so the worker image does not
+# carry a second copy of node_modules.
+# =============================================================================
+
+**
+
+# --- entrypoint + pipeline modules imported by main.py -----------------------
+!worker.py
+!main.py
+!Constants.py
+!cloud_env.py
+!video_handler.py
+!undistort.py
+
+!Objects/**
+!speed_estimation/**
+!violations/**
+!line_crossing/**
+!lpr/**
+# tools/ holds fetch_models.py plus ghost_mask / motion_filter /
+# shoulder_violation, which main.py imports for the violation path.
+!tools/**
+# worker/entrypoint.sh is COPYed into the image (the Dockerfiles themselves are
+# passed with -f and do not need to be in the context).
+!worker/**
+
+# --- dependency manifests ----------------------------------------------------
+!requirements.txt
+!requirements-worker.txt
+
+# --- weights: ONLY the three small ones we commit ----------------------------
+# Named individually. Their parent directories hold much larger checkpoints that
+# must stay out of the image; the big auto-downloadable base weights arrive at
+# run time in the models-cache volume (see tools/fetch_models.py).
+!israeli_plates.pt
+!weights/phase3_v3_yellowprotect.pt
+!models/tire_yolo11n.pt
+
+# --- re-exclude noise that lives inside the allowed directories ---------------
+# These come last: a later pattern overrides the `!` lines above.
+# Both forms are needed: `**/__pycache__/**` drops the .pyc files, and
+# `**/__pycache__` drops the now-empty directory entry itself.
+**/__pycache__
+**/__pycache__/**
+**/*.pyc
+**/.pytest_cache
+**/.pytest_cache/**
+# Per-module test suites and their fixtures are not needed at run time.
+tools/violation_labels.json
+**/tests/**

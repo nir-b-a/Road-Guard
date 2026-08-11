@@ -44,6 +44,26 @@ app.use((req, res, next) => {
     next();
 });
 
+// Registered before the routers so it stays cheap - no auth, no DB query, no
+// router stack to walk. It does sit under the /api rate limiter mounted above,
+// which is fine: the healthcheck polls once every 10s against a 600/min cap.
+// Docker's healthcheck polls this, and the worker waits for it to go healthy
+// before it starts claiming jobs: a worker that polls an API whose Mongo
+// connection is still opening just burns retries and logs noise.
+// Liveness alone is not enough - server.js exits(1) on a failed initial connect,
+// but a mid-flight drop leaves the process up with an unusable database, so the
+// mongoose connection state is what decides the status code.
+app.get('/api/health', (req, res) => {
+    // mongoose readyState: 0 disconnected, 1 connected, 2 connecting, 3 disconnecting.
+    const state = require('mongoose').connection.readyState;
+    const ok = state === 1;
+    res.status(ok ? 200 : 503).json({
+        success: ok,
+        message: ok ? 'ok' : 'database not connected',
+        data: { mongo: ['disconnected', 'connected', 'connecting', 'disconnecting'][state] ?? 'unknown' }
+    });
+});
+
 app.use('/api/auth', authRoutes);
 app.use('/api/authority', authorityRoutes);
 app.use('/api/internal', require('./routes/internalRoutes'));

@@ -109,45 +109,131 @@ The general vehicle tracker (`yolo11x.pt`) is an off-the-shelf Ultralytics model
 
 ## Setup & Running
 
-### Quick start (Docker)
+### First-time setup (from a fresh clone)
 
-Brings up MongoDB, the REST API and the authority dashboard in one command:
+Three commands take a new machine from nothing to a runnable pipeline. **Order matters:**
+`fetch_models.py` imports `ultralytics`, so the dependencies must be installed first.
+
+```bash
+# 1. Clone
+git clone <repo-url>
+cd malshinon_master
+
+# 2. Install Python dependencies  (Python 3.10, CUDA-capable GPU)
+pip install -r requirements.txt
+
+# 3. Fetch and verify every model weight
+python tools/fetch_models.py
+```
+
+> **Step 2 caveat:** follow the numbered install steps *inside* `requirements.txt` — PyTorch
+> with CUDA must be installed manually before the rest, or pip will pull a CPU-only build.
+
+That is the whole model setup. **No weight is ever downloaded by hand, and no Roboflow or
+other API key is needed to run the system** — only to retrain. Step 3 prints a line per model
+and exits non-zero if anything required is missing or corrupt, so it doubles as a pre-demo
+smoke check:
+
+```
+  [OK] lane_seg                 weights/phase3_v3_yellowprotect.pt     6.8 MB verified
+  [OK] tire                     models/tire_yolo11n.pt                 5.5 MB verified
+  [OK] plate_detector_israeli   israeli_plates.pt                      6.3 MB verified
+  [OK] yolo11x                  yolo11x.pt                             114.6 MB verified
+  All models present and verified.
+```
+
+Then pick a surface below: Docker for the whole stack, or *Python Pipeline* to run the
+worker natively against a containerised backend.
+
+### Quick start (Docker)
 
 ```bash
 cp backend/.env.example backend/.env   # fill in JWT_SECRET and the R2_* values
-docker compose up --build
+
+docker compose up --build                 # MongoDB + REST API + authority dashboard
+docker compose --profile cpu up --build   # ... + the CV worker, CPU-only
+docker compose --profile gpu up --build   # ... + the CV worker, CUDA 11.8
 ```
 
 - Dashboard → <http://localhost:4173>
-- API → <http://localhost:5000/api>
+- API → <http://localhost:5000/api> (health: `/api/health`)
 
-The **GPU worker is deliberately not containerised** — it needs `torch+cu118` and a
-passed-through NVIDIA device. Run it natively (see *Python Pipeline* below).
+| Command | What you get | Cost |
+|---------|--------------|------|
+| `docker compose up` | Mongo + API + dashboard. Enough to browse the product. | ~400 MB, no extra host setup |
+| `--profile cpu` | The above **plus** the full CV pipeline, end to end. Processes clips perhaps 20–40× slower than GPU. | ~2.9 GB image |
+| `--profile gpu` | The above at real throughput. | ~10 GB image, **needs an NVIDIA driver + the NVIDIA Container Toolkit** (on Windows: Docker Desktop with the WSL2 backend) |
+
+The worker sits behind a profile so a plain `docker compose up` stays a fast three-container
+demo with no GPU prerequisites. Run **at most one** worker profile at a time — both claim from
+the same job queue.
+
+Startup is ordered by health, not by luck: the API waits for a real `mongosh` ping, and the
+worker waits for `/api/health` to report `mongo: connected` before it starts polling.
+
+**Model weights are not baked into the images.** The 114 MB `yolo11x.pt` and the FastALPR ONNX
+cache live in a named `models-cache` volume that `worker/entrypoint.sh` populates on first
+start (~9 s) and links on every start after (~1 s). Only the three small committed weights
+ship in the layer.
+
+To run the worker natively against the containerised backend instead, start the stack without
+a profile and see *Python Pipeline* below. Note that `worker.env` points at
+`http://localhost:5001`; the containerised backend publishes **5000**.
+
+#### Container layout
+
+| File | Role |
+|------|------|
+| [`docker-compose.yml`](docker-compose.yml) | The whole stack. Profiles `cpu` / `gpu` gate the worker. |
+| [`backend/Dockerfile`](backend/Dockerfile) | Node 22 alpine, `npm ci --omit=dev`. |
+| [`frontend/roadguard-authority/Dockerfile`](frontend/roadguard-authority/Dockerfile) | Two-stage: `vite build`, then `vite preview` over the static bundle. |
+| [`worker/Dockerfile.cpu`](worker/Dockerfile.cpu) | `python:3.10-slim` + torch 2.1.2 from the CPU wheel index. |
+| [`worker/Dockerfile.gpu`](worker/Dockerfile.gpu) | `nvidia/cuda:11.8-cudnn8-runtime` + torch 2.1.2+cu118. |
+| [`worker/entrypoint.sh`](worker/entrypoint.sh) | Links the cached weights in from the volume, fetches what is missing, links the result back out. |
+| [`worker/verify_env.py`](worker/verify_env.py) | Build-time gate: asserts the torch flavour, the headless-OpenCV substitution, and that every pipeline module imports. Run as the last layer, so a broken dependency set fails the **build**. |
+| [`requirements-worker.txt`](requirements-worker.txt) | Container dependency set — headless OpenCV, no PaddleOCR, no UnLanedet extras. |
+| [`.dockerignore`](.dockerignore) | Allowlist. Trims the worker build context from ~500 MB to ~19 MB. |
+
+#### Testing the stack
+
+```bash
+pytest tests/test_docker_stack.py                    # static + daemon checks (~5 s)
+pytest tests/test_docker_stack.py --rundocker-build  # + build the image and assert on it
+pytest tests/test_docker_stack.py -m "not docker"    # no daemon needed
+cd backend && npm test                               # includes the /api/health contract
+```
 
 ### Model weights
 
-Every model is either committed to the repo or auto-downloaded. One command fetches
-what is missing and verifies the rest against a known SHA-256:
-
 ```bash
 python tools/fetch_models.py           # fetch anything missing, then verify
-python tools/fetch_models.py --check   # verify only, no network (pre-demo check)
+python tools/fetch_models.py --check   # verify only, no network (offline / CI / pre-demo)
 python tools/fetch_models.py --list    # inventory: which models, and where each comes from
 ```
 
-Exits non-zero if a required model is missing or corrupt. See
-[docs/EXTERNAL_COMPONENTS.md](docs/EXTERNAL_COMPONENTS.md) for what each model is and
-who trained it.
+Every model falls into one of three groups, which is why no manual download step exists:
+
+| Group | Models | How you get it |
+|-------|--------|----------------|
+| **Ours, committed** | `weights/phase3_v3_yellowprotect.pt`, `models/tire_yolo11n.pt`, `israeli_plates.pt` | Arrives with the clone — each is under 7 MB. `.gitignore` excludes `*.pt` then re-includes exactly these three. |
+| **Third-party, auto-downloaded** | `yolo11x.pt` (114 MB) | Ultralytics fetches it on first use; `fetch_models.py` pins the working directory so it lands where `Constants.YOLO_VERSION` expects. |
+| **Third-party, self-caching** | FastALPR plate detector + OCR (ONNX) | `fast_alpr` pulls both into its own cache when the reader is first constructed. |
+
+Checksums are enforced asymmetrically on purpose: a mismatch on **our** committed weights is a
+hard failure (those bytes must never change), while a third-party mismatch is only a warning,
+since upstream can legitimately re-cut a release.
+
+If a committed weight is reported missing or corrupt, restore it with
+`git checkout -- <path>` rather than re-downloading.
+
+See [WEIGHTS.md](WEIGHTS.md) for per-model detail and
+[docs/EXTERNAL_COMPONENTS.md](docs/EXTERNAL_COMPONENTS.md) for provenance — who trained each
+model, on what data, under which licence.
 
 ### Python Pipeline
 
-**Prerequisites:** Python 3.10, CUDA-capable GPU.
-
-```bash
-pip install -r requirements.txt
-```
-
-> Follow the numbered install steps inside `requirements.txt` — PyTorch with CUDA must be installed manually before the rest.
+**Prerequisites:** Python 3.10, CUDA-capable GPU, and *First-time setup* above completed
+(dependencies installed, `python tools/fetch_models.py` green).
 
 ```bash
 # Start the worker — polls the backend and processes drives automatically

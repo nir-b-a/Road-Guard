@@ -1,0 +1,8 @@
+# Shell scripts must keep LF endings even on a Windows checkout. A CRLF
+# entrypoint.sh makes the kernel read the shebang as "/bin/sh\r" and the
+# container dies with "no such file or directory" - a confusing failure that
+# only appears once the image runs.
+*.sh text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+*.dockerignore text eol=lf

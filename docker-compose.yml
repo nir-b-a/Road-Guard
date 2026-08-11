@@ -1,14 +1,21 @@
-# Road Guard - local stack: MongoDB + Node/Express API + React authority dashboard.
+# Road Guard - full local stack.
 #
 #   cp backend/.env.example backend/.env   # fill in JWT_SECRET and the R2_* values
-#   docker compose up --build
+#
+#   docker compose up --build                      # mongo + API + dashboard
+#   docker compose --profile cpu up --build        # ... + the worker, CPU-only
+#   docker compose --profile gpu up --build        # ... + the worker, CUDA 11.8
 #
 #   dashboard -> http://localhost:4173
-#   API       -> http://localhost:5000/api
+#   API       -> http://localhost:5000/api   (health: /api/health)
 #
-# NOT included: the Python GPU worker. It needs torch+cu118 and a passed-through
-# NVIDIA device, which is a different (and much heavier) setup - run it natively:
-#   python tools/fetch_models.py && python worker.py
+# Why the worker sits behind a profile. The default `up` is what a reviewer runs
+# to look at the product, and it must stay a fast, dependency-free three
+# containers. Pulling ~1 GB of wheels (cpu) or ~10 GB plus an NVIDIA Container
+# Toolkit (gpu) is opt-in. Profiles do that with no second compose file: a
+# service with `profiles:` is invisible to a plain `docker compose up`.
+#
+# Run at most ONE worker profile at a time - both claim jobs from the same queue.
 services:
   mongo:
     image: mongo:7
@@ -47,6 +54,16 @@ services:
     depends_on:
       mongo:
         condition: service_healthy
+    healthcheck:
+      # /api/health reports 503 until mongoose is actually connected, so this
+      # gates the worker on a usable API rather than a listening socket.
+      # node -e, not curl: the alpine image has no curl and adding one would
+      # exist purely for this check.
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:5000/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
 
   frontend:
     build:
@@ -62,5 +79,51 @@ services:
     depends_on:
       - backend
 
+  # --- the Python worker: same service, two builds -------------------------- #
+  # Only the base image and the torch index differ; everything below is shared
+  # via the x-worker-common anchor so the two cannot drift apart.
+  worker-cpu:
+    <<: &worker-common
+      restart: unless-stopped
+      # Reuse backend/.env for the R2_* credentials and INTERNAL_TOKEN - worker.py
+      # reads that same file natively, so the creds stay in exactly one place.
+      env_file:
+        - ./backend/.env
+      environment:
+        # Inside the compose network the API is `backend`, not localhost:5001 -
+        # which is what the native-run worker.env says. An explicit value here
+        # beats worker.env, since worker.py's _load_env_file uses setdefault.
+        SERVER_URL: http://backend:5000
+        WORK_DIR: /work
+        MODEL_CACHE_DIR: /models-cache
+      volumes:
+        # Named, not bind: the big auto-downloaded weights (yolo11x.pt ~114 MB)
+        # and the fast_alpr ONNX cache survive rebuilds instead of being
+        # re-fetched, and they never enter an image layer.
+        - models-cache:/models-cache
+        - worker-scratch:/work
+      depends_on:
+        backend:
+          condition: service_healthy
+    build:
+      context: .
+      dockerfile: worker/Dockerfile.cpu
+    container_name: roadguard-worker-cpu
+    profiles: ["cpu"]
+
+  worker-gpu:
+    <<: *worker-common
+    build:
+      context: .
+      dockerfile: worker/Dockerfile.gpu
+    container_name: roadguard-worker-gpu
+    profiles: ["gpu"]
+    # Requires an NVIDIA driver + the NVIDIA Container Toolkit on the host.
+    # `docker compose --profile gpu up` fails fast with a clear device error if
+    # they are missing - that is the intended signal to use the cpu profile.
+    gpus: all
+
 volumes:
   mongo-data:
+  models-cache:
+  worker-scratch:

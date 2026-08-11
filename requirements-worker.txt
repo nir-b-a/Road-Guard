@@ -1,0 +1,62 @@
+# =============================================================================
+# Road Guard — container dependency set for the GPU/CPU worker image.
+# Target: Linux, Python 3.10 (same interpreter as the native Windows env).
+#
+# This is NOT a second copy of requirements.txt out of preference — the root
+# file cannot be reused as-is inside a container, for three reasons:
+#
+#   1. opencv-python (headed) links libGL/libgtk and aborts with
+#      "cannot open display" style failures in an image with no X11. The
+#      container wants opencv-python-headless, which ships the identical `cv2`
+#      module minus the GUI entry points. main.py already tolerates this:
+#      cloud_env.py neutralises cv2.imshow/waitKey when it detects a headless host.
+#   2. paddleocr==2.7.3 pulls paddlepaddle (~600 MB of wheels). lpr/reader.py
+#      imports it lazily and only in PaddleOCRDetectorReader, which is NOT the
+#      active reader — fast_alpr + onnxruntime is. Excluding it is pure win.
+#   3. The UnLanedet / CLRerNet block (ninja, imgaug, albumentations, skimage,
+#      shapely, scikit-learn, addict, yapf) is needed only by
+#      tools/test_corun_video.py and line_crossing/dl_lane_detector.py. The
+#      worker never touches that path.
+#
+# torch / torchvision are deliberately absent here, exactly as in the root file:
+# the Dockerfiles install them first from the CPU or cu118 wheel index. Listing
+# them here would let pip resolve a default PyPI build and silently swap the
+# CUDA runtime out from under the GPU image.
+#
+# Version pins are copied verbatim from requirements.txt — this file must not
+# drift from the proven native env. tests/test_docker_stack.py enforces that.
+# =============================================================================
+
+# --- core pipeline (main.py / speed estimation) ------------------------------
+# numpy 2.0 broke the ABI for the compiled CV/ML wheels below. Keep pinned.
+numpy==1.26.4
+# YOLO11 detection + BoT-SORT tracking.
+ultralytics==8.4.68
+# Headless cv2 — see reason (1) above. Same version as the headed build.
+opencv-python-headless==4.10.0.84
+# Linear-assignment backend for the ultralytics trackers.
+lapx==0.9.4
+# Savitzky-Golay smoothing + Kalman/RTS math (speed_estimation/).
+scipy==1.13.1
+# Per-vehicle speed/distance plots. Agg backend only in the container.
+matplotlib==3.10.9
+# Overpass speed-limit lookup, violations/export.py, worker.py HTTP calls.
+requests==2.28.1
+pandas==2.2.2
+pillow==10.4.0
+pyyaml==6.0.2
+tqdm==4.66.5
+
+# --- worker transport --------------------------------------------------------
+# S3 client for Cloudflare R2: pulls each job's files, pushes evidence back.
+boto3==1.35.36
+
+# --- license-plate recognition (the active reader) ---------------------------
+# fast_alpr runs on onnxruntime and caches its two ONNX models on first
+# construction; the image warms that cache at run time, not at build time.
+fast_alpr==0.4.0
+onnxruntime==1.23.2
+
+# --- build shim --------------------------------------------------------------
+# torch 2.1.2's cpp_extension imports pkg_resources, removed in setuptools 81+.
+setuptools<81
