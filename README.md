@@ -110,21 +110,6 @@ The general vehicle tracker (`yolo11x.pt`) is an off-the-shelf Ultralytics model
 
 ## Setup & Running
 
-### Quick start (Docker)
-
-Brings up MongoDB, the REST API and the authority dashboard in one command:
-
-```bash
-cp backend/.env.example backend/.env   # fill in JWT_SECRET and the R2_* values
-docker compose up --build
-```
-
-- Dashboard → <http://localhost:4173>
-- API → <http://localhost:5000/api>
-
-The **GPU worker is deliberately not containerised** — it needs `torch+cu118` and a
-passed-through NVIDIA device. Run it natively (see *Python Pipeline* below).
-
 ### Model weights
 
 Every model is either committed to the repo or auto-downloaded. One command fetches
