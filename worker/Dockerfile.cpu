@@ -1,0 +1,77 @@
+# =============================================================================
+# Road Guard - Python worker, CPU build.
+#
+# Build context is the REPO ROOT (worker.py imports main.run_pipeline), so:
+#     docker build -f worker/Dockerfile.cpu -t roadguard-worker:cpu .
+# The root .dockerignore trims that context from ~500 MB to ~19 MB.
+#
+# This is the portable image: no NVIDIA driver, no Container Toolkit, no GPU.
+# It processes a clip perhaps 20-40x slower than the cu118 image, which is
+# irrelevant for "does the whole pipeline run end to end" and is the difference
+# between a reviewer being able to run the stack and not. worker/Dockerfile.gpu
+# is the one to use for real throughput.
+# =============================================================================
+FROM python:3.10-slim
+
+# 3.10 to match the validated native environment - the pinned wheels below
+# (numpy 1.26.4 / torch 2.1.2 / lapx) are the exact ones from that .venv.
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# libglib2.0-0: still required by opencv-python-headless (it drops libGL/GTK, not
+#               glib). libgomp1: OpenMP runtime for scipy / onnxruntime.
+# No ffmpeg package - the OpenCV wheel bundles its own decoders.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libglib2.0-0 libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# torch FIRST, and from the CPU index explicitly. The default PyPI wheel for
+# linux is the CUDA one (~2 GB of nvidia-* transitive packages) - installing it
+# here would quadruple the image for a build that has no GPU to use it.
+RUN pip install torch==2.1.2 torchvision==0.16.2 \
+        --index-url https://download.pytorch.org/whl/cpu
+
+# Dependencies before source, so editing a .py does not re-resolve the wheels.
+COPY requirements-worker.txt ./
+RUN pip install -r requirements-worker.txt
+
+# ultralytics depends on the HEADED opencv-python and pip installs it next to the
+# headless build; both unpack a cv2/ package over the same path and the last one
+# wins. Remove the headed flavour and reinstall headless so the surviving cv2 is
+# the one that does not link libGL. --no-deps stops it dragging opencv back in.
+RUN pip uninstall -y opencv-python opencv-contrib-python || true \
+    && pip install --force-reinstall --no-deps opencv-python-headless==4.10.0.84
+
+# Source last.
+COPY . .
+
+# The context comes off a Windows checkout, where every file arrives as 0644 -
+# without this the ENTRYPOINT dies with "permission denied".
+RUN chmod +x /app/worker/entrypoint.sh
+
+# /models-cache holds the big auto-downloaded weights, /work the per-job scratch
+# space. Both are volumes; creating them in the image under the non-root user
+# makes Docker initialise each named volume with that ownership, which a
+# root-created volume would not have.
+RUN mkdir -p /models-cache /work \
+    && useradd --create-home --uid 1000 worker \
+    && chown -R worker:worker /app /models-cache /work
+USER worker
+
+# MPLBACKEND=Agg: draw_vehicle_plots imports pyplot, which picks an interactive
+# backend and fails without a display.
+ENV MODEL_CACHE_DIR=/models-cache \
+    WORK_DIR=/work \
+    MPLBACKEND=Agg
+VOLUME ["/models-cache", "/work"]
+
+# Fail the BUILD on a broken dependency set rather than the first job.
+RUN python worker/verify_env.py --expect cpu
+
+ENTRYPOINT ["/app/worker/entrypoint.sh"]
+CMD ["python", "worker.py"]

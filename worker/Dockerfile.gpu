@@ -1,0 +1,74 @@
+# =============================================================================
+# Road Guard - Python worker, CUDA 11.8 build.
+#
+# Build context is the REPO ROOT (worker.py imports main.run_pipeline), so:
+#     docker build -f worker/Dockerfile.gpu -t roadguard-worker:gpu .
+#
+# Running it needs more than Docker: an NVIDIA driver on the host plus the
+# NVIDIA Container Toolkit (on Windows: Docker Desktop with the WSL2 backend and
+# a recent driver). Without that, `--gpus all` errors out at `docker run`. That
+# is exactly why compose keeps this service behind the `gpu` profile and ships
+# worker/Dockerfile.cpu as the portable default.
+#
+# Expect ~9-11 GB. cu118 (not a newer CUDA) because the pipeline was validated on
+# torch 2.1.2+cu118, which is also the last comfortable stop for Pascal cards
+# such as the GTX 1060 this project develops on.
+# =============================================================================
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+# `runtime`, not `devel`: nothing here compiles CUDA kernels. The UnLanedet
+# inline-op build is the only thing that would need nvcc, and that path is not
+# in this image (see requirements-worker.txt).
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Ubuntu 22.04's system python IS 3.10, which is the version the pins were
+# validated against - no deadsnakes PPA needed.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.10 python3-pip python3.10-distutils \
+        libglib2.0-0 libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/local/bin/pip
+
+WORKDIR /app
+
+# torch FIRST, from the cu118 index. This is the whole point of the image: the
+# default PyPI wheel would bring a different CUDA runtime than the base layer.
+RUN pip install torch==2.1.2 torchvision==0.16.2 \
+        --index-url https://download.pytorch.org/whl/cu118
+
+COPY requirements-worker.txt ./
+RUN pip install -r requirements-worker.txt
+
+# ultralytics depends on the headed opencv-python; it and the headless build
+# unpack over the same cv2/ path. Keep only headless. See Dockerfile.cpu.
+RUN pip uninstall -y opencv-python opencv-contrib-python || true \
+    && pip install --force-reinstall --no-deps opencv-python-headless==4.10.0.84
+
+COPY . .
+
+RUN chmod +x /app/worker/entrypoint.sh
+
+RUN mkdir -p /models-cache /work \
+    && useradd --create-home --uid 1000 worker \
+    && chown -R worker:worker /app /models-cache /work
+USER worker
+
+ENV MODEL_CACHE_DIR=/models-cache \
+    WORK_DIR=/work \
+    MPLBACKEND=Agg
+VOLUME ["/models-cache", "/work"]
+
+# Asserts torch reports cuda=11.8. Note this runs at BUILD time, with no GPU
+# attached, so it deliberately checks torch.version.cuda and not
+# torch.cuda.is_available() - the latter is False on any build machine.
+RUN python worker/verify_env.py --expect cuda
+
+ENTRYPOINT ["/app/worker/entrypoint.sh"]
+CMD ["python", "worker.py"]
