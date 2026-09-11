@@ -148,3 +148,14 @@ output_*/
 # worker.py stages each job's downloaded files here before processing —
 # regenerated every run, never commit.
 _worker_jobs/
+
+
+# --- New Data To Not Upload To Git --------------------------------------
+bitrate_sweep/
+docs/
+reconstruction_test/
+rg_vids_fake_sesh/
+roadguard_videos/
+test_videos/
+c2run.log
+output_c2_full.log

@@ -8,8 +8,10 @@ A capture folder (see ego_yaw.py / the Android data spec) holds:
     gyro.csv           timestamp_ns, gx, gy, gz                    (rad/s)
     gravity.csv        timestamp_ns, grx, gry, grz                 (m/s^2)
     linacc.csv         timestamp_ns, ax, ay, az        (optional;  m/s^2)
-    gps.csv            timestamp_ns, lat, lon, speed_mps, bearing_deg, accuracy_m
+    gps.csv            timestamp_ns, lat, lon, speed_mps, bearing_deg, accuracy_m,
+                       unix_time_ms, provider
     intrinsics.json    camera intrinsics            (copied verbatim)
+    session_meta.json  UTC anchor for the clock     (copied verbatim)
     tags.json          (copied verbatim)
 
 Everything is aligned by timestamp_ns on ONE monotonic clock, and the speed
@@ -52,7 +54,11 @@ SENSOR_FILES = {
     "linacc.csv":  "timestamp_ns",
     "gps.csv":     "timestamp_ns",
 }
-COPY_VERBATIM = ("intrinsics.json", "tags.json")
+# session_meta.json rides along unchanged: its clock_epoch_unix_ms anchors the monotonic
+# clock to UTC, and since the cut keeps timestamp_ns ABSOLUTE that mapping stays exactly
+# valid for the clip. (Its recording_start_* fields still describe the PARENT recording's
+# start -- the clip's own start is frames.csv row 0 through the same epoch formula.)
+COPY_VERBATIM = ("intrinsics.json", "tags.json", "session_meta.json")
 
 
 def find_source_video(src_dir: str, override: str | None) -> str:

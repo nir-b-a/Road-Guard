@@ -6,7 +6,8 @@ const r2 = require('../services/r2');
 const { internalAuth } = require('../middleware/internalAuth');
 
 // A 'processing' job older than this is assumed dead (worker crashed) and requeued.
-const JOB_STALE_MS = parseInt(process.env.JOB_STALE_MINUTES || '30', 10) * 60 * 1000;
+// A worker that stops cleanly does not wait for this: it calls /drive/:id/release instead.
+const JOB_STALE_MS = parseInt(process.env.JOB_STALE_MINUTES || '60', 10) * 60 * 1000;
 
 router.use(internalAuth);
 
@@ -64,6 +65,34 @@ router.post('/drive/:id/complete', async (req, res) => {
         }
     }
     res.json({ success: true, message: 'Drive ' + status, data: { driveId: drive._id, status } });
+});
+
+/**
+ * POST /api/internal/drive/:id/release   Body: { reason? }
+ * A worker that is stopped before it finishes a drive hands the drive straight back to the queue,
+ * so it does not sit in 'processing' until the watchdog above gives up on it (JOB_STALE_MINUTES).
+ * Safe to rerun: violations are only POSTed after processing finished, and the raw files stay in
+ * R2 until the drive is 'processed'. Only the worker that holds the claim may release it: if the
+ * watchdog already requeued the drive and another worker claimed it, a late release is refused.
+ */
+router.post('/drive/:id/release', async (req, res) => {
+    const workerId = req.headers['x-worker-id'] || 'worker';
+    const drive = await Drive.findById(req.params.id);
+    if (!drive) return res.status(404).json({ success: false, message: 'Drive not found', data: null });
+
+    const released = await Drive.findOneAndUpdate(
+        { _id: drive._id, status: 'processing', workerId },
+        { $set: { status: 'queued', claimedAt: null, workerId: null } },
+        { new: true }
+    );
+    if (!released) {
+        return res.status(409).json({ success: false,
+            message: `Drive is not being processed by this worker (status: ${drive.status}, worker: ${drive.workerId})`,
+            data: { driveId: drive._id, status: drive.status } });
+    }
+    const reason = String((req.body || {}).reason || 'worker stopped').slice(0, 200);
+    console.log(`[internal] drive ${drive._id} released back to the queue by ${workerId}: ${reason}`);
+    res.json({ success: true, message: 'Drive released back to the queue', data: { driveId: drive._id, status: released.status } });
 });
 
 /**

@@ -49,10 +49,12 @@ FORBIDDEN_IN_CONTEXT = [
     "_quarantine_models",
 ]
 
-# Modules worker.py -> main.run_pipeline imports. If the allowlist drops one of
-# these the image builds fine and then dies on the first job.
+# Modules worker.py -> main.process_video_with_models imports. If the allowlist
+# drops one of these the image builds fine and then dies on the first job.
 REQUIRED_IN_CONTEXT = [
     "worker.py",
+    "worker_common.py",
+    "lane_render.py",
     "main.py",
     "Constants.py",
     "cloud_env.py",

@@ -26,6 +26,16 @@ class SplashActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("roadguard", MODE_PRIVATE)
 
+        // Offline build: there is no server to authenticate against, so skip the whole
+        // login/register screen. Deliberately no fake token is stored — every server call
+        // is gated on AppConfig.OFFLINE_MODE instead, so nothing can later "look logged in"
+        // and fire a request (the mess the dev-offline-token cleanup below was written for).
+        if (AppConfig.OFFLINE_MODE) {
+            startActivity(Intent(this, HomeActivity::class.java))
+            finish()
+            return
+        }
+
         // Already logged in with a real token -> go straight to Home. A previous DEV build
         // may have stored a fake "dev-offline-token"; ignore and clear it so the login
         // screen shows again instead of silently using a token the server will reject.

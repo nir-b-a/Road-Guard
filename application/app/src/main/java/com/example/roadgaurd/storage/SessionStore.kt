@@ -2,6 +2,8 @@ package com.example.roadgaurd.storage
 
 import android.content.Context
 import android.util.Log
+import com.example.roadgaurd.AppConfig
+import com.example.roadgaurd.upload.UploadProgress
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -10,7 +12,7 @@ import java.util.concurrent.TimeUnit
  *
  * Each drive is written by RecordingActivity to
  *     getExternalFilesDir(null)/sessions/<sessionId>/
- * On successful upload, PostDriveActivity writes an "uploaded.flag" sentinel and returns
+ * On successful upload, UploadService writes an "uploaded.flag" sentinel and returns
  * immediately — the session stays on device for UPLOAD_GRACE_MINUTES so the user can
  * verify or retry if something looked wrong. The launch-time sweep (HomeActivity) then
  * deletes flagged dirs once the grace period has passed. Un-uploaded sessions are kept
@@ -22,7 +24,7 @@ object SessionStore {
     const val UPLOAD_GRACE_MINUTES = 2L
     private const val UPLOADED_FLAG = "uploaded.flag"
     private const val SKIPPED_FLAG  = "skipped.flag"
-    private const val MIN_VIDEO_BYTES = 100L * 1024 * 1024
+    private const val MIN_VIDEO_BYTES = 5L * 1024 * 1024   // 5 MB — keep in sync with PostDriveActivity
 
     private const val TAG = "SessionStore"
 
@@ -78,12 +80,21 @@ object SessionStore {
      * Sweep stale sessions at launch:
      * - Uploaded (flag present): delete after UPLOAD_GRACE_MINUTES.
      * - Not uploaded: delete after SESSION_RETENTION_HOURS.
+     *
+     * Disabled entirely in offline builds: retention exists to reclaim space once a drive is
+     * safely on the server, and offline it never is — sweeping would silently destroy the only
+     * copy of the data. Offline sessions are kept until they are pulled off the phone by hand.
      */
     fun sweepStaleSessions(context: Context) {
+        if (AppConfig.OFFLINE_MODE) {
+            Log.i(TAG, "offline mode — retention sweep disabled, sessions kept on device")
+            return
+        }
         val children = sessionsRoot(context).listFiles() ?: return
         val now = System.currentTimeMillis()
         for (dir in children) {
             if (!dir.isDirectory) continue
+            if (UploadProgress.isUploading(dir)) continue   // never delete a folder mid-upload
             val flag = File(dir, UPLOADED_FLAG)
             if (flag.exists()) {
                 val graceMs = TimeUnit.MINUTES.toMillis(UPLOAD_GRACE_MINUTES)

@@ -103,7 +103,7 @@ DISTANCE_CALCULATION_METHOD = "height"
 # lateral) into world coordinates. -1 is the validated winner for CARLA; it MUST
 # be re-validated on real Android footage (device axes / mount orientation differ
 # -- see ANDROID_DATA_SPEC.md sign note).
-LAT_SIGN = -1
+LAT_SIGN = 1
 
 # ── Lateral landmark (cross-track reference point) ────────────────────────────
 # Which horizontal point of a vehicle's bbox the lateral offset is measured from
@@ -201,7 +201,7 @@ SHRINK_DROP_RATIO = 0.12           # fractional width/height collapse vs last go
 # mount dependent and MUST be re-validated on real footage: if a turn makes the
 # reconstructed target speed WORSE, flip this. +1 is the neutral default (there is
 # no CARLA equivalent to inherit). Only affects the Android path; sim is unchanged.
-HEADING_SIGN = 1
+HEADING_SIGN = -1
 
 # ── Smoother selection ────────────────────────────────────────────────────────
 SMOOTHER_KALMAN = "kalman"       # constant-acceleration Kalman + RTS (emits std)

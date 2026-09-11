@@ -11,6 +11,10 @@ const ViolationDetailPage = () => {
   const [loading, setLoading] = useState(true);
   const [actionMsg, setActionMsg] = useState('');
   const [error, setError] = useState('');
+  // A <video> whose codec the browser cannot decode fails silently: black box, live
+  // controls, nothing in the console. Surface it, otherwise an unplayable clip is
+  // indistinguishable from a missing one.
+  const [videoError, setVideoError] = useState(false);
   useEffect(() => {
     api.get('/authority/evidence/' + id).then(res => { setEvidence(res.data.data); setStatus(res.data.data.status || 'pending'); }).catch(() => setError('Failed to load evidence.')).finally(() => setLoading(false));
   }, [id]);
@@ -31,7 +35,13 @@ const ViolationDetailPage = () => {
         {!loading && evidence && <div className="space-y-6">
           <div className="bg-gray-800 border border-gray-700 rounded-xl overflow-hidden">
             <div className="px-6 py-4 border-b border-gray-700"><h2 className="font-semibold text-white">Evidence Video</h2></div>
-            <div className="p-4"><video controls src={evidence.video_clip_url} className="w-full rounded-lg bg-black max-h-80">Your browser does not support video.</video></div>
+            <div className="p-4">
+              <video controls src={evidence.video_clip_url} onError={() => setVideoError(true)} className="w-full rounded-lg bg-black max-h-80">Your browser does not support video.</video>
+              {videoError && <div className="mt-3 rounded-lg border border-amber-600/40 bg-amber-950/40 px-4 py-3 text-sm text-amber-200">
+                <p className="font-semibold">This clip could not be played in the browser.</p>
+                <p className="mt-1 text-amber-300/80">The evidence exists but is in a format this browser cannot decode — it was most likely processed by a worker without ffmpeg, so it was never transcoded to H.264. <a href={evidence.video_clip_url} className="underline hover:text-amber-100">Download the clip</a> to review it in a desktop player.</p>
+              </div>}
+            </div>
           </div>
           <div className="bg-gray-800 border border-gray-700 rounded-xl p-6">
             <div className="flex justify-between items-start mb-4"><h2 className="font-semibold text-white">Evidence Details</h2><StatusBadge status={status} /></div>

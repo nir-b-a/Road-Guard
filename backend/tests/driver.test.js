@@ -8,7 +8,7 @@ beforeAll(async () => await connect());
 afterAll(async () => await disconnect());
 beforeEach(async () => await clearCollections());
 
-const VALID_SIZE = 200 * 1024 * 1024;   // 200 MB, inside [100 MB, 4 GB]
+const VALID_SIZE = 200 * 1024 * 1024;   // 200 MB, inside [5 MB, 4 GB]
 
 describe('DRIVER - POST /api/driver/upload/init', () => {
     it('initializes upload and returns 7 presigned URLs', async () => {
@@ -40,6 +40,12 @@ describe('DRIVER - POST /api/driver/upload/init', () => {
             .send({ sessionId: 'session_small', videoName: 'drive.mp4', videoSize: 1024 });
         expect(res.statusCode).toBe(400);
         expect(res.body.message).toMatch(/size must be between/i);
+    });
+    it('accepts a video exactly at the 5 MB floor (the Android app minimum)', async () => {
+        const { token } = await getDriverToken();
+        const res = await request(app).post('/api/driver/upload/init').set('Authorization', 'Bearer ' + token)
+            .send({ sessionId: 'session_floor', videoName: 'drive.mp4', videoSize: 5 * 1024 * 1024 });
+        expect(res.statusCode).toBe(201);
     });
     it('rejects a non-video extension', async () => {
         const { token } = await getDriverToken();
