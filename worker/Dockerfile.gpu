@@ -1,7 +1,7 @@
 # =============================================================================
 # Road Guard - Python worker, CUDA 11.8 build.
 #
-# Build context is the REPO ROOT (worker.py imports main.run_pipeline), so:
+# Build context is the REPO ROOT (worker.py imports main.process_video_with_models), so:
 #     docker build -f worker/Dockerfile.gpu -t roadguard-worker:gpu .
 #
 # Running it needs more than Docker: an NVIDIA driver on the host plus the

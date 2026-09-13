@@ -40,8 +40,9 @@ PIPELINE_MODULES = [
     "scipy", "pandas", "matplotlib", "boto3", "requests", "onnxruntime",
 ]
 
-# First-party packages the worker reaches through main.run_pipeline.
-FIRST_PARTY = ["Constants", "cloud_env", "video_handler", "Objects.World", "violations.event"]
+# First-party packages the worker reaches through main.process_video_with_models.
+FIRST_PARTY = ["Constants", "cloud_env", "video_handler", "Objects.World", "violations.event",
+               "worker_common", "lane_render"]
 
 
 def fail(msg: str) -> None:

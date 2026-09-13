@@ -1,7 +1,7 @@
 # =============================================================================
 # Road Guard - Python worker, CPU build.
 #
-# Build context is the REPO ROOT (worker.py imports main.run_pipeline), so:
+# Build context is the REPO ROOT (worker.py imports main.process_video_with_models), so:
 #     docker build -f worker/Dockerfile.cpu -t roadguard-worker:cpu .
 # The root .dockerignore trims that context from ~500 MB to ~19 MB.
 #

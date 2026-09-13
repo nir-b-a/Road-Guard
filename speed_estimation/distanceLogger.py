@@ -1,6 +1,9 @@
 import csv
+import os
+
 from Objects.World import World
 from Constants import class_name
+from speed_estimation import session_clock as _sc
 
 def export_distances(world: World, max_frame, output_file="distances.csv", vehicle_id: int | None = None):
     v = world.getVehicle(vehicle_id) if vehicle_id is not None else world.getVehicle(1)
@@ -84,6 +87,87 @@ def export_persisted_speeds(world: World, max_frame: int,
             writer.writerow([frame,
                              v.speed_per_frame.get(frame, 0.0),
                              v.speed_std_per_frame.get(frame, 0.0)])
+
+
+def export_vehicle_speed_series(world: World,
+                                output_file: str = "vehicle_speeds.csv",
+                                *,
+                                fps: float,
+                                frames_csv: str | None = None,
+                                session_dir: str | None = None) -> str | None:
+    """EVERY vehicle's speed series in ONE tidy CSV, stamped with absolute UTC.
+
+    export_persisted_speeds writes a single vehicle in wide form; this writes all of
+    them in long form (one row per vehicle-frame), which is what an external
+    comparison needs: the ground truth lives on a DIFFERENT device, so each estimate
+    has to carry a timestamp that means the same thing on both phones.
+
+    Columns:
+        vehicle_id, vehicle_class, frame, time_s,
+        timestamp_ns   the capture's monotonic sensor clock (blank if not an Android clip)
+        unix_ms, utc    absolute UTC via session_meta.json's clock_epoch_unix_ms
+                        (blank when the capture has no GNSS anchor)
+        speed_mps, speed_kmh, speed_std_kmh
+        x1, y1, x2, y2  the bbox at that frame -- so a track can be recognised in the
+                        annotated video without cross-referencing another file
+
+    Only vehicles with a persisted speed series are written (the ones that survived
+    the short-track filter), sorted by (vehicle_id, frame).
+    """
+    frame_ts: dict[int, int] = {}
+    if frames_csv and os.path.exists(frames_csv):
+        with open(frames_csv, newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    frame_ts[int(row["frame"])] = int(row["timestamp_ns"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+
+    clock = None
+    if session_dir:
+        try:
+            clock = _sc.load_session_clock(session_dir, quiet=True)
+        except Exception as e:                       # no anchor -> UTC columns stay blank
+            print(f"[speed_series] no UTC anchor ({e}); unix_ms/utc columns left empty")
+
+    survivors = sorted((vid, v) for vid, v in world.vehicles.items() if v.speed_per_frame)
+    if not survivors:
+        print(f"[speed_series] no vehicle has a speed series; skipped {output_file}")
+        return None
+
+    n_rows = 0
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["vehicle_id", "vehicle_class", "frame", "time_s",
+                         "timestamp_ns", "unix_ms", "utc",
+                         "speed_mps", "speed_kmh", "speed_std_kmh",
+                         "x1", "y1", "x2", "y2"])
+        for vid, vehicle in survivors:
+            cls = class_name(vehicle.vehicle_type)
+            for frame in sorted(vehicle.speed_per_frame):
+                mps = float(vehicle.speed_per_frame[frame])
+                std = float(vehicle.speed_std_per_frame.get(frame, 0.0))
+                ts = frame_ts.get(frame)
+                if ts is not None and clock is not None:
+                    unix_ms = clock.to_utc_ms(ts)
+                    utc = _sc.utc_ms_to_iso(unix_ms)
+                    unix_s = f"{unix_ms:.1f}"
+                else:
+                    utc, unix_s = "", ""
+                bbox = vehicle.bounding_box.get(frame)
+                if not bbox or bbox == (0, 0, 0, 0):
+                    x1 = y1 = x2 = y2 = ""
+                else:
+                    x1, y1, x2, y2 = bbox
+                writer.writerow([vid, cls, frame, round(frame / fps, 3) if fps else "",
+                                 ts if ts is not None else "", unix_s, utc,
+                                 round(mps, 4), round(mps * 3.6, 2), round(std * 3.6, 2),
+                                 x1, y1, x2, y2])
+                n_rows += 1
+
+    stamped = "with UTC" if clock is not None else "NO UTC anchor"
+    print(f"[speed_series] {len(survivors)} vehicle(s), {n_rows} rows ({stamped}) -> {output_file}")
+    return output_file
 
 
 def export_all_bboxes(world: World, max_frame, output_file="all_bboxes.csv", vehicle_id: int | None = None):

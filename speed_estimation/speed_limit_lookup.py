@@ -79,12 +79,33 @@ DIRECTION_WEIGHT_M = 60.0   # how much a wrong travel direction "costs" in metre
                             # big enough to push the opposite carriageway behind
                             # the correct one even when it's a touch closer.
 
+# Whole-drive lookups (get_track_speed_limits) ask Overpass only for the roads in a CORRIDOR around
+# the driven path instead of every road in the drive's bounding box. The GPS track is thinned to one
+# point per ROUTE_POINT_SPACING_M (spacing doubled until it fits ROUTE_MAX_POINTS) and sent as a
+# polyline. The corridor half-width is radius_m + DIRECTION_WEIGHT_M + that spacing: every road
+# _resolve could pick for any frame lies inside it, so each frame gets the same limit the
+# bounding-box query gave -- from a far smaller response.
+# TO GO BACK to the bounding-box query: set USE_ROUTE_QUERY = False.
+USE_ROUTE_QUERY = True
+ROUTE_POINT_SPACING_M = 25.0
+ROUTE_MAX_POINTS = 1000
+
 # Politeness / robustness.
 HTTP_TIMEOUT_S = 25
 MIN_REQUEST_INTERVAL_S = 1.0   # minimum spacing between real network requests
 MAX_RETRIES_PER_ENDPOINT = 2
 CACHE_COORD_DECIMALS = 4       # ~11 m cache granularity
 MPH_TO_KMH = 1.609344
+
+# ─── TEMPORARY-SPEED-TEST ────────────────────────────────────────────────────
+# Hard kill switch for the road-speed API, added for the two-phone speed-accuracy
+# test so a long clip can never stall on Overpass. True -> _run_overpass returns
+# nothing without touching the network; every caller already handles "no limit
+# found", so the pipeline degrades cleanly rather than failing.
+#
+# TO RESTORE: set this back to False. That is the only edit in this file.
+DISABLE_NETWORK = False
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Module-level query cache + throttle state.
 _CACHE: dict[tuple, int | None] = {}
@@ -247,7 +268,7 @@ def _throttle() -> None:
     _last_request_ts = time.time()
 
 
-def _run_overpass(query: str, timeout: int) -> list[dict]:
+def _run_overpass(query: str, timeout: int, *, post: bool = False) -> list[dict]:
     """
     Run one Overpass query string, returning its ways (with inline geometry).
 
@@ -258,6 +279,13 @@ def _run_overpass(query: str, timeout: int) -> list[dict]:
     """
     global _consecutive_failures, _overpass_down
 
+    # TEMPORARY-SPEED-TEST: see DISABLE_NETWORK at the top of the module.
+    if DISABLE_NETWORK:
+        if not _overpass_down:                       # announce once per run
+            print("[speed-limit] DISABLE_NETWORK is set -- no Overpass request will be made")
+        _overpass_down = True                        # reuse the breaker: every later call skips
+        return []
+
     if _overpass_down:                # API already declared dead this run -> skip fast
         return []
 
@@ -266,8 +294,12 @@ def _run_overpass(query: str, timeout: int) -> list[dict]:
         for attempt in range(MAX_RETRIES_PER_ENDPOINT):
             _throttle()
             try:
-                resp = requests.get(endpoint, params={"data": query},
-                                    headers=headers, timeout=timeout)
+                if post:        # long queries (the route polyline) go in the body, not the URL
+                    resp = requests.post(endpoint, data={"data": query},
+                                         headers=headers, timeout=timeout)
+                else:
+                    resp = requests.get(endpoint, params={"data": query},
+                                        headers=headers, timeout=timeout)
                 if resp.status_code in (429, 502, 503, 504):
                     time.sleep(2.0 * (attempt + 1))      # back off, then retry
                     continue
@@ -308,6 +340,47 @@ def _query_overpass_bbox(min_lat: float, min_lon: float,
         f"out geom;"
     )
     return _run_overpass(query, timeout)
+
+
+def _thin_route(latlons: list[tuple[float, float]],
+                spacing_m: float) -> list[tuple[float, float]]:
+    """Keep the first fix, every fix at least `spacing_m` from the last KEPT one, and the last fix.
+
+    Each dropped fix was closer than `spacing_m` to a kept point, i.e. to a vertex of the returned
+    polyline -- so every original fix lies within `spacing_m` of the polyline."""
+    kept = [latlons[0]]
+    for lat, lon in latlons[1:]:
+        klat, klon = kept[-1]
+        x0, y0 = _local_xy(klat, klon, klat)
+        x1, y1 = _local_xy(lat, lon, klat)
+        if math.hypot(x1 - x0, y1 - y0) >= spacing_m:
+            kept.append((lat, lon))
+    if kept[-1] != latlons[-1]:
+        kept.append(latlons[-1])
+    return kept
+
+
+def _route_for_track(points) -> tuple[list[tuple[float, float]], float]:
+    """(polyline, spacing_m) for a track of (frame, lat, lon[, bearing]) points, in frame order."""
+    latlons = [(p[1], p[2]) for p in sorted(points, key=lambda p: p[0])]
+    spacing = ROUTE_POINT_SPACING_M
+    route = _thin_route(latlons, spacing)
+    while len(route) > ROUTE_MAX_POINTS:
+        spacing *= 2.0
+        route = _thin_route(latlons, spacing)
+    return route, spacing
+
+
+def _query_overpass_route(route: list[tuple[float, float]], radius_m: float,
+                          timeout: int) -> list[dict]:
+    """Every way within radius_m of a polyline (the thinned drive), in ONE query (sent as POST)."""
+    coords = ",".join(f"{lat:.6f},{lon:.6f}" for lat, lon in route)
+    query = (
+        f"[out:json][timeout:{timeout}];"
+        f'way(around:{math.ceil(radius_m)},{coords})["highway"];'
+        f"out geom;"
+    )
+    return _run_overpass(query, timeout, post=True)
 
 
 def _parse_elements(data: dict) -> list[dict]:
@@ -470,29 +543,37 @@ def get_track_speed_limits(points,
 
     Same input as get_speed_limits_for_track -- (frame, lat, lon) or
     (frame, lat, lon, bearing). Instead of a network request per point, this
-    fetches every drivable way in the track's bounding box once, then resolves
-    each frame's limit LOCALLY against that road set. That turns hundreds of slow
-    public-API calls into a single one (the fix for long clips appearing to hang).
+    fetches the roads along the whole drive once, then resolves each frame's
+    limit LOCALLY against that road set. That turns hundreds of slow public-API
+    calls into a single one (the fix for long clips appearing to hang).
+
+    Which roads are fetched: with USE_ROUTE_QUERY (the default) every way in a
+    corridor around the thinned GPS polyline (see ROUTE_POINT_SPACING_M);
+    otherwise every way in the track's bounding box.
 
     Args:
         radius_m:         a frame with no road within this distance gets None.
         timeout:          per-request HTTP/Overpass timeout.
-        bbox_margin_deg:  padding added around the track's lat/lon extent (~0.002
-                          deg ~= 220 m) so roads just off the path are included.
+        bbox_margin_deg:  bounding-box query only (USE_ROUTE_QUERY = False): padding
+                          added around the track's lat/lon extent (~0.002 deg ~= 220 m).
 
     Returns:
-        {frame -> speed_limit_kmh or None}. If the single bbox query fails (or the
+        {frame -> speed_limit_kmh or None}. If the single query fails (or the
         circuit breaker has tripped), every frame maps to None.
     """
     pts = [p for p in points]
     if not pts:
         return {}
 
-    lats = [p[1] for p in pts]
-    lons = [p[2] for p in pts]
-    m = bbox_margin_deg
-    ways = _query_overpass_bbox(min(lats) - m, min(lons) - m,
-                                max(lats) + m, max(lons) + m, timeout)
+    if USE_ROUTE_QUERY:
+        route, spacing = _route_for_track(pts)
+        ways = _query_overpass_route(route, radius_m + DIRECTION_WEIGHT_M + spacing, timeout)
+    else:
+        lats = [p[1] for p in pts]
+        lons = [p[2] for p in pts]
+        m = bbox_margin_deg
+        ways = _query_overpass_bbox(min(lats) - m, min(lons) - m,
+                                    max(lats) + m, max(lons) + m, timeout)
 
     out: dict[int, int | None] = {}
     local: dict[tuple, int | None] = {}     # dedup near-identical fixes (cheap, no network)

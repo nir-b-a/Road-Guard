@@ -85,3 +85,42 @@ describe('CV UNIT - POST /api/internal/drive/:id/complete', () => {
         expect(res.statusCode).toBe(400);
     });
 });
+
+describe('CV UNIT - POST /api/internal/drive/:id/release', () => {
+    const claimedBy = async (driverId, workerId) => {
+        const drive = await createDrive(driverId, 'queued');
+        await request(app).get('/api/internal/next-job').set('x-worker-id', workerId);
+        return Drive.findById(drive._id);
+    };
+    it('hands a drive back to the queue so the next poll can claim it again', async () => {
+        const { userId: driverId } = await getDriverToken();
+        const drive = await claimedBy(driverId, 'w1');
+        expect(drive.status).toBe('processing');
+        const res = await request(app).post('/api/internal/drive/' + drive._id + '/release').set('x-worker-id', 'w1').send({ reason: 'stop now' });
+        expect(res.statusCode).toBe(200);
+        const updated = await Drive.findById(drive._id);
+        expect(updated.status).toBe('queued');
+        expect(updated.workerId).toBeNull();
+        expect(updated.claimedAt).toBeNull();
+        const again = await request(app).get('/api/internal/next-job').set('x-worker-id', 'w2');
+        expect(String(again.body.data.driveId)).toBe(String(drive._id));
+    });
+    it('refuses to release a drive another worker holds', async () => {
+        const { userId: driverId } = await getDriverToken();
+        const drive = await claimedBy(driverId, 'w1');
+        const res = await request(app).post('/api/internal/drive/' + drive._id + '/release').set('x-worker-id', 'w2').send({});
+        expect(res.statusCode).toBe(409);
+        expect((await Drive.findById(drive._id)).status).toBe('processing');
+    });
+    it('refuses to release a drive that is no longer processing', async () => {
+        const { userId: driverId } = await getDriverToken();
+        const drive = await createDrive(driverId, 'processed');
+        const res = await request(app).post('/api/internal/drive/' + drive._id + '/release').set('x-worker-id', 'worker').send({});
+        expect(res.statusCode).toBe(409);
+        expect((await Drive.findById(drive._id)).status).toBe('processed');
+    });
+    it('returns 404 for an unknown drive', async () => {
+        const res = await request(app).post('/api/internal/drive/64b2f1a2e4b0a1b2c3d4e5f6/release').send({});
+        expect(res.statusCode).toBe(404);
+    });
+});

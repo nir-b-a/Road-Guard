@@ -24,6 +24,7 @@ report the (conservative) peak exceedance per vehicle, not every noisy frame.
 """
 
 import csv
+import math
 from dataclasses import dataclass
 
 from speed_estimation.speed_limit_lookup import get_track_speed_limits
@@ -33,6 +34,12 @@ MPS_TO_KMH = 3.6
 # The estimator over-estimates, so require this much OVER the limit before flagging --
 # below it the "violation" is within the noise of the estimate. Tune on real footage.
 OVERSPEED_MARGIN_KMH = 10.0
+
+# The GPS heading only means something while the car moves: Android writes bearing 0.0 (due north)
+# when it has none, and near a standstill the heading is noise. A wrong heading makes the
+# direction-aware road match prefer the opposite carriageway, so below this GPS speed the bearing is
+# dropped and the match falls back to the nearest road. (gps.csv without speed_mps keeps the bearing.)
+MIN_BEARING_SPEED_MPS = 3.0     # ~11 km/h
 
 
 @dataclass
@@ -61,14 +68,21 @@ def build_ego_track(frames_csv: str, gps_csv: str) -> dict[int, tuple[float, flo
     if not frame_ts:
         return {}
 
-    fixes: list[tuple[int, float, float, float]] = []
+    fixes: list[tuple[int, float, float, float | None]] = []
     with open(gps_csv, "r") as f:
         for row in csv.DictReader(f):
             try:
-                fixes.append((int(row["timestamp_ns"]), float(row["lat"]),
-                              float(row["lon"]), float(row["bearing_deg"])))
+                ts_ns, lat, lon = int(row["timestamp_ns"]), float(row["lat"]), float(row["lon"])
+                bearing = float(row["bearing_deg"])
             except (KeyError, ValueError):
                 continue
+            try:
+                speed = float(row.get("speed_mps") or "nan")
+            except ValueError:
+                speed = math.nan
+            if not math.isfinite(bearing) or (math.isfinite(speed) and speed < MIN_BEARING_SPEED_MPS):
+                bearing = None          # no usable heading -> nearest-road match for this fix
+            fixes.append((ts_ns, lat, lon, bearing))
     if not fixes:
         return {}
     fixes.sort(key=lambda r: r[0])

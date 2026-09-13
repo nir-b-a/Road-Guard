@@ -1,43 +1,39 @@
 package com.example.roadgaurd.ui
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
-import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import com.example.roadgaurd.AppConfig
 import com.example.roadgaurd.R
 import com.example.roadgaurd.storage.SessionStore
-import okhttp3.MediaType
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import okio.Buffer
-import okio.BufferedSink
-import okio.source
-import org.json.JSONObject
+import com.example.roadgaurd.upload.UploadProgress
+import com.example.roadgaurd.upload.UploadService
 import java.io.File
-import java.io.IOException
-import java.util.concurrent.atomic.AtomicLong
-import kotlin.concurrent.thread
 
 class PostDriveActivity : AppCompatActivity() {
+
+    companion object {
+        private const val STATE_WATCHING_UPLOAD = "watching_upload"
+    }
 
     private var sessionId: String? = null
     private var sessionDirPath: String? = null
     private var videoPath: String? = null
-    private val BASE_URL get() = AppConfig.getBaseUrl(this)
 
     // Client-side sanity check before uploading (fast feedback). The server re-validates
     // authoritatively at /upload/init + /complete — keep these in sync with the server's
     // VIDEO_MIN_BYTES / VIDEO_MAX_BYTES.
-    private val MIN_VIDEO_BYTES = 100L * 1024 * 1024       // 100 MB
+    private val MIN_VIDEO_BYTES = 5L * 1024 * 1024         // 5 MB
     private val MAX_VIDEO_BYTES = 4L * 1024 * 1024 * 1024  // 4 GB
 
     // The 6 fixed-name sensor/calibration files that, with the video, form the "7-file"
@@ -46,6 +42,17 @@ class PostDriveActivity : AppCompatActivity() {
         "frames.csv", "gyro.csv", "gravity.csv", "gps.csv", "linacc.csv", "intrinsics.json"
     )
 
+    // True once THIS screen started (or re-attached to) the background upload of its session.
+    // Only then is the upload's result shown here — never a stale result of an earlier attempt.
+    private var watchingUpload = false
+
+    private val uploadListener: (UploadProgress.State) -> Unit = { renderUpload(it) }
+
+    // Android 13+ asks before an app may post notifications (the upload's progress and result).
+    // The upload itself runs whatever the answer.
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { startBackgroundUpload() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_post_drive)
@@ -53,22 +60,57 @@ class PostDriveActivity : AppCompatActivity() {
         sessionId = intent.getStringExtra("session_id") ?: "session_${System.currentTimeMillis()}"
         sessionDirPath = intent.getStringExtra("session_dir")
         videoPath = intent.getStringExtra("video_path")
+        watchingUpload = savedInstanceState?.getBoolean(STATE_WATCHING_UPLOAD) ?: false
 
-        findViewById<Button>(R.id.btnNo).setOnClickListener {
-            sessionDirPath?.let { SessionStore.markSkipped(File(it)) }
+        val btnNo = findViewById<Button>(R.id.btnNo)
+        val btnYes = findViewById<Button>(R.id.btnYes)
+
+        if (AppConfig.OFFLINE_MODE) {
+            // Nothing to submit to — the recording is already complete on disk (RecordingActivity
+            // writes the video + CSVs before launching this screen). Turn the question into a
+            // receipt showing where the data landed, with a single way out. No skipped.flag is
+            // written: that flag only means "don't nag me to upload", and offline it would be
+            // misleading (the retention sweep it feeds is disabled anyway).
+            findViewById<TextView>(R.id.tvPostTitle).text = "Drive saved on this phone"
+            findViewById<TextView>(R.id.tvPostSubtitle).text =
+                "Offline mode — nothing was uploaded. Footage and sensor data are in:\n\n" +
+                "Android/data/$packageName/files/sessions/${sessionId ?: ""}"
+            btnYes.visibility = View.GONE
+            btnNo.text = "Done"
+            // Drop the "No" X icon — this is a confirmation now, not a refusal.
+            (btnNo as? com.google.android.material.button.MaterialButton)?.icon = null
+            btnNo.setOnClickListener { goHome() }
+            return
+        }
+
+        btnNo.setOnClickListener {
+            // While the upload runs this button reads "Close": leaving must not mark the drive
+            // skipped, or a failed upload would never be offered again.
+            if (!watchingUpload) sessionDirPath?.let { SessionStore.markSkipped(File(it)) }
             goHome()
         }
-        findViewById<Button>(R.id.btnYes).setOnClickListener { uploadDrive() }
+        btnYes.setOnClickListener { uploadDrive() }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (!AppConfig.OFFLINE_MODE) UploadProgress.observe(uploadListener)
+    }
+
+    override fun onStop() {
+        UploadProgress.remove(uploadListener)
+        super.onStop()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_WATCHING_UPLOAD, watchingUpload)
     }
 
     /**
-     * Direct-to-storage upload in three steps so the big video never flows through our
-     * server:
-     *   1. POST /driver/upload/init      -> presigned PUT URLs (one per file)
-     *   2. PUT each file straight to Cloudflare R2
-     *   3. POST /driver/upload/complete  -> server validates the objects and queues the drive
-     * On success the session folder is deleted (it now lives in R2). On any failure the
-     * folder is kept so the launch-time sweep can reclaim it later.
+     * Check the session, then hand it to [UploadService], which uploads it in the background
+     * (direct to Cloudflare R2 — see the service). The user may leave this screen, or the app, at
+     * any time; while this screen is visible it mirrors the upload's progress and result.
      */
     private fun uploadDrive() {
         val dir = sessionDirPath?.let { File(it) }
@@ -106,155 +148,84 @@ class PostDriveActivity : AppCompatActivity() {
             return
         }
 
-        val btnYes = findViewById<Button>(R.id.btnYes)
-        val progressBar = findViewById<ProgressBar>(R.id.pbUpload)
-        val tvProgress = findViewById<TextView>(R.id.tvProgress)
-        btnYes.isEnabled = false
-        Toast.makeText(this, "Uploading drive…", Toast.LENGTH_SHORT).show()
+        val busyWith = UploadProgress.activeSessionDir
+        if (busyWith != null && busyWith != dir.absolutePath) {
+            Toast.makeText(this, "Another drive is still uploading — try again when it finishes.",
+                Toast.LENGTH_LONG).show()
+            return
+        }
 
-        val token = getSharedPreferences("roadguard", MODE_PRIVATE).getString("token", "") ?: ""
-        val sid = sessionId ?: ""
-        val client = OkHttpClient()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)  // -> startBackgroundUpload()
+            return
+        }
+        startBackgroundUpload()
+    }
 
-        // Network must not run on the UI thread; these calls are sequential & dependent.
-        thread {
-            try {
-                // 1. init -> presigned PUT URLs
-                val initBody = JSONObject()
-                    .put("sessionId", sid)
-                    .put("videoName", videoFile.name)
-                    .put("videoSize", videoFile.length())
-                    .toString()
-                val initReq = Request.Builder()
-                    .url("$BASE_URL/driver/upload/init")
-                    .addHeader("Authorization", "Bearer $token")
-                    .addHeader("ngrok-skip-browser-warning", "true")
-                    .post(initBody.toRequestBody("application/json".toMediaType()))
-                    .build()
-                val uploads = client.newCall(initReq).execute().use { resp ->
-                    val text = resp.body?.string() ?: ""
-                    if (resp.code == 401) { runOnUiThread { handleSessionExpired() }; return@thread }
-                    if (!resp.isSuccessful) throw IOException("init failed (${resp.code}): $text")
-                    JSONObject(text).getJSONObject("data").getJSONObject("uploads")
-                }
+    private fun startBackgroundUpload() {
+        val sid = sessionId ?: return
+        val dir = sessionDirPath ?: return
+        val video = videoPath ?: return
+        watchingUpload = true
+        showProgress("Uploading… 0%", 0)
+        UploadService.start(this, sid, dir, video)
+    }
 
-                // Build the concrete upload list (video + the sensor files that exist and
-                // were presigned) so we can show a single bar across ALL bytes, not per file.
-                val plan = mutableListOf<Triple<String, File, String>>()
-                plan.add(Triple(videoFile.name, videoFile, "video/mp4"))
-                for (name in DATA_FILES) {
-                    val f = File(dir, name)
-                    if (f.exists() && uploads.has(name)) {
-                        val mime = if (name.endsWith(".json")) "application/json" else "text/csv"
-                        plan.add(Triple(name, f, mime))
-                    }
-                }
-                val totalBytes = plan.sumOf { it.second.length() }
-                val sentBytes = AtomicLong(0)
-                var lastPct = -1
-                runOnUiThread {
-                    progressBar.progress = 0
-                    progressBar.visibility = View.VISIBLE
-                    tvProgress.text = "Uploading… 0%"
-                    tvProgress.visibility = View.VISIBLE
-                }
-
-                // 2. PUT every file directly to R2 using its presigned URL, reporting bytes
-                // as they stream so the bar reflects the whole upload (video dominates).
-                for ((name, f, mime) in plan) {
-                    putFile(client, uploads.getString(name), f, mime) { chunk ->
-                        val sent = sentBytes.addAndGet(chunk)
-                        val pct = if (totalBytes > 0) ((sent * 100) / totalBytes).toInt().coerceIn(0, 100) else 100
-                        if (pct != lastPct) {
-                            lastPct = pct
-                            runOnUiThread {
-                                progressBar.progress = pct
-                                tvProgress.text = "Uploading… $pct%"
-                            }
-                        }
-                    }
-                }
-
-                runOnUiThread { tvProgress.text = "Finalizing…" }
-
-                // 3. complete -> server HEAD-validates the 7 objects and queues the drive.
-                val completeReq = Request.Builder()
-                    .url("$BASE_URL/driver/upload/complete")
-                    .addHeader("Authorization", "Bearer $token")
-                    .addHeader("ngrok-skip-browser-warning", "true")
-                    .post(JSONObject().put("sessionId", sid).toString().toRequestBody("application/json".toMediaType()))
-                    .build()
-                client.newCall(completeReq).execute().use { resp ->
-                    val text = resp.body?.string() ?: ""
-                    if (resp.code == 401) { runOnUiThread { handleSessionExpired() }; return@thread }
-                    if (!resp.isSuccessful) throw IOException("complete failed (${resp.code}): $text")
-                }
-
-                runOnUiThread {
-                    progressBar.visibility = View.GONE
-                    tvProgress.visibility = View.GONE
-                    SessionStore.markUploaded(dir)
-                    com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
-                        .setTitle("Drive Uploaded Successfully!")
-                        .setMessage("You just made the road safer — thank you for your contribution!")
-                        .setPositiveButton("Awesome!") { _, _ -> goHome() }
-                        .setCancelable(false)
-                        .show()
-                }
-            } catch (e: Exception) {
-                Log.w("PostDrive", "Upload failed: ${e.message}")
-                runOnUiThread {
-                    progressBar.visibility = View.GONE
-                    tvProgress.visibility = View.GONE
-                    btnYes.isEnabled = true
-                    // Folder is deliberately KEPT on failure/rejection — the 24h launch-time
-                    // sweep (SessionStore) reclaims it later; nothing is deleted here.
-                    Toast.makeText(this,
-                        "Upload failed: ${e.message}. Saved on device — will retry/clean up later.",
-                        Toast.LENGTH_LONG).show()
-                }
+    /** Mirror the background upload of THIS session (main thread, only while visible). */
+    private fun renderUpload(state: UploadProgress.State) {
+        if (state.sessionId != sessionId) return
+        when (state) {
+            is UploadProgress.State.Uploading -> {
+                watchingUpload = true
+                showProgress("Uploading… ${state.percent}%", state.percent)
             }
+            is UploadProgress.State.Finalizing -> {
+                watchingUpload = true
+                showProgress("Finalizing…", 100)
+            }
+            is UploadProgress.State.Succeeded -> if (finishWatching()) {
+                findViewById<Button>(R.id.btnYes).isEnabled = false      // it is on the server now
+                com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+                    .setTitle("Drive Uploaded Successfully!")
+                    .setMessage("You just made the road safer — thank you for your contribution!")
+                    .setPositiveButton("Awesome!") { _, _ -> goHome() }
+                    .setCancelable(false)
+                    .show()
+            }
+            is UploadProgress.State.Failed -> if (finishWatching()) {
+                // Folder is deliberately KEPT on failure/rejection — the next launch offers it
+                // again, and the 24h sweep (SessionStore) reclaims it later.
+                Toast.makeText(this,
+                    "Upload failed: ${state.message}. Saved on device — will retry/clean up later.",
+                    Toast.LENGTH_LONG).show()
+            }
+            is UploadProgress.State.SessionExpired -> if (finishWatching()) handleSessionExpired()
         }
     }
 
-    /**
-     * Upload one file with a single HTTP PUT to its presigned R2 URL. [onChunk] is invoked
-     * with the number of bytes flushed each time a chunk is written, so the caller can drive
-     * a progress bar spanning the whole multi-file upload.
-     */
-    private fun putFile(client: OkHttpClient, url: String, file: File, mime: String, onChunk: (Long) -> Unit) {
-        val req = Request.Builder()
-            .url(url)
-            .put(ProgressRequestBody(file, mime.toMediaType(), onChunk))
-            .build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw IOException("PUT ${file.name} failed (${resp.code})")
-        }
+    /** An upload ended: restore the screen. -> false if this screen was not watching it (stale). */
+    private fun finishWatching(): Boolean {
+        if (!watchingUpload) return false
+        watchingUpload = false
+        findViewById<ProgressBar>(R.id.pbUpload).visibility = View.GONE
+        findViewById<TextView>(R.id.tvProgress).visibility = View.GONE
+        findViewById<Button>(R.id.btnYes).isEnabled = true
+        findViewById<Button>(R.id.btnNo).text = "No"
+        return true
     }
 
-    /**
-     * A streaming [RequestBody] over a file that reports upload progress. It keeps a known
-     * Content-Length (so OkHttp streams instead of buffering) and calls [onChunk] after each
-     * 64 KB block reaches the socket — identical wire bytes to a plain file body, just observed.
-     */
-    private class ProgressRequestBody(
-        private val file: File,
-        private val mime: MediaType,
-        private val onChunk: (Long) -> Unit
-    ) : RequestBody() {
-        override fun contentType(): MediaType = mime
-        override fun contentLength(): Long = file.length()
-        override fun writeTo(sink: BufferedSink) {
-            file.source().use { source ->
-                val buf = Buffer()
-                val segment = 64L * 1024
-                while (true) {
-                    val read = source.read(buf, segment)
-                    if (read == -1L) break
-                    sink.write(buf, read)
-                    onChunk(read)
-                }
-            }
+    private fun showProgress(text: String, percent: Int) {
+        findViewById<Button>(R.id.btnYes).isEnabled = false
+        findViewById<Button>(R.id.btnNo).text = "Close"
+        findViewById<ProgressBar>(R.id.pbUpload).apply {
+            progress = percent
+            visibility = View.VISIBLE
+        }
+        findViewById<TextView>(R.id.tvProgress).apply {
+            this.text = "$text\nYou can leave the app — the upload continues in the background."
+            visibility = View.VISIBLE
         }
     }
 

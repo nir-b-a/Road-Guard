@@ -85,6 +85,10 @@ services:
   worker-cpu:
     <<: &worker-common
       restart: unless-stopped
+      # `docker stop` sends SIGTERM, which worker.py treats as --stop-now: the drive in progress
+      # goes straight back to the queue, and evidence uploads already underway finish first.
+      # Docker's default 10 s before SIGKILL is too short for that drain.
+      stop_grace_period: 10m
       # Reuse backend/.env for the R2_* credentials and INTERNAL_TOKEN - worker.py
       # reads that same file natively, so the creds stay in exactly one place.
       env_file:

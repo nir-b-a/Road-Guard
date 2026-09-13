@@ -61,6 +61,21 @@ except Exception as _e:                                # pragma: no cover
     print(f"[yellow] import unavailable ({_e}); yellow-line rule will be skipped")
     _YELLOW_IMPORT_OK = False
 
+# ── Yellow solid-line CROSSING (v3 half-edge contact rule) ───────────────────
+# The crossing rule is split by marking colour: ghost_mask.VIOLATION_CLASSES is
+# {"solid_white_lane", "traffic_island"}, so evaluate_crossing below owns the white
+# lines and the painted gore areas and never looked at a yellow line. This adds the
+# colour it skips, over the SAME lane cache, and emits the same ViolationEvent -- so
+# the evidence/export/push chain treats both identically. Wrapped like the rest: a
+# missing crossing2 disables the yellow crossing channel, not the run.
+try:
+    from line_crossing.crossing2.yellow_crossing import (   # noqa: E402
+        drop_duplicate_crossings, evaluate_yellow_crossing)
+    _YELLOW_CROSSING_OK = True
+except Exception as _e:                                # pragma: no cover
+    print(f"[crossing/yellow] import unavailable ({_e}); yellow crossings will be skipped")
+    _YELLOW_CROSSING_OK = False
+
 # ── Backend export (per-violation clip + 3 pics + .docx -> .tar.gz -> backend) ─
 try:
     from violations import export as vx, docx_report
@@ -103,6 +118,38 @@ def print_time(start_time, read_times, yolo_times, postprocess_times, frame_id):
     print(f"  total           : {total_time:.2f} s")
 
 
+# --speed-only: run the SPEED path alone -- no plate reading, no lane segmentation,
+# no Stage-2 tire model, no speed-limit lookup. Everything it turns off is a second
+# network or an online query that has nothing to do with estimating how fast the
+# tracked vehicles are moving; detection + tracking + speed still run in full, and
+# the annotated video is still rendered (you need it to recognise a track by its ID).
+SPEED_ONLY_DISABLES = ("--no-evidence", "--no-yellow", "--no-stage2", "--no-overspeed")
+
+# ─── TEMPORARY-SPEED-TEST ────────────────────────────────────────────────────
+# Forces --speed-only on EVERY run, for the two-phone speed-accuracy test: no
+# violation detection of any kind (plate/evidence, yellow line, solid-line
+# crossing, overspeed) and therefore no road-speed API call. Detection, tracking,
+# ego motion, speed and the annotated video are untouched.
+#
+# TO RESTORE: set this back to False. That is the only edit in this file; passing
+# --speed-only by hand keeps working either way.
+FORCE_SPEED_ONLY = False
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _expand_speed_only() -> None:
+    """Rewrite --speed-only into the individual --no-* flags, which the rest of the
+    program (and process_video_with_models) already reads straight off sys.argv."""
+    forced = FORCE_SPEED_ONLY and "--speed-only" not in sys.argv
+    if not (forced or "--speed-only" in sys.argv):
+        return
+    added = [f for f in SPEED_ONLY_DISABLES if f not in sys.argv]
+    sys.argv.extend(added)
+    why = "FORCE_SPEED_ONLY is set (TEMPORARY)" if forced else "--speed-only"
+    print(f"[speed-only] {why}: speed pipeline only, no violation checks, no road-speed API; "
+          f"implied flags: {' '.join(added) or '(all already set)'}")
+
+
 def _cli_value(flag: str, default):
     """Return the argv token after `flag`, or `default` if the flag is absent.
 
@@ -115,6 +162,32 @@ def _cli_value(flag: str, default):
         if idx + 1 < len(sys.argv):
             return sys.argv[idx + 1]
     return default
+
+
+def _ego_accel_enabled() -> bool:
+    """False when `--no-accel-ego` is on argv -- the ego speed then comes from GPS
+    fixes + linear interpolation only (ego_speed_from_android), with the
+    accelerometer/GPS complementary filter (ego_speed_fused) never called.
+
+    This is the A/B knob for the two-phone accuracy test: the estimated speed of
+    every vehicle is `ego speed + relative speed`, so scoring a run with the
+    accelerometer halted isolates how much the fusion is worth. Absent, the run is
+    byte-identical to before this flag existed. Note the GYRO still supplies the
+    heading -- only the accelerometer's contribution to SPEED is cut.
+    """
+    return "--no-accel-ego" not in sys.argv
+
+
+def _camera_height() -> float:
+    """Camera mount height in metres -- `--camera-height 1.15` overrides
+    Constants.DEFAULT_CAMERA_HEIGHT_M (1.4).
+
+    It feeds the ground-plane half of the distance estimator, so a phone clamped
+    lower than the constant claims makes every distance (and therefore every speed)
+    wrong by a systematic factor. Worth measuring for a controlled accuracy test;
+    the default keeps every existing run byte-identical.
+    """
+    return float(_cli_value("--camera-height", Constants.DEFAULT_CAMERA_HEIGHT_M))
 
 
 # load yolo vehicle model. --model overrides Constants.YOLO_VERSION (enables the v8m/11x A/B).
@@ -242,9 +315,16 @@ def run_speed_estimation(world: World, fps: float,
     elif is_android:
         ego_heading = ego_yaw.ego_heading_from_android(
             frames_csv, gyro_csv, gravity_csv, sign=heading_sign)
+        # --no-accel-ego: hand ego_position_from_android no linacc, so it falls back
+        # to GPS-only interpolated ego speed instead of the accel+GPS fusion.
+        use_accel = _ego_accel_enabled()
+        if not use_accel:
+            print("[ego] --no-accel-ego: accelerometer fusion OFF "
+                  "(ego speed = GPS fixes + interpolation)")
         ego_pos     = ego_yaw.ego_position_from_android(
             frames_csv, gps_csv, ego_heading,
-            linacc_csv=linacc_csv, gravity_csv=gravity_csv)
+            linacc_csv=linacc_csv if use_accel else None,
+            gravity_csv=gravity_csv)
 
     if not (ego_pos and ego_heading):
         print("[main] no ego pose available -> skipping world-frame speed path "
@@ -264,6 +344,7 @@ def run_speed_estimation(world: World, fps: float,
           f"occlusion_gate={occlusion_gate}, aspect_gate={aspect_gate}, "
           f"reject_lateral={reject_lateral}, reject_direction={reject_direction}, "
           f"distance_drop={distance_drop} (>= {max_speed_distance:.0f}m), "
+          f"camera_height={_camera_height():.2f}m, "
           f"valid_roi={valid_roi}, ego_shift={ego_shift}")
     frame_ts = ego_yaw.load_frame_timestamps(frames_csv) if is_android else None
     # ── RELEVANCE REJECTION: decide which vehicles are probably NOT on our road
@@ -273,7 +354,7 @@ def run_speed_estimation(world: World, fps: float,
         fx=fx, fy=fy, cx=cx, cy=cy, fps=fps,
         method=Constants.DISTANCE_CALCULATION_METHOD,
         lateral_ref=lateral_ref, lat_sign=lat_sign,
-        camera_height_m=Constants.DEFAULT_CAMERA_HEIGHT_M,
+        camera_height_m=_camera_height(),
         reject_lateral=reject_lateral, reject_direction=reject_direction))
 
     estimate_world_speeds(
@@ -294,7 +375,7 @@ def run_speed_estimation(world: World, fps: float,
         max_speed_distance=max_speed_distance,
         image_width=image_width, image_height=image_height,
         valid_roi=valid_roi,
-        camera_height_m=Constants.DEFAULT_CAMERA_HEIGHT_M,
+        camera_height_m=_camera_height(),
         min_track_seconds=Constants.MIN_TRACK_SECONDS,
         reject_ids=reject_ids,
     )
@@ -336,7 +417,7 @@ def run_speed_estimation(world: World, fps: float,
                 fx=fx, fy=fy, cx=cx, cy=cy, fps=fps, lat_sign=lat_sign,
                 method=_cd_method, lateral_ref=lateral_ref, frame_ts=frame_ts,
                 gps_speed=_cd_gps, only_ids=_cd_only, stationary_ids=_cd_sta_ids,
-                camera_height_m=Constants.DEFAULT_CAMERA_HEIGHT_M,
+                camera_height_m=_camera_height(),
                 out_dir=os.path.join(_base, "cancel_diag"))
         except Exception as e:
             print(f"[cancel-diag] failed: {e}")
@@ -937,7 +1018,7 @@ def process_video_with_models(
               f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
 
     # ── 6. Distance ──────────────────────────────────────────────────────────
-    estimateDistance(world, fx, fy, cx, cy, Constants.DEFAULT_CAMERA_HEIGHT_M)
+    estimateDistance(world, fx, fy, cx, cy, _camera_height())
     smooth_distances(world, Constants.SMOOTH_WINDOW, Constants.POLYORDER)
 
     # ── 7. Speed ─────────────────────────────────────────────────────────────
@@ -984,9 +1065,19 @@ def process_video_with_models(
         world, seg_frames, video_path, video_name,
         frame_width, frame_height, frame_id, fps, once_per_vehicle=sim_speed)
 
-    # ── 7.65 Solid-line crossing violation (Stage-1 + Stage-2 tire confirmation) ──
+    # ── 7.65 Solid-line crossing violation ────────────────────────────────────
+    # v1 -- WHITE solid lines + painted gore areas (ghost_mask.VIOLATION_CLASSES):
+    # Stage-1 verdict timeline + Stage-2 tire confirmation. Unchanged.
     crossing_events = evaluate_crossing(seg_frames, fps, frame_height, frame_width,
                                         video_path=video_path, tire_model=tire_model)
+    # v3 -- YELLOW solid lines: the bbox half-edge contact rule, line continuation
+    # off. Same ViolationEvent, same evidence/export path; --no-yellow-crossing
+    # turns it off and leaves the run byte-identical to before this rule existed.
+    if _YELLOW_CROSSING_OK and "--no-yellow-crossing" not in sys.argv:
+        yellow_crossings = evaluate_yellow_crossing(seg_frames, fps,
+                                                    frame_height, frame_width)
+        crossing_events = crossing_events + drop_duplicate_crossings(
+            crossing_events, yellow_crossings, fps)
 
     # ── 7.7 Evidence stage ────────────────────────────────────────────────────
     all_events = (crossing_events
@@ -1003,6 +1094,15 @@ def process_video_with_models(
     # ── 8. Outputs ────────────────────────────────────────────────────────────
     distanceLogger.export_vehicle_summary(
         world, os.path.join(out_dir, f"{video_name}_vehicles.csv"))
+
+    # Every vehicle's speed series in one long-form CSV, stamped with absolute UTC
+    # from the capture's GNSS anchor. This is what tools/speed_gt_eval.py scores
+    # against a SECOND phone's GPS -- the two devices only share a timeline through
+    # this timestamp. Written before the benchmark early-return: it is data, not a plot.
+    distanceLogger.export_vehicle_speed_series(
+        world, os.path.join(out_dir, f"{video_name}_vehicle_speeds.csv"),
+        fps=fps, frames_csv=frames_csv if is_android else None,
+        session_dir=video_dir if is_android else None)
 
     if benchmark:
         print("[benchmark] done -- CSV/text data written; skipped plots + annotated video render")
@@ -1024,7 +1124,8 @@ def process_video_with_models(
         ego_speed, ego_source = ego_yaw.ego_speed_from_telemetry(telemetry_csv), "telemetry"
     elif is_android:
         gps_speed = ego_yaw.ego_speed_from_android(frames_csv, gps_csv)
-        fused_speed = ego_yaw.ego_speed_fused(frames_csv, gps_csv, linacc_csv, gravity_csv)
+        fused_speed = (ego_yaw.ego_speed_fused(frames_csv, gps_csv, linacc_csv, gravity_csv)
+                       if _ego_accel_enabled() else None)
         if fused_speed:
             ego_speed, ego_source = fused_speed, "accelerometer+GPS fused"
             ego_speed_raw, raw_source = gps_speed, "GPS only"
@@ -1063,6 +1164,10 @@ def process_video_with_models(
 def main():
     global EVIDENCE_COLLECTOR, LANE_MODEL, TIRE_MODEL
 
+    # --speed-only expands into --no-evidence/--no-yellow/--no-stage2/--no-overspeed
+    # BEFORE anything reads them.
+    _expand_speed_only()
+
     # Cloud awareness FIRST: detect Colab/headless (auto, or via --colab) and neutralize the
     # cv2 GUI calls so nothing crashes without a display. Everything below stays env-agnostic.
     cloud_env.init()
@@ -1090,8 +1195,7 @@ def main():
     # Evidence collector (one OCR reader for the whole run).
     if _EVIDENCE_IMPORT_OK and "--no-evidence" not in sys.argv:
         try:
-            EVIDENCE_COLLECTOR = EvidenceCollector(FastALPRReader().read_plate_with_conf,
-                                                   min_area=LPR.MIN_VEHICLE_AREA)
+            EVIDENCE_COLLECTOR = EvidenceCollector(FastALPRReader().read_plate_with_conf, min_area=LPR.MIN_VEHICLE_AREA)
             print("[evidence] EvidenceCollector ready (FastALPR)")
         except Exception as e:
             print(f"[evidence] disabled (reader init failed: {e})")

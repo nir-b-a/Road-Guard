@@ -81,18 +81,25 @@ def reconcile_components(lanes, H: int, W: int):
         return [], np.zeros((H, W), np.int32), np.zeros((H, W), np.uint8)
     masks = {c: np.zeros((H, W), np.uint8) for c in ALL_CLASSES}
     conf_map = np.zeros((H, W), np.float32)
+    tmp = np.zeros((H, W), np.uint8)          # one scratch buffer, reused for every polygon
     for l in lanes:
         if l["cls"] not in masks:
             continue
         cnt = np.asarray(l["contour"], np.int32).reshape(-1, 1, 2)
         cv2.fillPoly(masks[l["cls"]], [cnt], 255)
-        tmp = np.zeros((H, W), np.uint8)
+        tmp.fill(0)
         cv2.fillPoly(tmp, [cnt], 1)
-        conf_map = np.maximum(conf_map, tmp.astype(np.float32) * float(l["conf"]))
+        # conf_map is the per-pixel max confidence over the polygons covering that pixel.
+        # Writing the max only WHERE this polygon covers is bit-identical to the earlier
+        # `maximum(conf_map, tmp.astype(float32) * conf)`: off the polygon that product is 0
+        # and conf_map is never negative, so those pixels were always a no-op. Skipping them
+        # avoids a fresh 2 MB tmp, an 8 MB float32 cast, a full-frame multiply and a
+        # full-frame maximum PER POLYGON -- ~10x faster for the same pixels.
+        np.maximum(conf_map, np.float32(l["conf"]), out=conf_map, where=tmp.view(bool))
 
     union = np.zeros((H, W), np.uint8)
     for m in masks.values():
-        union = cv2.bitwise_or(union, m)
+        cv2.bitwise_or(union, m, dst=union)
     if not union.any():
         return [], np.zeros((H, W), np.int32), union
 

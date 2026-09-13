@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 from typing import Callable, Optional, Sequence
 
+from violations.clip_encoder import open_clip_writer
 from violations.clip_extract import ClipAsset, ClipWindow
 
 # frame_id -> bounding box (x1, y1, x2, y2) of the violating vehicle, or None if absent that frame.
@@ -69,10 +70,13 @@ def annotate_clip(src: str, dest: str, window: ClipWindow, box_for_frame: BoxFor
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    writer = cv2.VideoWriter(dest, cv2.VideoWriter_fourcc(*fourcc), fps, (w, h))
+    # ONE H.264 encode straight from these frames -- see violations/clip_encoder.py. The frames
+    # handed over below are byte-identical to what cv2.VideoWriter used to get; `fourcc` is now
+    # only the fallback container for when ffmpeg is missing.
+    writer = open_clip_writer(dest, fps, (w, h), fourcc=fourcc)
     if not writer.isOpened():
         cap.release()
-        raise RuntimeError(f"cannot open VideoWriter for {dest} (fourcc {fourcc})")
+        raise RuntimeError(f"cannot open a clip writer for {dest} (fourcc {fourcc})")
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, window.start_frame)
     try:

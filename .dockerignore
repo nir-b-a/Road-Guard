@@ -2,7 +2,8 @@
 # Road Guard - build context for the Python worker image (context = repo root).
 #
 # This is an ALLOWLIST, not a denylist: the first line excludes everything and
-# the `!` lines add back only what worker.py -> main.run_pipeline actually needs.
+# the `!` lines add back only what worker.py -> main.process_video_with_models
+# actually needs.
 #
 # Why an allowlist. The repo root carries ~500 MB of things a container must
 # never receive: yolo11x.pt (114 MB) and yolov8m.pt (52 MB) at the root,
@@ -25,6 +26,16 @@
 
 # --- entrypoint + pipeline modules imported by main.py -----------------------
 !worker.py
+# worker_common.py holds everything worker.py does that is not transport (model
+# loading, bundle unpacking, violation records); worker_offline.py is the same
+# worker with local folders instead of R2, handy for debugging inside the image.
+!worker_common.py
+!worker_offline.py
+# lane_render.py draws the detected lane markings into the annotated video and the
+# evidence clips; worker.py installs it at start-up. run_lanes.py is the lanes-only
+# entry point (offline), useful for debugging inside the image.
+!lane_render.py
+!run_lanes.py
 !main.py
 !Constants.py
 !cloud_env.py

@@ -7,7 +7,7 @@ const r2 = require('../services/r2');
 const FPS = 30;
 
 // Video size gate (declared at init, re-checked from the real object at complete).
-const VIDEO_MIN_BYTES = parseInt(process.env.VIDEO_MIN_BYTES || String(100 * 1024 * 1024), 10);          // 100 MB
+const VIDEO_MIN_BYTES = parseInt(process.env.VIDEO_MIN_BYTES || String(5 * 1024 * 1024), 10);            // 5 MB (same floor as the Android app)
 const VIDEO_MAX_BYTES = parseInt(process.env.VIDEO_MAX_BYTES || String(4 * 1024 * 1024 * 1024), 10);      // 4 GB
 // Admission guard: reject new uploads once the bucket is this full (R2 free tier ~10 GB).
 const R2_MAX_BYTES    = parseInt(process.env.R2_MAX_BYTES || String(9.5 * 1024 * 1024 * 1024), 10);
