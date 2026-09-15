@@ -159,3 +159,5 @@ roadguard_videos/
 test_videos/
 c2run.log
 output_c2_full.log
+rg_vids_fake_sesh_relevant/
+roadguard_videos_relevant/

@@ -98,17 +98,22 @@ router.post('/drive/:id/release', async (req, res) => {
 /**
  * POST /api/internal/violation
  * One detected violation. videoClipPath is now the R2 key of the evidence clip the worker
- * uploaded (under <sessionId>/out/). Recording a violation does NOT flip the drive to
+ * uploaded (under <sessionId>/out/); plateImagePath, when present, is the R2 key of the plate
+ * picture beside it. Recording a violation does NOT flip the drive to
  * processed — the worker does that via /drive/:id/complete after all violations are in.
  */
 router.post('/violation', async (req, res) => {
-    const { driveId, videoClipPath, carId, calculatedSpeed, lat, lon, violationType } = req.body;
+    const { driveId, videoClipPath, carId, calculatedSpeed, lat, lon, violationType, plateImagePath } = req.body;
     if (!driveId || !videoClipPath || !carId || calculatedSpeed == null || lat == null || lon == null) {
         return res.status(400).json({ success: false, message: 'Missing required fields', data: null });
     }
     const drive = await Drive.findById(driveId);
     if (!drive) return res.status(404).json({ success: false, message: 'Drive not found', data: null });
-    const violation = await Violation.create({ driveId, driverId: drive.driverId, videoClipPath, carId, calculatedSpeed, location: { lat, lon }, violationType: violationType || 'speeding' });
+    const violation = await Violation.create({
+        driveId, driverId: drive.driverId, videoClipPath, carId, calculatedSpeed, location: { lat, lon },
+        violationType: violationType || 'speeding',
+        plateImagePath: typeof plateImagePath === 'string' && plateImagePath ? plateImagePath : null
+    });
     res.status(201).json({ success: true, message: 'Violation recorded', data: { violationId: violation._id } });
 });
 

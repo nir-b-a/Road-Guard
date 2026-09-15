@@ -3,6 +3,8 @@ const ViolationSchema = new mongoose.Schema({
     driveId: { type: mongoose.Schema.Types.ObjectId, ref: 'Drive', required: true },
     driverId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     videoClipPath: { type: String, required: true },
+    // R2 key of the clearest picture of the offending car's plate; null when no plate was found.
+    plateImagePath: { type: String, default: null },
     carId: { type: String, required: true },
     calculatedSpeed: { type: Number, required: true },
     location: { lat: { type: Number, required: true }, lon: { type: Number, required: true } },

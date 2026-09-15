@@ -1,6 +1,7 @@
 const request = require('supertest');
 const app = require('../app');
 const { connect, disconnect, clearCollections } = require('./setup');
+const { INVITE_CODE } = require('./helpers');
 beforeAll(async () => await connect());
 afterAll(async () => await disconnect());
 beforeEach(async () => await clearCollections());
@@ -13,7 +14,7 @@ describe('AUTH - POST /api/auth/register', () => {
         expect(res.body.data.role).toBe('driver');
     });
     it('registers an authority user successfully', async () => {
-        const res = await request(app).post('/api/auth/register').send({ name: 'Officer', email: 'officer@test.com', password: 'password123', role: 'authority' });
+        const res = await request(app).post('/api/auth/register').send({ name: 'Officer', email: 'officer@test.com', password: 'password123', role: 'authority', inviteCode: INVITE_CODE });
         expect(res.statusCode).toBe(201);
         expect(res.body.data.role).toBe('authority');
     });

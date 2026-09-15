@@ -5,7 +5,8 @@ Recipe (lifted from the offline RoadGuard harness) for each VIOLATING vehicle:
   1. rank the vehicle's frames by readability = bbox area x Laplacian sharpness,
   2. OCR the sharpest crops, then temporally VOTE one plate (length-first, then
      per-position) -> (plate, score),
-  3. keep the top-N sharpest crops as evidence images a human can verify.
+  3. keep the top-N sharpest crops as evidence images a human can verify,
+  4. cut the tight plate picture out of each of those crops and pick the clearest one.
 
 Key difference from the offline version: we never re-open the video to seek frames after
 the fact (double-decoding hurts on a 1060). While a vehicle is tracked LIVE we keep a
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from lpr.plate_char_voter import vote_characters
@@ -43,6 +44,8 @@ DEFAULT_N_EVIDENCE = 3
 OCRReader = Callable[[Any], "tuple[Optional[str], float]"]
 # crop -> sharpness score (higher = sharper)
 SharpnessFn = Callable[[Any], float]
+# vehicle crop -> the tight plate sub-crop inside it, or None when no plate is localised
+PlateCropper = Callable[[Any], Optional[Any]]
 
 
 def bbox_area(bbox) -> float:
@@ -69,6 +72,9 @@ class EvidenceResult:
     n_buffered: int                  # crops available in the buffer at collect time
     evidence_crops: list             # top-N sharpest vehicle crops (BGR nd-arrays)
     evidence_frame_ids: list         # frame ids those crops came from
+    # the plate picture cut out of each evidence crop, same order; None where no plate was found
+    evidence_plate_crops: list = field(default_factory=list)
+    plate_crop: Any = None           # the clearest of evidence_plate_crops, or None
 
     @property
     def manual_review(self) -> bool:
@@ -96,13 +102,15 @@ class EvidenceCollector:
                  buffer_size: int = DEFAULT_BUFFER_SIZE,
                  max_ocr_frames: int = DEFAULT_MAX_OCR_FRAMES,
                  n_evidence: int = DEFAULT_N_EVIDENCE,
-                 sharpness_fn: SharpnessFn = laplacian_variance):
+                 sharpness_fn: SharpnessFn = laplacian_variance,
+                 plate_cropper: Optional[PlateCropper] = None):
         self._ocr = ocr_reader
         self.min_area = min_area
         self.buffer_size = buffer_size
         self.max_ocr_frames = max_ocr_frames
         self.n_evidence = n_evidence
         self._sharpness = sharpness_fn
+        self._plate_cropper = plate_cropper    # None -> results carry no plate pictures
         # vehicle_id -> min-heap of (score, seq, frame_id, crop); size capped at buffer_size,
         # so heap[0] is always the WEAKEST kept crop -> O(1) eviction test.
         self._buffers: dict[int, list] = {}
@@ -199,6 +207,8 @@ class EvidenceCollector:
         # while a successful read short-circuits all future events for this vehicle.
         self._plates[event.vehicle_id] = (plate, score, n_reads)
 
+        evidence_crops = crops[:self.n_evidence]
+        plate_crops = self._crop_plates(event.vehicle_id, evidence_crops)
         return EvidenceResult(
             vehicle_id=event.vehicle_id,
             violation_type=event.violation_type,
@@ -206,24 +216,54 @@ class EvidenceCollector:
             plate_score=score,
             n_reads=n_reads,
             n_buffered=len(heap),
-            evidence_crops=crops[:self.n_evidence],
+            evidence_crops=evidence_crops,
             evidence_frame_ids=frame_ids[:self.n_evidence],
+            evidence_plate_crops=plate_crops,
+            plate_crop=self._clearest_plate(plate_crops),
         )
 
-    def save_evidence(self, result: EvidenceResult, out_dir: str, *, plate_reader=None) -> str:
+    def _crop_plates(self, vehicle_id: int, crops: list) -> list:
+        """The plate picture inside each evidence crop, same order, None where no plate is
+        localised. [] without a plate cropper. RECALL-FIRST: a cropper that raises costs that
+        one picture, never the violation."""
+        if self._plate_cropper is None:
+            return []
+        out = []
+        for crop in crops:
+            try:
+                pc = self._plate_cropper(crop)
+            except Exception as e:
+                print(f"[evidence] plate crop failed for vehicle {vehicle_id}: {e}")
+                pc = None
+            out.append(pc if pc is not None and getattr(pc, "size", 0) else None)
+        return out
+
+    def _clearest_plate(self, plate_crops: list):
+        """The plate picture a reviewer should see: the one with the highest pixel area x
+        sharpness, the same readability score the vehicle crops are ranked by. On a tie the
+        earlier one wins, i.e. the plate from the sharper vehicle crop."""
+        best, best_score = None, -1.0
+        for pc in plate_crops:
+            if pc is None:
+                continue
+            score = float(pc.shape[0] * pc.shape[1]) * self._sharpness(pc)
+            if score > best_score:
+                best, best_score = pc, score
+        return best
+
+    def save_evidence(self, result: EvidenceResult, out_dir: str) -> str:
         """RECALL-FIRST disk write: always persist the top-N sharpest crops + a sidecar label,
-        readable plate or not. ``plate_reader`` (optional) adds a tight plate zoom when its
-        ``crop_plate`` localises one. Returns ``out_dir``."""
+        readable plate or not, plus the plate picture cut from each crop when one was found.
+        Returns ``out_dir``."""
         import os
         import cv2
         os.makedirs(out_dir, exist_ok=True)
         stem = f"v{result.vehicle_id}_{result.violation_type}"
+        plate_crops = result.evidence_plate_crops
         for i, (crop, fid) in enumerate(zip(result.evidence_crops, result.evidence_frame_ids)):
             cv2.imwrite(os.path.join(out_dir, f"{stem}_{i}_f{fid}.png"), crop)
-            if plate_reader is not None:
-                pc = plate_reader.crop_plate(crop)
-                if pc is not None and getattr(pc, "size", 0):
-                    cv2.imwrite(os.path.join(out_dir, f"{stem}_{i}_f{fid}_plate.png"), pc)
+            if i < len(plate_crops) and plate_crops[i] is not None:
+                cv2.imwrite(os.path.join(out_dir, f"{stem}_{i}_f{fid}_plate.png"), plate_crops[i])
         with open(os.path.join(out_dir, f"{stem}.txt"), "w", encoding="utf-8") as fh:
             fh.write(f"vehicle_id={result.vehicle_id}\n"
                      f"violation={result.violation_type}\n"

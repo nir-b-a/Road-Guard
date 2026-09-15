@@ -3,12 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import api from '../api/axios';
 import PageLayout from '../components/PageLayout';
 import StatusBadge from '../components/StatusBadge';
-const getPriority = (v) => {
-  if (v.calculatedSpeed >= 120) return { label: 'High', style: 'bg-red-500/20 text-red-400 border-red-500/30' };
-  if (v.violationType === 'lane_crossing') return { label: 'Medium', style: 'bg-orange-500/20 text-orange-400 border-orange-500/30' };
-  return { label: 'Low', style: 'bg-gray-500/20 text-gray-400 border-gray-500/30' };
-};
-const PRIORITY_ORDER = { High: 0, Medium: 1, Low: 2 };
+import PlateImageButton from '../components/PlateImageButton';
+import { PriorityBadge, TypeBadge } from '../components/ViolationBadges';
+import { getPriority, PRIORITY_ORDER } from '../utils/violations';
 const StatCard = ({ label, count, color, icon }) => (
   <div className={"bg-gray-800 border " + color + " rounded-xl p-6 flex items-center gap-4"}>
     <span className="text-3xl">{icon}</span>
@@ -71,18 +68,17 @@ const DashboardPage = () => {
                 <th className="px-6 py-3">License Plate</th><th className="px-6 py-3">Priority</th><th className="px-6 py-3">Type</th><th className="px-6 py-3">Date</th><th className="px-6 py-3">Status</th>
               </tr></thead>
               <tbody>
-                {pendingViolations.slice(0,5).map(v => {
-                  const priority = getPriority(v);
-                  return (
+                {pendingViolations.slice(0,5).map(v => (
                   <tr key={v._id} onClick={() => navigate('/violations/' + v._id)} className="border-b border-gray-700/50 hover:bg-gray-700/30 cursor-pointer transition">
-                    <td className="px-6 py-3 font-mono text-white">{v.carId}</td>
-                    <td className="px-6 py-3"><span className={"px-2.5 py-1 rounded-full text-xs font-semibold uppercase border " + priority.style}>{priority.label}</span></td>
-                    <td className="px-6 py-3"><span className="px-2.5 py-1 rounded-full text-xs font-semibold uppercase bg-cyan-500/20 text-cyan-400 border border-cyan-500/30">{v.violationType === 'lane_crossing' ? 'Lane Crossing' : 'Speeding'}</span></td>
+                    <td className="px-6 py-3 font-mono text-white">
+                      <div className="flex items-center gap-2">{v.carId}{v.plateImagePath && <PlateImageButton violationId={v._id} plate={v.carId} />}</div>
+                    </td>
+                    <td className="px-6 py-3"><PriorityBadge violation={v} /></td>
+                    <td className="px-6 py-3"><TypeBadge type={v.violationType} /></td>
                     <td className="px-6 py-3 text-gray-400">{new Date(v.detectedAt).toLocaleDateString()}</td>
                     <td className="px-6 py-3"><StatusBadge status={v.status} /></td>
                   </tr>
-                  );
-                })}
+                ))}
                 {pendingViolations.length === 0 && <tr><td colSpan={5} className="px-6 py-6 text-center text-gray-500">No pending violations</td></tr>}
               </tbody>
             </table>

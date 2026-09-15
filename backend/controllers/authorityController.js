@@ -3,10 +3,23 @@ const Notification = require('../models/Notification');
 const Drive = require('../models/Drive');
 const r2 = require('../services/r2');
 
+// Where the dashboard loads a stored R2 object from. R2 keeps the bucket private, so hand back a
+// short-lived presigned GET URL (the bytes never pass through this server). Falls back to a
+// plain path when R2 isn't configured (local dev / tests).
+const objectUrl = async (req, key) => r2.isConfigured()
+    ? r2.presignGet(key)
+    : req.protocol + '://' + req.get('host') + '/' + key;
+
 const getViolations = async (req, res) => {
-    const { status, date, license_plate } = req.query;
+    const { status, date, license_plate, reviewed_by } = req.query;
     const filter = {};
     if (status) filter.status = status;
+    // reviewed_by=me -> only the violations this authority verified or dismissed. Every review
+    // stamps reviewedBy, so this is each authority's own list; add status to split it.
+    if (reviewed_by) {
+        if (reviewed_by !== 'me') return res.status(400).json({ success: false, message: "reviewed_by must be 'me'", data: null });
+        filter.reviewedBy = req.user._id;
+    }
     if (license_plate) filter.carId = { $regex: license_plate, $options: 'i' };
     if (date) {
         const start = new Date(date);
@@ -40,18 +53,27 @@ const dismissViolation = async (req, res) => {
 const getEvidence = async (req, res) => {
     const violation = await Violation.findById(req.params.id);
     if (!violation) return res.status(404).json({ success: false, message: 'Violation not found', data: null });
-    // The clip lives in R2; hand back a short-lived presigned GET URL so the dashboard's
-    // <video> loads it straight from R2 (bytes never pass through this server, bucket stays
-    // private). Falls back to a plain path when R2 isn't configured (local dev / tests).
-    const video_clip_url = r2.isConfigured()
-        ? await r2.presignGet(violation.videoClipPath)
-        : req.protocol + '://' + req.get('host') + '/' + violation.videoClipPath;
     res.json({ success: true, message: 'Evidence retrieved', data: {
-        video_clip_url,
+        video_clip_url: await objectUrl(req, violation.videoClipPath),
+        plate_image_url: violation.plateImagePath ? await objectUrl(req, violation.plateImagePath) : null,
         car_id_recognition: violation.carId,
         calculated_speed: violation.calculatedSpeed,
         location: violation.location,
-        detected_at: violation.detectedAt
+        detected_at: violation.detectedAt,
+        // The detail page shows Verify/Dismiss only while this is 'pending'.
+        status: violation.status
+    }});
+};
+
+// A fresh URL for the plate picture alone. The dashboard asks for it when the button is
+// clicked, so a page left open longer than the presign expiry still shows the picture.
+const getPlateImage = async (req, res) => {
+    const violation = await Violation.findById(req.params.id);
+    if (!violation) return res.status(404).json({ success: false, message: 'Violation not found', data: null });
+    if (!violation.plateImagePath) return res.status(404).json({ success: false, message: 'No plate picture for this violation', data: null });
+    res.json({ success: true, message: 'Plate picture retrieved', data: {
+        plate_image_url: await objectUrl(req, violation.plateImagePath),
+        car_id_recognition: violation.carId
     }});
 };
 
@@ -71,4 +93,4 @@ const searchViolations = async (req, res) => {
     res.json({ success: true, message: 'Found ' + results.length + ' result(s)', data: { results } });
 };
 
-module.exports = { getViolations, verifyViolation, dismissViolation, getEvidence, searchViolations, getDrives };
+module.exports = { getViolations, verifyViolation, dismissViolation, getEvidence, getPlateImage, searchViolations, getDrives };

@@ -283,6 +283,7 @@ def process_session(main, args, models, session: Session, worker_id: str,
     bundle_path = os.path.join(out_dir, f"{video_name}_violations_bundle.tar.gz")
     manifest = wc.unpack_bundle(bundle_path, violations_dir)
     clips = wc.move_clips(manifest, out_dir, violations_dir) if manifest else {}
+    plates = wc.collect_plate_images(manifest, out_dir, violations_dir) if manifest else {}
     if manifest and args.no_bundle and os.path.isfile(bundle_path):
         os.remove(bundle_path)                  # unpacked already; the tar.gz is pure duplication
         print(f"[offline] removed {os.path.basename(bundle_path)} (--no-bundle); "
@@ -293,7 +294,7 @@ def process_session(main, args, models, session: Session, worker_id: str,
     detected_at = datetime.now(timezone.utc).isoformat()
     payloads = wc.build_violation_payloads(
         manifest, clips, drive_id=f"offline:{session.id}", session_id=session.id,
-        session_dir=session.dir, detected_at=detected_at)
+        session_dir=session.dir, detected_at=detected_at, plate_images=plates)
 
     violations_json = os.path.join(out_dir, "violations.json")
     with open(violations_json, "w", encoding="utf-8") as fh:
@@ -338,6 +339,7 @@ def process_session(main, args, models, session: Session, worker_id: str,
             "evidenceDir": f"{video_name}_evidence",
             "speedPlots": plots,
             "clips": clips,
+            "plateImages": plates,
         },
     }
     with open(os.path.join(out_dir, "drive.json"), "w", encoding="utf-8") as fh:

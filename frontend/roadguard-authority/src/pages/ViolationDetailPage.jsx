@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import api from '../api/axios';
 import PageLayout from '../components/PageLayout';
 import StatusBadge from '../components/StatusBadge';
+import PlateImageButton from '../components/PlateImageButton';
 const ViolationDetailPage = () => {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -46,7 +47,10 @@ const ViolationDetailPage = () => {
           <div className="bg-gray-800 border border-gray-700 rounded-xl p-6">
             <div className="flex justify-between items-start mb-4"><h2 className="font-semibold text-white">Evidence Details</h2><StatusBadge status={status} /></div>
             <div className="grid grid-cols-2 gap-4 text-sm">
-              <div><p className="text-gray-400">License Plate</p><p className="text-white font-mono font-bold text-lg">{evidence.car_id_recognition}</p></div>
+              <div><p className="text-gray-400">License Plate</p>
+                <div className="flex items-center gap-2"><p className="text-white font-mono font-bold text-lg">{evidence.car_id_recognition}</p>
+                  {evidence.plate_image_url && <PlateImageButton violationId={id} plate={evidence.car_id_recognition} />}</div>
+              </div>
               <div><p className="text-gray-400">Speed</p><p className="text-white font-bold text-lg">{evidence.calculated_speed} km/h</p></div>
               <div><p className="text-gray-400">GPS</p><p className="text-white">{evidence.location?.lat?.toFixed(5)}, {evidence.location?.lon?.toFixed(5)}</p></div>
               <div><p className="text-gray-400">Detected At</p><p className="text-white">{new Date(evidence.detected_at).toLocaleString()}</p></div>

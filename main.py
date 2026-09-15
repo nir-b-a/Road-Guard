@@ -699,7 +699,7 @@ def run_evidence_and_report(world: World, all_events: list, out_dir: str, video_
             if v is not None and result.plate:
                 v.license_plate = result.plate            # read once; reused by later violations
             out = os.path.join(evidence_dir, f"v{e.vehicle_id}_{e.violation_type.lower()}")
-            EVIDENCE_COLLECTOR.save_evidence(result, out, plate_reader=EVIDENCE_COLLECTOR._ocr.__self__)
+            EVIDENCE_COLLECTOR.save_evidence(result, out)
         results_by_event.append((e, result))
 
     csv_path = os.path.join(out_dir, f"{video_name}_violations.csv")
@@ -1195,7 +1195,9 @@ def main():
     # Evidence collector (one OCR reader for the whole run).
     if _EVIDENCE_IMPORT_OK and "--no-evidence" not in sys.argv:
         try:
-            EVIDENCE_COLLECTOR = EvidenceCollector(FastALPRReader().read_plate_with_conf, min_area=LPR.MIN_VEHICLE_AREA)
+            reader = FastALPRReader()
+            EVIDENCE_COLLECTOR = EvidenceCollector(reader.read_plate_with_conf, min_area=LPR.MIN_VEHICLE_AREA,
+                                                   plate_cropper=reader.crop_plate)
             print("[evidence] EvidenceCollector ready (FastALPR)")
         except Exception as e:
             print(f"[evidence] disabled (reader init failed: {e})")
