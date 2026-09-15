@@ -3,6 +3,7 @@ const app = require('../app');
 const { connect, disconnect, clearCollections } = require('./setup');
 const { getDriverToken, getAuthorityToken } = require('./helpers');
 const Drive = require('../models/Drive');
+const Violation = require('../models/Violation');
 beforeAll(async () => await connect());
 afterAll(async () => await disconnect());
 beforeEach(async () => await clearCollections());
@@ -19,6 +20,20 @@ describe('CV UNIT - POST /api/internal/violation', () => {
         expect(res.body.data.violationId).toBeDefined();
         const updated = await Drive.findById(drive._id);
         expect(updated.status).toBe('processing');   // /violation does not complete the drive
+    });
+    it('stores the plate picture key sent with the violation', async () => {
+        const { userId: driverId } = await getDriverToken();
+        const drive = await createDrive(driverId);
+        const res = await request(app).post('/api/internal/violation').send({ driveId: drive._id, videoClipPath: 'sessions/s/out/clip.mp4', plateImagePath: 'sessions/s/out/clip_plate.png', carId: 'XYZ-9999', calculatedSpeed: 110, lat: 32.08, lon: 34.78 });
+        expect(res.statusCode).toBe(201);
+        expect((await Violation.findById(res.body.data.violationId)).plateImagePath).toBe('sessions/s/out/clip_plate.png');
+    });
+    it('stores no plate picture when the worker found none', async () => {
+        const { userId: driverId } = await getDriverToken();
+        const drive = await createDrive(driverId);
+        const res = await request(app).post('/api/internal/violation').send({ driveId: drive._id, videoClipPath: 'sessions/s/out/clip.mp4', plateImagePath: null, carId: 'vehicle-7', calculatedSpeed: 0, lat: 0, lon: 0 });
+        expect(res.statusCode).toBe(201);
+        expect((await Violation.findById(res.body.data.violationId)).plateImagePath).toBeNull();
     });
     it('fails with missing carId', async () => {
         const { userId: driverId } = await getDriverToken();

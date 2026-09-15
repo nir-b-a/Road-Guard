@@ -113,7 +113,7 @@ STAGES: "OrderedDict[str, tuple[str, str, int]]" = OrderedDict([
     ("out.annotated",  ("annotated video render",                           G_OUTPUT, 0)),
     # -- worker book-keeping ------------------------------------------------ #
     ("worker.unpack",  ("unpack the evidence bundle",                       G_WORKER, 0)),
-    ("worker.clips",   ("collect clips / speed plots",                      G_WORKER, 0)),
+    ("worker.clips",   ("collect clips / plate pictures / speed plots",     G_WORKER, 0)),
     ("worker.payloads",("build the violation records",                      G_WORKER, 0)),
     ("worker.download",("download the session from R2",                     G_WORKER, 0)),
     ("worker.upload",  ("transcode + upload the evidence clips",            G_WORKER, 0)),
@@ -333,7 +333,8 @@ class RunTimer:
     # -- step 3: the worker's own delivery helpers -------------------------- #
     def install_worker(self, wc) -> None:
         self._wrap(wc, "unpack_bundle", "worker.unpack")
-        self._wrap_all(wc, ("move_clips", "collect_speed_plots"), "worker.clips")
+        self._wrap_all(wc, ("move_clips", "collect_plate_images", "collect_speed_plots"),
+                       "worker.clips")
         self._wrap(wc, "build_violation_payloads", "worker.payloads")
 
     # -- the three hooks that need more than a stopwatch --------------------- #

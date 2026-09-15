@@ -163,7 +163,8 @@ def attach_models(main, models: Models) -> None:
     from lpr.evidence import EvidenceCollector
     from Constants import LPR
     main.EVIDENCE_COLLECTOR = EvidenceCollector(models.plate_reader.read_plate_with_conf,
-                                                min_area=LPR.MIN_VEHICLE_AREA)
+                                                min_area=LPR.MIN_VEHICLE_AREA,
+                                                plate_cropper=models.plate_reader.crop_plate)
 
 
 def reset_speed_limit_lookup(log=print) -> None:
@@ -251,6 +252,22 @@ def move_clips(manifest: dict, out_dir: str, violations_dir: str) -> dict:
     return clips
 
 
+def collect_plate_images(manifest: dict, out_dir: str, violations_dir: str) -> dict:
+    """Each violation's clearest plate picture, as unpack_bundle() left it
+    (violations/<violation_id>/plate.png). -> {violation_id: path relative to out_dir}; a
+    violation whose plate was never localised is simply absent."""
+    images = {}
+    for rec in (manifest or {}).get("violations", []):
+        stem = rec.get("violation_id")
+        rel = ((rec.get("evidence") or {}).get("plate_crop") or {}).get("file")
+        if not (stem and rel):
+            continue
+        path = os.path.join(violations_dir, *rel.split("/"))
+        if os.path.isfile(path):
+            images[stem] = os.path.relpath(path, out_dir).replace("\\", "/")
+    return images
+
+
 def collect_speed_plots(out_dir: str, video_name: str) -> dict:
     """Move the per-vehicle speed/distance PNGs and the ego-speed PNG into speed_plots/.
     -> {"vehicles": {track_id: relpath}, "ego": relpath|None}. Both are empty on a video-only
@@ -309,16 +326,19 @@ def fix_at(track: dict, sorted_frames: list, frame: int):
 
 
 def build_violation_payloads(manifest: dict, clips: dict, *, drive_id: str, session_id: str,
-                             session_dir: str, detected_at: str, log=print) -> list:
+                             session_dir: str, detected_at: str, plate_images: dict | None = None,
+                             log=print) -> list:
     """One record per violation: the exact body POSTed to /api/internal/violation, what the
     backend adds when it stores the row, and every artefact path.
 
     `clips` maps violation_id -> wherever the clip now lives (an R2 key online, a path relative
-    to the output folder offline). `lat`/`lon` are the EGO's GPS fix at the violation frame --
-    the system never has GPS for the other car, the same proxy the speed-limit lookup uses --
-    and 0.0 when the session has no gps.csv."""
+    to the output folder offline); `plate_images` does the same for the plate picture, and a
+    violation missing from it gets plateImagePath None. `lat`/`lon` are the EGO's GPS fix at
+    the violation frame -- the system never has GPS for the other car, the same proxy the
+    speed-limit lookup uses -- and 0.0 when the session has no gps.csv."""
     track = ego_track_for(session_dir, log=log)
     frames = sorted(track)
+    plate_images = plate_images or {}
     payloads = []
 
     def _rel(path):
@@ -342,6 +362,7 @@ def build_violation_payloads(manifest: dict, clips: dict, *, drive_id: str, sess
             "lat": lat,
             "lon": lon,
             "violationType": BACKEND_TYPE.get(vtype, "lane_crossing"),
+            "plateImagePath": plate_images.get(stem),
             # --- what the backend adds when it stores the row ------------------------
             "detectedAt": detected_at,
             "status": "pending",
@@ -366,6 +387,7 @@ def build_violation_payloads(manifest: dict, clips: dict, *, drive_id: str, sess
             "locationKnown": bool(frames),
             "evidence": {
                 "clip": clips.get(stem),
+                "plateImage": plate_images.get(stem),
                 "images": [_rel(c.get("file")) for c in (evidence.get("crops") or [])],
                 "plateImages": [_rel(c["plate"]["file"]) for c in (evidence.get("crops") or [])
                                 if c.get("plate")],

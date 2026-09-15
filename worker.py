@@ -6,7 +6,8 @@ It is the bridge between the upload server and the CV pipeline. The loop:
     1. GET  {SERVER_URL}/api/internal/next-job   (atomically claims a queued drive)
     2. Download that drive's 7 files from Cloudflare R2 to a local temp dir
     3. Run the existing pipeline   (main.process_video_with_models)
-    4. Upload ONE evidence clip PER VIOLATION to R2 (<sessionId>/out/<violation_id>.mp4)
+    4. Upload ONE evidence clip PER VIOLATION to R2 (<sessionId>/out/<violation_id>.mp4), plus its
+       plate picture when the plate was found (<sessionId>/out/<violation_id>_plate.png)
     5. POST one /api/internal/violation per detected violation
     6. POST /api/internal/drive/<id>/complete  (processed | failed)
 
@@ -33,7 +34,7 @@ grand total at the end of its run.
 Config (env vars, see backend/.env.example for the shared R2_* names):
     SERVER_URL        backend base URL                 (default http://localhost:5000)
     INTERNAL_TOKEN    shared secret -> x-internal-token header (optional)
-    WORKER_ID         identifies this worker in logs/claims    (default host name)
+    WORKER_ID         identifies this worker in logs/claims    (default <host name>-<6 random hex>)
     POLL_SECONDS      idle poll interval                       (default 5)
     WORK_DIR          scratch dir for downloads/outputs        (default ./_worker_jobs)
     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_ENDPOINT
@@ -47,6 +48,9 @@ Config (env vars, see backend/.env.example for the shared R2_* names):
     STOP_FILE         stop-request file the worker watches        (default <WORK_DIR>/worker.stop)
 
 Run:  python worker.py
+      python worker.py --keep-annotated   # also keep each drive's annotated video, in
+                                          # <WORK_DIR>/annotated/<sessionId>_annotated.mp4
+                                          # (--keep-anotated works too)
       python worker_offline.py <folder>   # the same processing with no server and no R2
 
 Stop (from another terminal; see worker_stop.py):
@@ -57,6 +61,7 @@ import os
 import sys
 import time
 import shutil
+import secrets
 import socket
 import subprocess
 import threading
@@ -97,10 +102,22 @@ import worker_stop                             # noqa: E402  --stop / --stop-now
 
 SERVER_URL     = os.environ.get("SERVER_URL", "http://localhost:5000").rstrip("/")
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "")
-WORKER_ID      = os.environ.get("WORKER_ID", socket.gethostname())
+# The host name alone is shared by every worker on one machine, so two workers started from two
+# terminals would claim drives under the same id -- and the server's release check (only the
+# worker holding a claim may hand it back) could not tell them apart. A random suffix, not the
+# start time, because two workers launched in the same second must still differ. A new id per
+# run is harmless: a worker only ever releases drives it claimed in this process.
+WORKER_ID      = os.environ.get("WORKER_ID") or f"{socket.gethostname()}-{secrets.token_hex(3)}"
 POLL_SECONDS   = float(os.environ.get("POLL_SECONDS", "5"))
 WORK_DIR       = os.environ.get("WORK_DIR", os.path.join(_HERE, "_worker_jobs"))
 STOP_FILE      = os.environ.get("STOP_FILE", os.path.join(WORK_DIR, "worker.stop"))
+
+# The pipeline renders a full annotated video for every drive, but it lives in the job dir,
+# which ship() deletes. --keep-annotated moves it out first, into ANNOTATED_DIR.
+# --keep-anotated (one "n") is accepted too: flags are matched exactly and nothing rejects an
+# unknown one, so that typo used to be silently ignored and the video deleted.
+KEEP_ANNOTATED = any(flag in sys.argv for flag in ("--keep-annotated", "--keep-anotated"))
+ANNOTATED_DIR  = os.path.join(WORK_DIR, "annotated")
 
 R2_BUCKET   = os.environ.get("R2_BUCKET")
 R2_ENDPOINT = os.environ.get("R2_ENDPOINT")
@@ -170,7 +187,7 @@ def report_violation(payload):
     """POST one violation. `payload` comes from worker_common.build_violation_payloads, which
     carries the backend's fields plus pipeline detail; only the fields the API accepts are sent."""
     body = {k: payload[k] for k in ("driveId", "videoClipPath", "carId", "calculatedSpeed",
-                                    "lat", "lon", "violationType")}
+                                    "lat", "lon", "violationType", "plateImagePath")}
     r = requests.post(SERVER_URL + "/api/internal/violation", json=body, headers=_headers(), timeout=30)
     if not r.ok:
         print(f"[worker] violation POST failed ({r.status_code}): {r.text}")
@@ -349,6 +366,41 @@ def upload_evidence(s3, manifest, clips, session, out_dir, video_local, job_dir)
     return keys
 
 
+def upload_plate_images(s3, plates, session, out_dir):
+    """Upload each violation's plate picture to <session>/out/<violation_id>_plate.png.
+    -> {violation_id: R2 key}.
+
+    Best effort, unlike the clips: the backend requires a clip, but a plate picture is optional,
+    so a failed upload is logged and that violation is reported without one."""
+    keys = {}
+    for stem, rel in plates.items():
+        key = f"{session}/out/{stem}_plate.png"
+        try:
+            s3.upload_file(os.path.join(out_dir, rel), R2_BUCKET, key,
+                           ExtraArgs={"ContentType": "image/png"})
+        except Exception as e:
+            print(f"[worker] {stem}: plate picture upload failed ({e}); reporting it without one")
+            continue
+        keys[stem] = key
+    return keys
+
+
+def keep_annotated_video(path, session):
+    """--keep-annotated: move the drive's annotated video out of its job dir (which ship()
+    deletes) to ANNOTATED_DIR/<session>_annotated.mp4. Failing to keep it never fails the drive."""
+    if not path or not os.path.isfile(path):
+        print(f"[worker] --keep-annotated: no annotated video was rendered for {session}")
+        return
+    dest = os.path.join(ANNOTATED_DIR, f"{session}_annotated.mp4")
+    try:
+        os.makedirs(ANNOTATED_DIR, exist_ok=True)
+        shutil.move(path, dest)
+    except OSError as e:
+        print(f"[worker] --keep-annotated: could not keep {path} ({e})")
+        return
+    print(f"[worker] annotated video kept -> {dest}")
+
+
 class PendingShip:
     """One drive's finished pipeline output, waiting to be transcoded, uploaded and reported.
 
@@ -356,9 +408,10 @@ class PendingShip:
     the moment it is created: nothing else may delete that folder, because the clips, the
     source video (the 5 s fallback cut) and gps.csv (the violation's GPS fix) are all still
     read from it while the upload runs."""
-    __slots__ = ("drive_id", "session", "job_dir", "out_dir", "video_local", "manifest", "clips")
+    __slots__ = ("drive_id", "session", "job_dir", "out_dir", "video_local", "manifest", "clips",
+                 "plates")
 
-    def __init__(self, drive_id, session, job_dir, out_dir, video_local, manifest, clips):
+    def __init__(self, drive_id, session, job_dir, out_dir, video_local, manifest, clips, plates):
         self.drive_id    = drive_id
         self.session     = session
         self.job_dir     = job_dir
@@ -366,6 +419,7 @@ class PendingShip:
         self.video_local = video_local
         self.manifest    = manifest
         self.clips       = clips
+        self.plates      = plates
 
 
 def process(s3, job, models, timer) -> PendingShip:
@@ -394,18 +448,21 @@ def process(s3, job, models, timer) -> PendingShip:
     import main                       # lazy: a missing GPU stack fails per-job, not at startup
     wc.attach_models(main, models)     # fresh evidence buffer for this clip
     wc.reset_speed_limit_lookup()      # re-arm the Overpass circuit breaker for this drive
-    main.process_video_with_models(
+    result = main.process_video_with_models(
         video_local, models.yolo, models.lane, models.tire,
         out_dir=out_dir, is_simulation=False, job={"job_id": session})
+    if KEEP_ANNOTATED:
+        keep_annotated_video(result.get("annotated_video"), session)
 
     # 4. Unpack the bundle into out/violations/<violation_id>/. The clips are only MOVED into
     #    place here (a local rename); encoding and uploading them is ship()'s job.
     violations_dir = os.path.join(out_dir, "violations")
     manifest = wc.unpack_bundle(os.path.join(out_dir, f"{video_name}_violations_bundle.tar.gz"),
                                 violations_dir)
-    clips = (wc.move_clips(manifest, out_dir, violations_dir)
-             if manifest and manifest.get("violations") else {})
-    return PendingShip(drive_id, session, job_dir, out_dir, video_local, manifest, clips)
+    has_violations = bool(manifest and manifest.get("violations"))
+    clips = wc.move_clips(manifest, out_dir, violations_dir) if has_violations else {}
+    plates = wc.collect_plate_images(manifest, out_dir, violations_dir) if has_violations else {}
+    return PendingShip(drive_id, session, job_dir, out_dir, video_local, manifest, clips, plates)
 
 
 def ship(s3, p: PendingShip) -> None:
@@ -426,17 +483,19 @@ def ship(s3, p: PendingShip) -> None:
 
         keys = upload_evidence(s3, p.manifest, p.clips, p.session, p.out_dir,
                                p.video_local, p.job_dir)
+        plate_keys = upload_plate_images(s3, p.plates, p.session, p.out_dir)
 
         # 5. Report each violation, with its own clip, its GPS fix and its real type.
         payloads = wc.build_violation_payloads(
             p.manifest, keys, drive_id=p.drive_id, session_id=p.session, session_dir=p.job_dir,
-            detected_at=datetime.now(timezone.utc).isoformat())
+            detected_at=datetime.now(timezone.utc).isoformat(), plate_images=plate_keys)
         for v in payloads:
             report_violation(v)
 
         complete(p.drive_id, "processed")
         print(f"[worker] drive {p.drive_id}: {len(payloads)} violation(s) reported "
-              f"({sum(1 for v in payloads if v['plate'])} with a plate read)")
+              f"({sum(1 for v in payloads if v['plate'])} with a plate read, "
+              f"{sum(1 for v in payloads if v['plateImagePath'])} with a plate picture)")
         print(f"[ship] drive {p.drive_id}: transcode + upload took "
               f"{run_timing.fmt_dur(time.perf_counter() - t0)}")
     except Exception as e:
@@ -504,6 +563,8 @@ def main():
     if _SHIP_POOL is not None:
         print(f"[worker] evidence shipping runs off-thread "
               f"(up to {MAX_PENDING_SHIPS} drive(s) queued; SHIP_ASYNC=0 to disable)")
+    if KEEP_ANNOTATED:
+        print(f"[worker] --keep-annotated: each drive's annotated video is kept in {ANNOTATED_DIR}")
 
     try:
         while not stopper.requested:

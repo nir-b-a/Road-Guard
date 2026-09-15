@@ -136,13 +136,13 @@ def hampel_clean_runs(runs: list[Run],
 # a causal filter would have. This is the ONLY smoother that emits a velocity std.
 # ============================================================================
 
-DEFAULT_MEAS_NOISE_STD_M = 1.0   # std of the position measurement (m). Larger -> smoother, more lag.
-DEFAULT_JERK_PSD = 2.0           # jerk power spectral density. Larger -> tracks fast changes, noisier.
+DEFAULT_MEAS_NOISE_STD_M = 1.0   # R. std of the position measurement (m). trust to about +-1m.
+DEFAULT_JERK_PSD = 2.0           # q. grows P, bigger q means P grows more between frames but more noisy, smaller - less reactive
 INIT_VAR_POS = 10.0 ** 2         # initial position variance (m^2): weak prior
 INIT_VAR_VEL = 10.0 ** 2         # initial velocity variance ((m/s)^2)
 INIT_VAR_ACC = 10.0 ** 2         # initial acceleration variance
 
-
+# uncertanty of next state values
 def _Q(dt: float, q: float) -> np.ndarray:
     return q * np.array([
         [dt**5 / 20, dt**4 / 8, dt**3 / 6],
@@ -150,7 +150,7 @@ def _Q(dt: float, q: float) -> np.ndarray:
         [dt**3 / 6,  dt**2 / 2, dt],
     ])
 
-
+# constant acceleration model
 def _F(dt: float) -> np.ndarray:
     return np.array([[1, dt, dt**2 / 2], [0, 1, dt], [0, 0, 1]])
 
@@ -177,10 +177,10 @@ def kalman_velocity_1d(values: np.ndarray,
     LESS (the filter leans on its model there). Used to down-weight low-confidence
     frames such as wide-angle targets. None -> uniform meas_noise_std (unchanged).
     """
-    z = np.asarray(values, dtype=float)
+    z = np.asarray(values, dtype=float)                     # positions (m) along ONE axis
     n = len(z)
     if n == 0:
-        return z, np.zeros(0), np.zeros(0)
+        return z, np.zeros(0), np.zeros(0)                  # nothing to smooth
 
     if dts is None:
         dt_arr = np.full(n, 1.0 / fps)
@@ -196,44 +196,44 @@ def kalman_velocity_1d(values: np.ndarray,
     else:
         r_std = float(meas_noise_std) * np.asarray(noise_scale, dtype=float)
 
-    H = np.array([[1.0, 0.0, 0.0]])
+    H = np.array([[1.0, 0.0, 0.0]])                                          # "what we measure is the position"
     I = np.eye(3)
 
     first_valid = next((v for v in z if not np.isnan(v)), 0.0)
-    x = np.array([[first_valid], [0.0], [0.0]])
-    P = np.diag([INIT_VAR_POS, INIT_VAR_VEL, INIT_VAR_ACC]).astype(float)
+    x = np.array([[first_valid], [0.0], [0.0]])                             # start: there, speed 0, accel 0
+    P = np.diag([INIT_VAR_POS, INIT_VAR_VEL, INIT_VAR_ACC]).astype(float)   # how unsure we are of that guess
 
-    xp = np.zeros((n, 3, 1)); Pp = np.zeros((n, 3, 3))
-    xu = np.zeros((n, 3, 1)); Pu = np.zeros((n, 3, 3))
-    Fs = np.zeros((n, 3, 3))  # store the transition used INTO step k (for the RTS pass)
+    xp = np.zeros((n, 3, 1)); Pp = np.zeros((n, 3, 3))                      # every frame's prediction
+    xu = np.zeros((n, 3, 1)); Pu = np.zeros((n, 3, 3))                      # every frame's result after the update
+    Fs = np.zeros((n, 3, 3))                                                # the F used to reach each frame
 
     for k in range(n):
         dt = dt_arr[k]
         F = _F(dt)
         Fs[k] = F
-        x = F @ x
-        P = F @ P @ F.T + _Q(dt, jerk_psd)
+        x = F @ x                                   # prediction step, move the state with physics, F - constant motion model, x - previouse state.
+        P = F @ P @ F.T + _Q(dt, jerk_psd)          # uncertainty carried along, grows by Q
         xp[k], Pp[k] = x, P
         if not np.isnan(z[k]):
-            y = np.array([[z[k]]]) - H @ x
-            R = np.array([[r_std[k] ** 2]])
-            S = H @ P @ H.T + R
-            K = P @ H.T @ np.linalg.inv(S)
-            x = x + K @ y
+            y = np.array([[z[k]]]) - H @ x          # surprise = measured − predicted position
+            R = np.array([[r_std[k] ** 2]])         # this frame's measurement variance
+            S = H @ P @ H.T + R                     # how big a surprise is normal - trust in the surprise
+            K = P @ H.T @ np.linalg.inv(S)          # gain: 3 numbers (position, speed, accel) - K=1  means we trust the measurment fully.
+            x = x + K @ y                           # update, all three from one surprise
             P = (I - K @ H) @ P
         xu[k], Pu[k] = x, P
 
     # RTS backward smoother (uses the same per-step transition that produced k+1)
-    xs = xu.copy(); Ps = Pu.copy()
-    for k in range(n - 2, -1, -1):
+    xs = xu.copy(); Ps = Pu.copy()                  # start from the forward results
+    for k in range(n - 2, -1, -1):                  # walk backwards, second-to-last frame
         F = Fs[k + 1]
-        C = Pu[k] @ F.T @ np.linalg.inv(Pp[k + 1])
-        xs[k] = xu[k] + C @ (xs[k + 1] - xp[k + 1])
+        C = Pu[k] @ F.T @ np.linalg.inv(Pp[k + 1])  # how strongly frame k should follow frame k+1
+        xs[k] = xu[k] + C @ (xs[k + 1] - xp[k + 1]) # correct frame k with what the future showed
         Ps[k] = Pu[k] + C @ (Ps[k + 1] - Pp[k + 1]) @ C.T
 
-    pos = xs[:, 0, 0]
-    vel = xs[:, 1, 0]
-    vel_std = np.sqrt(np.clip(Ps[:, 1, 1], 0, None))
+    pos = xs[:, 0, 0]                               # final position, every frame
+    vel = xs[:, 1, 0]                               # final velocity on this axis (m/s)
+    vel_std = np.sqrt(np.clip(Ps[:, 1, 1], 0, None))    # its std = √variance; clip guards rounding below 0
     return pos, vel, vel_std
 
 
