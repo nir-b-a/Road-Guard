@@ -16,6 +16,9 @@ Road Guard is a dashcam-based traffic violation detection system for Israeli roa
 
 ---
 
+https://www.youtube.com/watch?v=W7jFbPoyRSk
+
+
 ## System Overview
 
 Road-Guard is a human in the loop (HITL) automated traffic violation detection system that integrates android dashcam devices,
