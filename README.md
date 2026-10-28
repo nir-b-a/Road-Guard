@@ -2,6 +2,12 @@
 
 Road Guard is a dashcam-based traffic violation detection system for Israeli roads. A driver records footage with an Android app; a computer-vision pipeline automatically detects violations committed by other vehicles; a human authority reviewer approves or dismisses each finding via a web dashboard before any action is taken.
 
+
+**Video of the Project**
+
+[![Road Guard Video](https://img.youtube.com/vi/W7jFbPoyRSk/maxresdefault.jpg)](https://www.youtube.com/watch?v=W7jFbPoyRSk)
+
+
 ---
 
 ## Table of Contents
@@ -15,8 +21,6 @@ Road Guard is a dashcam-based traffic violation detection system for Israeli roa
 7. [Further Reading](#further-reading)
 
 ---
-
-[![Road Guard Video](https://img.youtube.com/vi/W7jFbPoyRSk/maxresdefault.jpg)](https://www.youtube.com/watch?v=W7jFbPoyRSk)
 
 ## System Overview
 
